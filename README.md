@@ -23,9 +23,6 @@ see [Geekworm's scripts: what's included](#geekworms-scripts-whats-included-and-
 
 ![The Energy Plan window](docs/gui.png)
 
-*(This screenshot was taken in the test simulator described under [Testing](#testing),
-so the numbers come from fake hardware.)*
-
 ---
 
 ## Contents
