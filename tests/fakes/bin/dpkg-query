@@ -1,0 +1,12 @@
+#!/usr/bin/python3
+"""Fake dpkg-query: `-W -f=${Status} PKG` for packages the fake apt-get installed."""
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import _common as c
+
+pkg = sys.argv[-1]
+if pkg in c.load().get("dpkg", {}):
+    print("install ok installed", end="")
+    sys.exit(0)
+sys.exit(1)

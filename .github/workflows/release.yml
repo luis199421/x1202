@@ -1,0 +1,93 @@
+# Publishes a new version: push a tag like v2.0.1 (matching VERSION in
+# pi5_energyplan.py). It builds the .deb, adds it to the signed apt repository on
+# GitHub Pages (branch gh-pages) and makes a GitHub release with the .deb.
+# Pis that have the package then see the update in the Pi's updater.
+# One-time setup: packaging/README.md
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apt-repository
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches VERSION
+        run: |
+          v=$(sed -n 's/^VERSION = "\([0-9.]*\)".*/\1/p' pi5_energyplan.py | head -n 1)
+          if [ "${GITHUB_REF_NAME#v}" != "$v" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match VERSION = \"$v\" in pi5_energyplan.py"
+            exit 1
+          fi
+
+      - name: Check the signing key
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+        run: |
+          if [ -z "$APT_SIGNING_KEY" ] || [ ! -f packaging/apt-repo-key.asc ]; then
+            echo "::error::Set up the signing key first: see packaging/README.md"
+            exit 1
+          fi
+          export GNUPGHOME=$(mktemp -d)
+          secret=$(printf '%s\n' "$APT_SIGNING_KEY" | gpg --batch --import-options show-only --import --with-colons | awk -F: '/^fpr/ {print $10; exit}')
+          public=$(gpg --batch --import-options show-only --import --with-colons packaging/apt-repo-key.asc | awk -F: '/^fpr/ {print $10; exit}')
+          if [ "$secret" != "$public" ]; then
+            echo "::error::The APT_SIGNING_KEY secret doesn't match packaging/apt-repo-key.asc"
+            exit 1
+          fi
+
+      - name: Install the tools
+        run: sudo apt-get update && sudo apt-get install -y apt-utils
+
+      - name: Build the package
+        run: sh packaging/build-deb.sh . dist
+
+      - name: Get the published repository (keeps the older versions)
+        run: |
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null; then
+            git fetch --depth 1 origin gh-pages
+            git worktree add site origin/gh-pages
+            git -C site checkout -B gh-pages
+          else
+            git worktree add --detach site
+            git -C site checkout --orphan gh-pages
+            git -C site rm -rf --quiet .
+          fi
+
+      - name: Add the package and sign the repository
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+        run: |
+          sh packaging/publish-apt-repo.sh dist site/apt
+          touch site/.nojekyll
+          cat > site/index.html <<'HTML'
+          <!doctype html><meta charset="utf-8"><title>Pi 5 Energy Plan</title>
+          <p>apt repository for <a href="https://github.com/${{ github.repository }}">Pi 5 Energy Plan</a>.
+          Install it with the instructions there; updates then come through the Pi's updater.</p>
+          HTML
+
+      - name: Publish to GitHub Pages
+        run: |
+          cd site
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Publish $GITHUB_REF_NAME"
+          git push origin gh-pages
+
+      - name: GitHub release with the .deb
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "dist/pi5-energyplan_${GITHUB_REF_NAME#v}_all.deb" \
+            --title "Pi 5 Energy Plan $GITHUB_REF_NAME" --generate-notes

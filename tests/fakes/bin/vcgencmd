@@ -18,5 +18,7 @@ elif cmd == ["pmic_read_adc"]:
    3V3_SYS_V volt(9)=3.31136000V
    VDD_CORE_V volt(15)=0.80000000V
    EXT5V_V volt(24)=5.13996000V""")
+elif cmd == ["measure_clock"] and sys.argv[2:3] == ["v3d"]:
+    print(f"frequency(0)={hw.get('v3d_mhz', 960) * 1000000}")
 else:
     sys.exit(1)

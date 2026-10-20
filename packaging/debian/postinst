@@ -1,0 +1,11 @@
+#!/bin/sh
+# pi5-energyplan: set up or refresh the system part after an install or update
+# (also when the Pi's updater installs a new version).
+set -e
+if [ "$1" = configure ]; then
+    if ! sh /usr/share/pi5-energyplan/install.sh --from-package; then
+        echo "pi5-energyplan: setup didn't finish. Run:" \
+             "sudo sh /usr/share/pi5-energyplan/install.sh --from-package" >&2
+    fi
+fi
+exit 0

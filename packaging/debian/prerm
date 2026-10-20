@@ -1,0 +1,9 @@
+#!/bin/sh
+# pi5-energyplan: on removal (not on update) stop the services and remove the menu
+# entry / panel icon. Charging is switched back on when the battery guard stops.
+set -e
+case "$1" in
+    remove|deconfigure)
+        sh /usr/share/pi5-energyplan/install.sh --from-package --uninstall || true ;;
+esac
+exit 0

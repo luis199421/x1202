@@ -1,0 +1,8 @@
+#!/bin/sh
+# pi5-energyplan: "purge" also forgets the settings. The plan block in config.txt
+# and the bootloader settings are left as they are (see the README).
+set -e
+if [ "$1" = purge ]; then
+    rm -rf /etc/pi5-energyplan /var/lib/pi5-energyplan /var/cache/pi5-energyplan
+fi
+exit 0

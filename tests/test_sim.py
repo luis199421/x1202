@@ -52,6 +52,70 @@ over_voltage_delta=10000
 [all]
 """
 
+# Raspberry Pi OS's own config.txt, unchanged: note it ends with [cm5] then [all]
+PI_OS_CONFIG = """\
+# For more options and information see
+# http://rptl.io/configtxt
+# Some settings may impact device functionality. See link above for details
+
+# Uncomment some or all of these to enable the optional hardware interfaces
+#dtparam=i2c_arm=on
+#dtparam=i2s=on
+#dtparam=spi=on
+
+# Enable audio (loads snd_bcm2835)
+dtparam=audio=on
+
+# Automatically load overlays for detected cameras
+camera_auto_detect=1
+
+# Automatically load overlays for detected DSI displays
+display_auto_detect=1
+
+# Automatically load initramfs files, if found
+auto_initramfs=1
+
+# Enable DRM VC4 V3D driver
+dtoverlay=vc4-kms-v3d
+max_framebuffers=2
+
+# Don't have the firmware create an initial video= setting in cmdline.txt.
+# Use the kernel's default instead.
+disable_fw_kms_setup=1
+
+# Run in 64-bit mode
+arm_64bit=1
+
+# Disable compensation for displays with overscan
+disable_overscan=1
+
+# Run as fast as firmware / board allows
+arm_boost=1
+
+[cm4]
+# Enable host mode on the 2711 built-in XHCI USB controller.
+# This line should be removed if the legacy DWC2 controller is required
+# (e.g. for USB device mode) or if USB support is not required.
+otg_mode=1
+
+[cm5]
+dtoverlay=dwc2,dr_mode=host
+
+[all]
+"""
+
+
+def section_of(text, wanted):
+    """The [section] a config.txt line is in, as the firmware reads it."""
+    section = "all"
+    for line in text.splitlines():
+        st = line.strip()
+        if st.startswith("[") and st.endswith("]"):
+            section = st[1:-1].lower()
+        elif st == wanted:
+            return section
+    return None
+
 
 def put(path, value):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -76,7 +140,9 @@ def make_pi(governors="conservative ondemand userspace powersave performance sch
     """A fresh Raspberry Pi 5 with Active Cooler and an X1202."""
     for d in ("/sys/class", "/sys/devices/system/cpu", "/boot", "/etc/systemd/system",
               "/usr/local/bin", "/etc/pi5-energyplan", "/var/lib/pi5-energyplan",
-              "/run/pi5-energyplan", "/sys/firmware", STATE):
+              "/run/pi5-energyplan", "/sys/firmware", "/usr/share/pi5-energyplan",
+              "/usr/share/doc/pi5-energyplan", "/usr/share/keyrings",
+              "/etc/apt/sources.list.d", "/var/cache/pi5-energyplan", STATE):
         clear(d)
     put(CPUFREQ + "/scaling_available_governors", governors)
     put(CPUFREQ + "/scaling_governor", "ondemand")
@@ -275,10 +341,28 @@ class TestPlans(Base):
         self.assertIn("2800 MHz unlocks after reboot", out)
         self.assertEqual(get(CPUFREQ + "/scaling_max_freq"), "2400000")
         cfg = self.config()
-        self.assertIn("arm_freq=2800\nover_voltage_delta=50000\n", cfg)
+        self.assertIn("arm_freq=2800\nover_voltage_delta=50000\nv3d_freq=1050\n", cfg)
         cli("--apply", "OC 3.0 GHz")
-        self.assertIn("arm_freq=3000\nover_voltage_delta=50000\ngpu_freq=1000\n",
+        self.assertIn("arm_freq=3000\nover_voltage_delta=50000\nv3d_freq=1100\n",
                       self.config())
+        self.assertNotIn("\ngpu_freq=", self.config())
+
+    def test_gpu_overclock_steps_up_with_the_cpu(self):
+        gpu = {}
+        for plan in ("OC 2.6 GHz", "OC 2.8 GHz", "OC 3.0 GHz"):
+            cli("--apply", plan)
+            block = self.config().split("# >>> pi5-energyplan")[1]
+            gpu[plan] = int(block.split("v3d_freq=")[1].split()[0])
+            self.assertEqual(block.count("v3d_freq="), 1)
+        self.assertEqual(gpu, {"OC 2.6 GHz": 1000, "OC 2.8 GHz": 1050, "OC 3.0 GHz": 1100})
+        self.assertTrue(all(v > 960 for v in gpu.values()))   # above the Pi 5 default
+        cli("--apply", "Cool")                                  # no GPU overclock
+        self.assertNotIn("v3d_freq=", self.config().split("# >>> pi5-energyplan")[1])
+        # a hand-made GPU overclock elsewhere in config.txt can't override the plan
+        put("/boot/firmware/config.txt", self.config().replace("[pi5]", "[pi5]\nv3d_freq=1200"))
+        cli("--apply", "oc26")
+        self.assertIn("#energyplan-disabled# v3d_freq=1200", self.config())
+        self.assertIn("GPU (3D)    : 960 MHz", cli("--status").stdout)
 
     def test_governor_fallback(self):
         put(CPUFREQ + "/scaling_available_governors", "ondemand performance")
@@ -633,18 +717,22 @@ class TestInstaller(Base):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         return r.stdout
 
-    def apt_installed(self):
-        line = [c for c in calls() if c.startswith("apt-get") and " install -y " in c][-1]
-        return line.split(" install -y ")[1].split()
+    def deb_field(self, field):
+        debs = glob.glob("/var/cache/pi5-energyplan/*.deb")
+        self.assertEqual(len(debs), 1, debs)
+        return subprocess.run(["dpkg-deb", "-f", debs[0], field], capture_output=True,
+                              text=True, check=True).stdout.strip()
 
-    def test_trixie_packages_and_i2c(self):
-        hw(i2c=1, apt_missing=["policykit-1", "libraspberrypi-bin"])
+    def test_installs_as_a_package_with_i2c_and_bootloader(self):
+        hw(i2c=1)
         out = self.install()
-        self.assertEqual(self.apt_installed(), [
-            "python3", "python3-tk", "python3-smbus2", "i2c-tools", "raspi-utils",
-            "python3-libgpiod", "gpiod", "rpi-eeprom", "python3-gi", "gir1.2-gdkpixbuf-2.0",
-            "librsvg2-common", "pkexec", "stress-ng"])
+        ver = self.ep.VERSION
+        deb = f"/var/cache/pi5-energyplan/pi5-energyplan_{ver}_all.deb"
         self.assertIn("apt-get -o DPkg::Lock::Timeout=300 update", calls())
+        self.assertIn(f"apt-get -o DPkg::Lock::Timeout=300 install -y --reinstall {deb}",
+                      calls())
+        self.assertEqual(hw()["dpkg"]["pi5-energyplan"]["version"], ver)
+        self.assertEqual(get("/usr/share/pi5-energyplan/pi5_energyplan.py"), get(SCRIPT))
         self.assertIn("raspi-config nonint do_i2c 0", calls())
         self.assertIn("REBOOT_NEEDED=1", out)
         # Geekworm's bootloader settings, other lines kept
@@ -655,13 +743,23 @@ class TestInstaller(Base):
         self.assertIn("Battery     : 76.5%", out)          # --status ran at the end
         self.assertIn("skipped the menu entry", out)
 
-    def test_older_package_names_used_when_needed(self):
-        hw(i2c=0, apt_missing=["pkexec", "raspi-utils", "python3-smbus2"],
-           eeprom="[all]\nPOWER_OFF_ON_HALT=1\nPSU_MAX_CURRENT=5000\n")
+    def test_package_needs_trixie_or_bookworm_names(self):
+        self.install()
+        deps = self.deb_field("Depends")
+        # Trixie name first, Bookworm's as the alternative: apt picks what exists
+        for want in ("python3-tk", "python3-smbus2 | python3-smbus", "i2c-tools",
+                     "raspi-utils | libraspberrypi-bin", "python3-gi",
+                     "gir1.2-gdkpixbuf-2.0", "pkexec | policykit-1"):
+            self.assertIn(want, deps)
+        recs = self.deb_field("Recommends")
+        for want in ("librsvg2-common", "python3-libgpiod", "gpiod", "rpi-eeprom",
+                     "stress-ng"):
+            self.assertIn(want, recs)
+        self.assertEqual(self.deb_field("Architecture"), "all")
+
+    def test_bootloader_already_set(self):
+        hw(i2c=0, eeprom="[all]\nPOWER_OFF_ON_HALT=1\nPSU_MAX_CURRENT=5000\n")
         out = self.install()
-        pk = self.apt_installed()
-        for p in ("policykit-1", "libraspberrypi-bin", "python3-smbus"):
-            self.assertIn(p, pk)
         self.assertNotIn("raspi-config nonint do_i2c 0", calls())
         self.assertIn("Bootloader already set", out)
         self.assertNotIn("REBOOT_NEEDED", out)
@@ -713,10 +811,14 @@ class TestInstaller(Base):
                         "Cool"], check=True, capture_output=True)
         cli("--ups-config", '{"enabled": true}')
         self.install("--uninstall")
+        self.assertIn("apt-get -o DPkg::Lock::Timeout=300 remove -y pi5-energyplan", calls())
+        self.assertNotIn("pi5-energyplan", hw()["dpkg"])
         for p in ("/usr/local/bin/pi5_energyplan.py",
                   "/etc/systemd/system/pi5-energyplan.service",
-                  "/etc/systemd/system/pi5-battery-guard.service"):
+                  "/etc/systemd/system/pi5-battery-guard.service",
+                  "/usr/share/pi5-energyplan/pi5_energyplan.py"):
             self.assertFalse(os.path.exists(p), p)
+        self.assertEqual(hw()["pin16"], "ip pd")             # charging left on
 
     @unittest.skipUnless(os.environ.get("INSTALL_TEST_USER"),
                          "set INSTALL_TEST_USER to a throwaway desktop user")
@@ -988,6 +1090,64 @@ class TestNothingTwice(Base):
         self.assertEqual(sum(c.startswith("rpi-eeprom-config --apply") for c in calls()), 1)
 
 
+class TestConfigLinesKeepTheirSection(Base):
+    """A line added at the end of config.txt (e.g. an audio HAT overlay) must keep
+    working after plan changes and updates."""
+    AUDIO = "dtoverlay=hifiberry-dacplus"
+    CFG = "/boot/firmware/config.txt"
+
+    def setUp(self):
+        super().setUp()
+        put(self.CFG, PI_OS_CONFIG.rstrip("\n"))
+
+    def add_at_the_end(self, line):
+        with open(self.CFG, "a") as f:
+            f.write(line + "\n")
+
+    def test_lines_added_after_the_block_stay_under_all(self):
+        cli("--apply", "Cool")
+        self.add_at_the_end(self.AUDIO)
+        self.assertEqual(section_of(self.config(), self.AUDIO), "all")
+        for plan in ("Eco", "OC 2.6 GHz", "Balanced"):
+            cli("--apply", plan)
+            self.assertEqual(section_of(self.config(), self.AUDIO), "all", plan)
+        cli("--update-root")
+        self.assertEqual(section_of(self.config(), self.AUDIO), "all")
+        self.assertEqual(self.config().count(self.AUDIO), 1)
+        before = self.config()
+        cli("--apply", "Balanced")                       # and nothing piles up
+        self.assertEqual(self.config(), before)
+
+    def test_update_repairs_what_an_older_version_moved(self):
+        old = os.path.join(PREVIOUS, "pi5_energyplan_original.py")
+        run = lambda *a: subprocess.run([sys.executable, old, *a], check=True,
+                                        capture_output=True)
+        run("--apply", "Cool")
+        self.add_at_the_end(self.AUDIO)
+        run("--apply", "Eco")                            # the old bug
+        self.assertEqual(section_of(self.config(), self.AUDIO), "cm5")   # sound gone
+        broken = self.config()
+
+        out = cli("--update-root").stdout                # what an update runs
+        self.assertIn(f"config.txt repaired: {self.AUDIO} moved back under [all]", out)
+        self.assertIn("under [cm5]", out)
+        self.assertEqual(section_of(self.config(), self.AUDIO), "all")
+        self.assertEqual(section_of(self.config(), "dtoverlay=dwc2,dr_mode=host"), "cm5")
+        self.assertEqual(get(self.CFG + ".before-repair"), broken.rstrip("\n"))
+        self.assertIn("# plan: Eco", self.config())
+        fixed = self.config()
+        self.assertNotIn("repaired", cli("--update-root").stdout)   # only once
+        self.assertEqual(self.config(), fixed)
+
+    def test_lines_that_were_in_cm5_from_the_start_are_left_alone(self):
+        put(self.CFG, PI_OS_CONFIG.replace("dtoverlay=dwc2,dr_mode=host",
+                                           "dtoverlay=dwc2,dr_mode=host\ndtparam=pciex1"))
+        cli("--apply", "Cool")
+        cli("--apply", "Eco")
+        self.assertEqual(section_of(self.config(), "dtparam=pciex1"), "cm5")
+        self.assertFalse(os.path.exists(self.CFG + ".before-repair"))
+
+
 PREVIOUS = os.path.join(HERE, "previous")
 
 
@@ -1120,6 +1280,12 @@ class TestUpgrade(Base):
                      os.path.join(older, "pi5_energyplan.py"))
         shutil.copy2(os.path.join(os.path.dirname(HERE), "install.sh"), older)
         r = self.install_sh(src_dir=older, check=False)
+        self.assertIn("packaging folder is missing", r.stdout)       # only some files
+        shutil.copytree(os.path.join(os.path.dirname(HERE), "packaging"),
+                        os.path.join(older, "packaging"))
+        for f in ("install_gui.py", "README.md"):                # a whole download
+            shutil.copy2(os.path.join(os.path.dirname(HERE), f), older)
+        r = self.install_sh(src_dir=older, check=False)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn(f"Version {self.ep.VERSION} is installed, which is newer", r.stdout)
         self.assertEqual(get("/usr/local/bin/pi5_energyplan.py"), new)
@@ -1135,6 +1301,162 @@ class TestUpgrade(Base):
         # --force does it on purpose
         self.install_sh("--force", src_dir=older)
         self.assertIn('VERSION = "1.9.0"', get("/usr/local/bin/pi5_energyplan.py"))
+
+
+REAL_APT = "/usr/bin/apt-get"
+
+
+@unittest.skipUnless(shutil.which("apt-ftparchive") and shutil.which("gpg") and
+                     os.path.exists(REAL_APT), "needs apt-ftparchive (apt-utils) and gpg")
+class TestAptRepository(Base):
+    """The GitHub release path, end to end with the real apt: what the Pi's updater
+    (PackageKit) and `apt upgrade` see."""
+
+    def setUp(self):
+        super().setUp()
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.src = os.path.join(self.tmp, "src")
+        repo = os.path.dirname(HERE)
+        os.makedirs(self.src)
+        for f in ("pi5_energyplan.py", "install.sh", "install_gui.py", "README.md"):
+            shutil.copy2(os.path.join(repo, f), self.src)
+        shutil.copytree(os.path.join(repo, "packaging"), os.path.join(self.src, "packaging"))
+        for f in glob.glob(os.path.join(self.src, "packaging", "apt-repo-key.asc")):
+            os.remove(f)                                 # make a fresh test key
+        self.site = os.path.join(self.tmp, "site", "apt")
+        apt = os.path.join(self.tmp, "apt")
+        for d in ("state/lists/partial", "cache/archives/partial"):
+            os.makedirs(os.path.join(apt, d))
+        self.status = os.path.join(apt, "status")
+        self.apt_opts = ["-o", f"Dir::State={apt}/state", "-o", f"Dir::State::status={self.status}",
+                         "-o", f"Dir::Cache={apt}/cache", "-o", "Dir::Etc::sourcelist=/dev/null",
+                         "-o", "Dir::Etc::sourceparts=/etc/apt/sources.list.d",
+                         "-o", "APT::Sandbox::User=root", "-o", "Debug::NoLocking=1"]
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def sh(self, *args, env=None):
+        r = subprocess.run(args, capture_output=True, text=True, timeout=180,
+                           env=dict(os.environ, **(env or {})))
+        self.assertEqual(r.returncode, 0, f"{args}: {r.stdout}{r.stderr}")
+        return r.stdout
+
+    def make_key(self):
+        out = self.sh("sh", os.path.join(self.src, "packaging", "make-signing-key.sh"),
+                      env={"TMPDIR": self.tmp})
+        secret = [w for w in out.split() if "pi5-energyplan-signing-key" in w][0]
+        self.secret = get(secret)
+        self.assertIn("BEGIN PGP PRIVATE KEY BLOCK", self.secret)
+        self.assertIn("BEGIN PGP PUBLIC KEY BLOCK",
+                      get(os.path.join(self.src, "packaging", "apt-repo-key.asc")))
+
+    def release(self, version, key=None):
+        """What the GitHub workflow does for tag v<version>."""
+        script = os.path.join(self.src, "pi5_energyplan.py")
+        put(script, get(script).replace(f'VERSION = "{self.ep.VERSION}"',
+                                        f'VERSION = "{version}"', 1).replace(
+            f'VERSION = "{getattr(self, "last", self.ep.VERSION)}"', f'VERSION = "{version}"', 1))
+        self.last = version
+        dist = os.path.join(self.tmp, "dist-" + version)
+        deb = self.sh("sh", os.path.join(self.src, "packaging", "build-deb.sh"), self.src, dist,
+                      env={"APT_URL": "file://" + self.site}).strip().splitlines()[-1]
+        self.sh("sh", os.path.join(self.src, "packaging", "publish-apt-repo.sh"), dist, self.site,
+                env={"APT_SIGNING_KEY": key or self.secret})
+        return deb
+
+    def set_installed(self, deb):
+        """dpkg's record of an installed package: its control fields + Status."""
+        control = subprocess.run(["dpkg-deb", "-f", deb], capture_output=True, text=True,
+                                 check=True).stdout
+        put(self.status, control.replace("Version:", "Status: install ok installed\nVersion:",
+                                         1).rstrip("\n") + "\n")
+
+    def fresh_lists(self):
+        shutil.rmtree(os.path.join(self.tmp, "apt/state/lists"))
+        os.makedirs(os.path.join(self.tmp, "apt/state/lists/partial"))
+
+    def apt(self, *args, check=True):
+        r = subprocess.run([REAL_APT, *self.apt_opts, *args], capture_output=True, text=True,
+                           timeout=120)
+        if check:
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return r
+
+    def upgradable(self):
+        r = subprocess.run(["/usr/bin/apt", *self.apt_opts, "list", "--upgradable"],
+                           capture_output=True, text=True, timeout=60)
+        return [line for line in r.stdout.splitlines() if line.startswith("pi5-energyplan/")]
+
+    def test_new_version_reaches_the_pi_updater(self):
+        self.make_key()
+        deb = self.release("2.0.0")
+        # install 2.0.0 like install.sh does: the package adds the signed update source
+        self.sh("apt-get", "install", "-y", deb)
+        src = get("/etc/apt/sources.list.d/pi5-energyplan.sources")
+        self.assertIn(f"URIs: file://{self.site}", src)
+        self.assertIn("Signed-By: /usr/share/keyrings/pi5-energyplan-archive-keyring.asc", src)
+        self.assertIn('VERSION = "2.0.0"', get("/usr/local/bin/pi5_energyplan.py"))
+        self.set_installed(deb)
+        self.apt("update")
+        self.assertEqual(self.upgradable(), [])            # nothing new yet
+
+        # a new release on GitHub: the updater now offers it
+        self.release("2.0.1")
+        self.apt("update")
+        self.assertEqual(self.upgradable(),
+                         ["pi5-energyplan/stable 2.0.1 all [upgradable from: 2.0.0]"])
+        policy = subprocess.run(["/usr/bin/apt-cache", *self.apt_opts, "policy",
+                                 "pi5-energyplan"], capture_output=True, text=True).stdout
+        self.assertIn("Installed: 2.0.0", policy)
+        self.assertIn("Candidate: 2.0.1", policy)
+
+        # clicking "Install" in the updater: apt downloads (checks signature + hashes)
+        # and dpkg runs the package's install step
+        dl = os.path.join(self.tmp, "download")
+        os.makedirs(dl)
+        r = subprocess.run([REAL_APT, *self.apt_opts, "download", "pi5-energyplan"], cwd=dl,
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        new_deb = glob.glob(dl + "/*.deb")[0]
+        self.assertTrue(new_deb.endswith("pi5-energyplan_2.0.1_all.deb"))
+        cli("--apply", "Cool")                              # so there are services to refresh
+        out = self.sh("apt-get", "install", "-y", new_deb)
+        self.assertIn("Updating from version 2.0.0 to 2.0.1", out)
+        self.assertIn('VERSION = "2.0.1"', get("/usr/local/bin/pi5_energyplan.py"))
+        self.assertIn('VERSION = "2.0.0"', get("/var/lib/pi5-energyplan/previous-version.py"))
+        self.assertIn("systemctl try-restart pi5-battery-guard.service", calls())
+        self.set_installed(new_deb)
+        self.apt("update")
+        self.assertEqual(self.upgradable(), [])
+
+    def test_tampered_or_wrongly_signed_repository_is_refused(self):
+        self.make_key()
+        deb = self.release("2.0.0")
+        self.sh("apt-get", "install", "-y", deb)
+        self.set_installed(deb)
+        self.apt("update")
+        # someone changes the index after it was signed
+        pk = os.path.join(self.site, "dists/stable/main/binary-amd64/Packages")
+        put(pk, get(pk).replace("Version: 2.0.0", "Version: 9.9.9"))
+        os.remove(pk + ".gz")
+        self.fresh_lists()
+        r = self.apt("update", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("Hash Sum mismatch", r.stdout + r.stderr)
+        # a repository signed with another key
+        other = os.path.join(self.tmp, "other")
+        os.makedirs(other)
+        self.sh("sh", "-c", f"GNUPGHOME={other} gpg --batch --passphrase '' --quick-gen-key "
+                            "evil ed25519 sign never")
+        evil = self.sh("sh", "-c", f"GNUPGHOME={other} gpg --batch --armor --export-secret-keys")
+        self.release("2.0.2", key=evil)
+        self.fresh_lists()
+        r = self.apt("update", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertRegex(r.stdout + r.stderr, "NO_PUBKEY|not signed|signatures couldn't be verified")
+        self.assertEqual(self.upgradable(), [])
 
 
 SCREEN_CHECK = r"""

@@ -52,10 +52,17 @@ see [Geekworm's scripts: what's included](#geekworms-scripts-whats-included-and-
 | Cool | schedutil | 2.4 GHz | Cool | Full speed, kept cool |
 | Max Cool | conservative | 2.0 GHz | Max | Coolest while still fairly fast |
 | Performance | performance | 2.4 GHz | Cool | Always at top speed |
-| OC 2.6 GHz | ondemand | 2.6 GHz, +0.025 V | Strong | Mild overclock |
-| OC 2.8 GHz | ondemand | 2.8 GHz, +0.05 V | Strong | Medium overclock |
-| OC 3.0 GHz | ondemand | 3.0 GHz, +0.05 V, GPU 1 GHz | Max | Not every chip is stable |
+| OC 2.6 GHz | ondemand | 2.6 GHz, +0.025 V, GPU 1.0 GHz | Strong | Mild overclock, slight GPU overclock |
+| OC 2.8 GHz | ondemand | 2.8 GHz, +0.05 V, GPU 1.05 GHz | Strong | Medium overclock |
+| OC 3.0 GHz | ondemand | 3.0 GHz, +0.05 V, GPU 1.1 GHz | Max | Not every chip is stable |
 | Sweet Spot | ondemand | found by the test | Strong | Only appears after the [test](#3-sweet-spot-overclock-test) |
+
+**GPU overclock:** the overclock plans also raise the 3D GPU (`v3d_freq`) step by step
+from the Pi 5's default of 960 MHz. Only the 3D block is raised, as the Raspberry Pi
+documentation recommends: `gpu_freq` would also overclock the core, ISP and video
+clocks, and `gpu_freq=1000` at 3.0 GHz is known to freeze some Pi 5s. `--status` and
+`--monitor` show the GPU clock. The sweet spot test only tests the CPU, so the "Sweet
+Spot" plan leaves the GPU at its default.
 
 The window lets you change each plan's **governor** and **fan profile**. These choices
 are saved in `/etc/pi5-energyplan/`. You can also edit the `PLANS` and `FAN_PROFILES`
@@ -291,14 +298,20 @@ sudo reboot          # only needed the first time, for I2C and the bootloader se
 Options: `--ups-recommended` (as above), `--no-eeprom` (leave the bootloader alone),
 `--force` (install even if a newer version is installed), `--uninstall`.
 
+Until the update branch is merged, clone it with
+`git clone -b claude/happy-turing-uuu5gu https://github.com/luis199421/x1202.git`.
+
 ### What the installer does
 
 Both ways run `install.sh`. It can be run again at any time and
 [never adds anything twice](#8-nothing-is-ever-added-twice). It:
 
-1. **Installs the packages** with apt (waiting if another apt is running). This is
-   Geekworm's list plus what the window and panel icon need. For each one it uses the
-   Trixie name, or the Bookworm name if that's the one apt knows:
+1. **Builds the `pi5-energyplan` package** from the downloaded files and **installs
+   it with apt** (waiting if another apt is running). That's what lets the Pi's
+   updater offer new versions later (see
+   [Automatic updates](#automatic-updates-through-the-pis-updater)). apt also installs
+   what it needs: Geekworm's list plus what the window and panel icon need, with the
+   Trixie name first and the Bookworm name as the alternative:
 
    | Package | Needed for |
    |---|---|
@@ -312,10 +325,11 @@ Both ways run `install.sh`. It can be run again at any time and
    | `i2c-tools` | `i2cdetect`, to check the UPS |
    | `stress-ng` | The sweet spot overclock test |
 
-2. **Turns on I2C** with `raspi-config` (the X1202's fuel gauge is on I2C).
-3. **Installs the program** as `/usr/local/bin/pi5_energyplan.py`. That folder is on
-   your PATH, so `pi5_energyplan.py --status` works from anywhere. On a reinstall it
-   refreshes both background services so they run the new version.
+2. The package's install step **turns on I2C** with `raspi-config` (the X1202's fuel
+   gauge is on I2C) and **installs the program** as `/usr/local/bin/pi5_energyplan.py`.
+   That folder is on your PATH, so `pi5_energyplan.py --status` works from anywhere.
+   On a reinstall or update it refreshes both background services so they run the
+   new version. This step is the same when the Pi's updater installs an update.
 4. **Sets Geekworm's bootloader settings** (unless you opt out). It skips this when
    they're already set.
 5. **Turns on battery protection** if you chose it.
@@ -443,6 +457,10 @@ After `install.sh`, you can write `pi5_energyplan.py` instead of
 | `/boot/firmware/config.txt.energyplan.bak` | Your original `config.txt` (made once) |
 | `/boot/firmware/tryboot.txt` | Only during the sweet spot test |
 | `/usr/local/bin/pi5_energyplan.py` | The copy the services run |
+| `/usr/share/pi5-energyplan/` | The package's files (the installed version, `install.sh`) |
+| `/etc/apt/sources.list.d/pi5-energyplan.sources`, `/usr/share/keyrings/pi5-energyplan-archive-keyring.asc` | The update source and its key (once the project has a signing key) |
+| `/var/cache/pi5-energyplan/pi5-energyplan_<version>_all.deb` | The package `install.sh` built (only the latest) |
+| `/boot/firmware/config.txt.before-repair` | Only if an update repaired lines an older version had moved (see Troubleshooting) |
 | `/etc/systemd/system/pi5-energyplan.service` | Restores the plan at boot |
 | `/etc/systemd/system/pi5-battery-guard.service` | Battery guard |
 | `/etc/pi5-energyplan/battery.json` | UPS settings |
@@ -462,6 +480,25 @@ After `install.sh`, you can write `pi5_energyplan.py` instead of
 ---
 
 ## 7. Updating and uninstalling
+
+### Automatic updates through the Pi's updater
+
+The program is installed as the package `pi5-energyplan`, and the package adds this
+project's apt repository (on GitHub Pages, signed with the project's own key). When a
+new version is published on GitHub:
+
+* the **update icon in the taskbar** shows it, together with the Pi's other updates,
+  and you click **Install**. `sudo apt update && sudo apt upgrade` works too.
+* installing it runs the same steps as `install.sh`: the system copy and both
+  services are updated, the battery guard restarts with the new version, and the menu
+  entry and panel icon of everyone who has them point at the new version.
+* nothing is installed without you clicking it.
+
+To publish versions, the project needs a one-time setup on GitHub (a signing key and
+GitHub Pages): see [packaging/README.md](packaging/README.md). After that, publishing
+is pushing a tag like `v2.0.1`. Pis need one install from a copy that has the key
+(`git pull`, then `sudo sh install.sh`, or the click installer) to get the update
+source; until then, update them as below.
 
 ### Updating from a previous version
 
@@ -497,12 +534,13 @@ Close the Energy Plan window before updating, then open it again from the menu.
 
 ```bash
 sudo pi5_energyplan.py --apply Balanced   # optional: put the Pi defaults back in config.txt
-sudo sh install.sh --uninstall
+sudo sh install.sh --uninstall            # same as: sudo apt remove pi5-energyplan
 ```
 
 This stops and removes both services (charging is switched back on), the system copy,
-the menu entry and the panel icon. It keeps your settings in `/etc/pi5-energyplan`,
-the bootloader settings, and the installed apt packages.
+the menu entry, the panel icon and the update source. It keeps your settings in
+`/etc/pi5-energyplan`, the bootloader settings, and the other apt packages.
+`sudo apt purge pi5-energyplan` also forgets the settings.
 
 To remove the managed block completely, delete the lines from
 `# >>> pi5-energyplan` to `# <<< pi5-energyplan <<<` at the end of
@@ -521,6 +559,7 @@ second copy of anything:
 | `config.txt` | One managed block between markers, replaced as a whole. Old lines are commented out once. The backup is made only the first time. |
 | Bootloader | Each setting is replaced in place, never added again, and only written when it's different. Your 5 V choice is kept. |
 | Services | The two unit files are rewritten in place; `systemctl enable` is the same every time. |
+| Package | Installing again reinstalls the same package; only the latest built `.deb` is kept. |
 | Menu entry, panel icon | Always the same two files. Starting the icon stops the old one first; a second icon, window, battery guard or boot task refuses to start. |
 | UPS settings | `--ups-recommended` only applies on a first install. |
 | Boot | The boot task only re-applies the governor and max speed; it writes no files. |
@@ -544,6 +583,7 @@ over, then compare every managed file byte for byte.
 | Under-voltage warnings | Check the adapter, cables, load and pogo-pin contact. `PSU_MAX_CURRENT` doesn't fix a weak supply. |
 | Installer warns about Geekworm scripts | Stop them and remove them from autostart, cron or rc.local. Only one program may control the UPS pins. |
 | Battery shows "Plugged in" but never "Charging" | Run `python3 pi5_energyplan.py --charge-debug`. If it says the adapter is too weak, use a stronger supply: the Pi and the charger share it. |
+| **Sound (or another device) stopped working after an update** | Versions before 2.0.0 had a bug: a line added at the **end** of `config.txt` (audio HAT guides say "add `dtoverlay=…` at the end") was moved into the section above the plan block when the block was rewritten. On a stock Raspberry Pi OS file that's `[cm5]`, which a Pi 5 ignores, so the line stopped working. Version 2.0.0 keeps such lines under `[all]`, and its update **repairs** files the old versions changed, then says *"config.txt repaired: … moved back under [all]"*. Reboot afterwards. The file before the repair is kept as `config.txt.before-repair`. To check by hand: `diff /boot/firmware/config.txt.energyplan.bak /boot/firmware/config.txt`. If audio is still off, check the output device (`wpctl status`, or right-click the speaker icon in the taskbar): updates of Raspberry Pi OS itself can change the default output, for example between the two HDMI ports. |
 | **The charge LED turns off, but the battery % keeps going up** | Usually that's not charging. The X1202 has no current sensor: its fuel gauge (MAX17048) *estimates* the % from the cell voltage, and the estimate lags behind, so after charging stops it often creeps up 1–2 % more. Check the **cell voltage** (`pi5_energyplan.py --monitor`, or the "Cell … V" line in the window) for 15–20 minutes. If it falls or stays flat, charging really stopped. If it keeps rising, the board is still charging; the guard notices that by itself and tries the other pin setting. Send the output of `pi5_energyplan.py --charge-debug` if it stays unclear. |
 | Charge limit "✗": board can't pause charging | Your board revision ignores GPIO 16. The guard leaves charging to the board, which stops by itself at full (4.2 V). |
 | A shutdown is counting down and you want to stop it | Plug the adapter back in, or run `sudo shutdown -c`. |
@@ -579,7 +619,7 @@ The installer test for the menu entry and panel icon needs a throwaway user:
 `sudo INSTALL_TEST_USER=someuser sh tests/run_sim_tests.sh`. To run some tests only:
 `sudo TESTS="TestUps TestNothingTwice" sh tests/run_sim_tests.sh`.
 
-The 66 tests cover:
+The 73 tests cover:
 
 * **Plans:** applying each kind of plan, the live sysfs changes and governor fallback,
   `config.txt` editing (backup, commenting out conflicting lines, only `[all]`/`[pi5]`
@@ -616,6 +656,16 @@ The 66 tests cover:
   change on a big screen.
 * **Charging:** the fuel gauge's % creeping up after a pause, with the voltage falling,
   is not mistaken for "pause not working".
+* **Packages and updates:** the package's dependencies, install and remove steps; and
+  with the **real apt**, a published repository: a new version shows up as upgradable
+  (what the Pi's updater sees), downloads with signature and hash checks, and
+  installs; a tampered repository or one signed with another key is refused. The
+  release workflow's steps were also run locally against a test remote.
+* **config.txt sections:** a line added at the end (like an audio overlay) stays under
+  `[all]` through plan changes and updates; an update repairs what the original
+  version moved into `[cm5]`; lines that were in `[cm5]` from the start stay there.
+* **GPU overclock:** 1000 → 1050 → 1100 MHz for the three overclock plans, none for
+  the others, and a hand-made `v3d_freq` can't override the plan.
 * **GUI and panel icon:** the window builds and shows live values; the panel icon
   registers on D-Bus and serves a 64×64 icon and its tooltip.
 * **Uninstall:** `--uninstall-service` and `--uninstall-guard`.

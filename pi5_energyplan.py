@@ -131,30 +131,35 @@ PLANS = {
     },
     # ---- Overclock: need a good power supply (official 27 W) and the Active Cooler.
     # over_voltage_delta is extra CPU voltage in microvolts (50000 = +0.05 V).
+    # v3d_freq is the 3D GPU clock (Pi 5 default 960 MHz). Only the 3D block is
+    # raised, as the Raspberry Pi docs recommend: gpu_freq would also overclock the
+    # core / ISP / video clocks, and gpu_freq=1000 at 3.0 GHz freezes some Pi 5s.
     "OC 2.6 GHz": {
-        "desc": "Mild overclock, works on most Pi 5s.",
+        "desc": "Mild overclock + GPU 1.0 GHz, works on most Pi 5s.",
         "governor": "ondemand",
         "max_freq_mhz": 2600,
         "over_voltage_delta": 25000,
+        "v3d_freq": 1000,
         "fan": list(FAN_PROFILES["Strong"]),
         "color": "#ffca28",
         "warn": True,
     },
     "OC 2.8 GHz": {
-        "desc": "Medium overclock, +0.05 V.",
+        "desc": "Medium overclock, +0.05 V, GPU 1.05 GHz.",
         "governor": "ondemand",
         "max_freq_mhz": 2800,
         "over_voltage_delta": 50000,
+        "v3d_freq": 1050,
         "fan": list(FAN_PROFILES["Strong"]),
         "color": "#ffa000",
         "warn": True,
     },
     "OC 3.0 GHz": {
-        "desc": "Max overclock + GPU 1 GHz. Not every chip is stable.",
+        "desc": "Max overclock + GPU 1.1 GHz. Not every chip is stable.",
         "governor": "ondemand",
         "max_freq_mhz": 3000,
         "over_voltage_delta": 50000,
-        "gpu_freq": 1000,
+        "v3d_freq": 1100,
         "fan": list(FAN_PROFILES["Max"]),
         "color": "#e53935",
         "warn": True,
@@ -169,7 +174,8 @@ CONFIG_PATHS = ["/boot/firmware/config.txt", "/boot/config.txt"]
 BLOCK_START = "# >>> pi5-energyplan (managed by pi5_energyplan.py) >>>"
 BLOCK_END = "# <<< pi5-energyplan <<<"
 CONFLICT_RE = re.compile(
-    r"^\s*(dtparam=fan_temp\d|arm_freq\s*=|over_voltage(_delta)?\s*=|gpu_freq\s*=)")
+    r"^\s*(dtparam=fan_temp\d|arm_freq\s*=|over_voltage(_delta)?\s*=|gpu_freq\s*=|"
+    r"v3d_freq\s*=)")
 THERMAL_ZONE = "/sys/class/thermal/thermal_zone0"
 CPU0 = "/sys/devices/system/cpu/cpu0/cpufreq"
 # If a kernel lacks a governor, use the closest one that exists.
@@ -349,6 +355,17 @@ def throttle_bits():
         return None
     m = re.search(r"0x[0-9a-fA-F]+", out)
     return int(m.group(0), 16) if m else None
+
+
+def gpu_clock_mhz():
+    """Current 3D GPU (V3D) clock, from the firmware."""
+    try:
+        out = subprocess.run(["vcgencmd", "measure_clock", "v3d"], capture_output=True,
+                             text=True, timeout=2).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"=(\d+)", out)
+    return round(int(m.group(1)) / 1e6) if m and int(m.group(1)) else None
 
 
 def cpu_temp_c():
@@ -1523,14 +1540,16 @@ def build_block(name, p=None):
     lines.append(f"arm_freq={p['max_freq_mhz']}")
     if p.get("over_voltage_delta"):
         lines.append(f"over_voltage_delta={int(p['over_voltage_delta'])}")
-    if p.get("gpu_freq"):
-        lines.append(f"gpu_freq={int(p['gpu_freq'])}")
+    for key in ("gpu_freq", "v3d_freq"):   # gpu_freq: older custom plans may use it
+        if p.get(key):
+            lines.append(f"{key}={int(p[key])}")
     lines.append(BLOCK_END)
     return "\n".join(lines) + "\n"
 
 
 def write_config(name, p=None, target=None):
     """Put the plan block into config.txt (or into `target`, e.g. tryboot.txt)."""
+    CONFIG_NOTES.clear()
     path = config_path()
     target = target or path
     if not os.path.exists(path):
@@ -1542,9 +1561,16 @@ def write_config(name, p=None, target=None):
     if target == path and not os.path.exists(backup):
         shutil.copy2(path, backup)
 
-    # Drop our old block
+    # Drop our old block. Lines someone added after it (audio HAT guides say "add
+    # this at the end of config.txt", raspi-config appends there too) were under
+    # the block's [all]: an [all] in its place keeps them there. Without it they'd
+    # end up in the section above (on a stock file [cm5]), which a Pi 5 ignores.
+    def old_block(m):
+        return "[all]\n" if text[m.end():].strip() else ""
     text = re.sub(re.escape(BLOCK_START) + r".*?" + re.escape(BLOCK_END) + r"\n?",
-                  "", text, flags=re.S)
+                  old_block, text, flags=re.S)
+    if target == path:
+        text = repair_moved_lines(text, read(backup, "") or "", path)
 
     # Comment out fan/arm_freq lines elsewhere in [all]/[pi5] so ours win cleanly
     out, section, seen_disabled = [], "all", set()
@@ -1578,6 +1604,60 @@ def write_config(name, p=None, target=None):
         os.fsync(f.fileno())
     os.replace(tmp, target)
     return target
+
+
+CONFIG_NOTES = []   # messages from write_config for the caller to show
+
+
+def sections(lines):
+    """[(header or None, [lines])] in file order."""
+    out = [(None, [])]
+    for line in lines:
+        st = line.strip()
+        if st.startswith("[") and st.endswith("]"):
+            out.append((st.lower(), []))
+        else:
+            out[-1][1].append(line)
+    return out
+
+
+def repair_moved_lines(text, backup, path):
+    """Versions before 2.0.0 moved lines that were added after the plan block into
+    the section above it when they rewrote the block (e.g. under [cm5], which a
+    Pi 5 ignores: an audio overlay added at the end stopped working). Find lines
+    appended to that last section since the backup was made and put them back
+    under [all]. Lines already there before the first change are never moved."""
+    secs = sections(text.splitlines())
+    header, body = secs[-1]
+    if header in (None, "[all]", "[pi5]"):
+        return text
+
+    def content(lines):
+        lines = list(lines)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        return lines
+    cur = content(body)
+    before = [b for h, b in sections(backup.splitlines()) if h == header]
+    if not before:
+        return text
+    orig = content(before[-1])
+    if len(cur) <= len(orig) or cur[:len(orig)] != orig:
+        return text
+    k = len(orig)
+    while k < len(cur) and not cur[k].strip():
+        k += 1
+    moved = [x.strip() for x in cur[k:] if x.strip() and not x.strip().startswith("#")]
+    if not moved:
+        return text
+    lines = text.splitlines()
+    lines.insert(len(lines) - len(body) + k, "[all]")   # body = the file's last lines
+    if not os.path.exists(path + ".before-repair"):
+        shutil.copy2(path, path + ".before-repair")      # the file as it was
+    CONFIG_NOTES.append(f"config.txt repaired: {', '.join(moved)} moved back under [all] "
+                        f"(an older version had put {'it' if len(moved) == 1 else 'them'} "
+                        f"under {header}, where a Pi 5 ignores it). Reboot to apply.")
+    return "\n".join(lines) + "\n"
 
 
 def set_trip_points(fan):
@@ -1647,6 +1727,7 @@ def apply_plan(name, save_config=True):
     if save_config:
         path = write_config(name)
         msgs.append(f"Saved to {path} (reboot for full fan curve)")
+        msgs += CONFIG_NOTES
         try:
             install_service()
             msgs.append("Boot service on: this plan is restored at every boot")
@@ -3066,6 +3147,19 @@ def install_desktop():
     return msgs
 
 
+def refresh_desktop():
+    """User part of an update: older copies updated, and the menu entry / panel icon
+    refreshed if this user has them (nothing is added that wasn't there)."""
+    msgs = refresh_old_copies()
+    if os.path.exists(LAUNCHER):
+        install_launcher()
+        msgs.append("Menu entry refreshed")
+    if os.path.exists(AUTOSTART):
+        install_tray()
+        msgs.append("Battery icon restarted with the new version")
+    return msgs
+
+
 def update_root():
     """Root part of an update. Every step overwrites in place, so running it
     any number of times never adds anything twice."""
@@ -3104,21 +3198,15 @@ def update_root():
         path = config_path()
         before = read(path, "")
         write_config(plan)
-        if read(path, "") != before:
+        msgs += CONFIG_NOTES
+        if read(path, "") != before and not CONFIG_NOTES:
             msgs.append(f"config.txt tidied (one '{plan}' block, no duplicates)")
     return msgs or ["System part already up to date"]
 
 
 def update_all():
     """User part (menu entry, panel icon) plus the root part when needed."""
-    msgs = refresh_old_copies()
-    if os.path.exists(LAUNCHER):
-        install_launcher()
-        msgs.append("Menu entry refreshed")
-    if os.path.exists(AUTOSTART):
-        os.makedirs(os.path.dirname(AUTOSTART), exist_ok=True)
-        install_tray()
-        msgs.append("Battery icon restarted with the new version")
+    msgs = refresh_desktop()
     if any(os.path.exists(p) for p in (SERVICE_PATH, GUARD_UNIT_PATH)) or saved_plan():
         if os.geteuid() == 0:
             msgs += update_root()
@@ -3174,6 +3262,8 @@ def print_status():
     print(f"Fan         : {fmt_fan(s)}")
     print(f"CPU         : {fmt_freq(s)}")
     print(f"Governor    : {s['governor']}")
+    gpu = gpu_clock_mhz()
+    print(f"GPU (3D)    : {f'{gpu} MHz' if gpu else '?'}")
     print(f"Power       : {s['throttled']}")
     print(f"Saved plan  : {s['plan'] or 'none'}")
     print(f"Sweet spot  : {autotest_summary()}")
@@ -3231,6 +3321,7 @@ def monitor_report(bat):
             f"Pi power     : {fmt_pmic(read_pmic())}",
             f"CPU          : {f'{t:.1f} °C' if t is not None else '? °C'} · {fmt_freq(s)} · "
             f"{s['governor'] or '?'}",
+            f"GPU (3D)     : {gpu_clock_mhz() or '?'} MHz",
             f"Fan          : {fmt_fan(s)}",
             f"Power        : {s['throttled'] or '?'}",
             f"Plan         : {s['plan'] or 'none'}"]
@@ -3288,6 +3379,7 @@ def main():
                     help="add the battery icon to the panel and start it at login")
     ap.add_argument("--install-desktop", action="store_true",
                     help="menu entry + panel icon, and update older copies they used")
+    ap.add_argument("--refresh-desktop", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--version", action="store_true", help="print the version")
     ap.add_argument("--ups-config", metavar="JSON",
                     help='battery limits, e.g. \'{"enabled":true,"min":20,"max":80}\' (sudo)')
@@ -3391,8 +3483,8 @@ def main():
     if args.install_tray:
         install_tray()
         return
-    if args.install_desktop:
-        for line in install_desktop():
+    if args.install_desktop or args.refresh_desktop:
+        for line in (install_desktop() if args.install_desktop else refresh_desktop()):
             print(line)
         return
     if args.version:
