@@ -161,6 +161,10 @@ PLANS = {
     },
 }
 
+# Raise on every release. An older copy never replaces a newer installed one
+# (copies without this line, like the first versions, count as version 0).
+VERSION = "2.0.0"
+
 CONFIG_PATHS = ["/boot/firmware/config.txt", "/boot/config.txt"]
 BLOCK_START = "# >>> pi5-energyplan (managed by pi5_energyplan.py) >>>"
 BLOCK_END = "# <<< pi5-energyplan <<<"
@@ -599,6 +603,9 @@ class Battery:
                 and g.get("charge_check") != "unsupported":
             info["state"], info["charging"] = f"Charge limit {g['max']}% reached", False
             info["eta"] = f"Charging paused (resumes below {g['max'] - RESUME_GAP}%)"
+            if rate is not None and rate > Battery.DEADBAND:
+                info["eta"] += " · the % can creep up a little after a pause: that's the " \
+                               "gauge catching up, not charging"
         elif info["charging"] and rate:
             info["eta"] = f"{g['max']}% limit in ≈ {fmt_hours(max(0.0, g['max'] - soc) / rate)}"
 
@@ -761,13 +768,31 @@ def set_plan_fan(name, profile):
 
 def sync_installed_copy():
     """Keep the system copy used by the boot service and battery guard up to date."""
+    return os.path.exists(INSTALLED_SCRIPT) and install_copy()
+
+
+def version_of(path):
+    """(2, 0, 0) from a copy's VERSION line; (0,) for copies without one."""
+    m = re.search(r'^VERSION = "([\d.]+)"', read(path, "") or "", re.M)
+    return tuple(int(x) for x in m.group(1).split(".")) if m else (0,)
+
+
+def installed_is_newer():
     me = os.path.abspath(__file__)
-    if os.path.exists(INSTALLED_SCRIPT) and me != INSTALLED_SCRIPT \
-            and file_sha(me) != file_sha(INSTALLED_SCRIPT):
-        shutil.copy2(me, INSTALLED_SCRIPT)
-        os.chmod(INSTALLED_SCRIPT, 0o755)
-        return True
-    return False
+    return me != INSTALLED_SCRIPT and os.path.exists(INSTALLED_SCRIPT) and \
+        version_of(INSTALLED_SCRIPT) > version_of(me)
+
+
+def install_copy():
+    """Copy this file to INSTALLED_SCRIPT, the copy the services run. Never replaces
+    a newer version with an older one. Returns True when it copied."""
+    me = os.path.abspath(__file__)
+    if me == INSTALLED_SCRIPT or file_sha(me) == file_sha(INSTALLED_SCRIPT) or \
+            installed_is_newer():
+        return False
+    shutil.copy2(me, INSTALLED_SCRIPT)
+    os.chmod(INSTALLED_SCRIPT, 0o755)
+    return True
 
 
 def file_sha(path):
@@ -823,8 +848,11 @@ def read_guard_status():
     return g if time.time() - g.get("updated", 0) < 30 else None
 
 
-CHARGE_PIN_FILE = "/etc/pi5-energyplan/charge_pin_v2.json"
-OLD_CHARGE_PIN_FILE = "/etc/pi5-energyplan/charge_pin.json"  # older, faulty learning
+CHARGE_PIN_FILE = "/etc/pi5-energyplan/charge_pin_v3.json"
+# What older versions learned, forgotten on update: v1 had a charging bug, and v2
+# could mistake the fuel gauge catching up after a pause for "pause not working".
+OLD_CHARGE_PIN_FILES = ("/etc/pi5-energyplan/charge_pin.json",
+                        "/etc/pi5-energyplan/charge_pin_v2.json")
 VOLT_MAX = 4.25  # a full 18650 sits at ~4.2 V; the X1202 charger stops at 4.23 V
 
 
@@ -835,9 +863,12 @@ class ChargeCheck:
     the Pi's own default pin state (input, pull-down), the same state the board
     charges with when no script is running (and what Geekworm's script uses).
 
-    * PAUSED check (on mains, below 98 %): the % must not rise. If it rises 1 %,
-      the "off" level isn't working: try the opposite level once, then give up
-      (pin released, board charges normally).
+    * PAUSED check (on mains, below 98 %): the battery must not keep charging. Only
+      when the % rises 1 % AND the cell voltage rises too, the "off" level isn't
+      working: try the opposite level once, then give up (pin released, board
+      charges normally). The % alone isn't enough: the fuel gauge estimates it from
+      the voltage with a lag, so it often creeps up 1-2 % after charging has
+      stopped, while the voltage falls (no current flows into the cells).
     * ON check (on mains, below 95 %): if the % stays flat for 20 min, try the
       other pin state for 20 min as a PROBE. If that charges, use it from now
       on; if not, go back. A probe is never saved unless it made the battery
@@ -845,6 +876,7 @@ class ChargeCheck:
     Nothing is "verified" at 98 % or more, where the % can't rise anyway."""
     WINDOW = 20 * 60
     PAUSE_RISE, ON_RISE = 1.0, 0.5
+    PAUSE_VRISE = 0.015   # V above the lowest reading since the pause = really charging
 
     def __init__(self, log=print):
         self.log = log
@@ -883,7 +915,7 @@ class ChargeCheck:
             return self._on_args(lvl)
         return ["op", "dh"] if self.off_level == "high" else ["op", "dl"]
 
-    def observe(self, charging, ac, soc, now):
+    def observe(self, charging, ac, soc, now, volt=None):
         """Feed one reading. Returns True when the pin must be set again."""
         if ac != 1 or charging is None or self.status == "unsupported":
             self.base = None
@@ -899,18 +931,23 @@ class ChargeCheck:
             self.base = None
             return False
         if not self.base or self.base["mode"] != mode:
-            self.base = {"mode": mode, "t0": now, "s0": soc, "smin": soc}
+            self.base = {"mode": mode, "t0": now, "s0": soc, "smin": soc, "vmin": volt}
             return False
         b = self.base
         b["smin"] = min(b["smin"], soc)
+        if volt is not None:
+            b["vmin"] = volt if b["vmin"] is None else min(b["vmin"], volt)
         if mode == "paused":
-            return self._paused(b, soc, now)
+            return self._paused(b, soc, now, volt)
         return self._on(b, soc, now)
 
-    def _paused(self, b, soc, now):
-        if soc - b["smin"] >= self.PAUSE_RISE:
+    def _paused(self, b, soc, now, volt=None):
+        volt_up = volt is None or b["vmin"] is None or volt - b["vmin"] >= self.PAUSE_VRISE
+        if soc - b["smin"] >= self.PAUSE_RISE and volt_up:
             self.base = None
-            self.log(f"Charge pause not working: battery rose {b['smin']:.1f}% → {soc:.1f}%")
+            self.log(f"Charge pause not working: battery rose {b['smin']:.1f}% → {soc:.1f}%"
+                     + (f", {b['vmin']:.3f} → {volt:.3f} V" if volt is not None and
+                        b["vmin"] is not None else ""))
             if not self.tried_flip:
                 self.off_level = "low" if self.off_level == "high" else "high"
                 self.tried_flip, self.status = True, "unknown"
@@ -992,10 +1029,10 @@ def battery_guard():
     saver = None  # name of the saver plan while it's active
     volt_high = False
     tick = 0
-    for old in (OLD_CHARGE_PIN_FILE,):  # forget what the older, faulty check learned
+    for old in OLD_CHARGE_PIN_FILES:  # forget what the older, faulty checks learned
         try:
             os.remove(old)
-            log("Removed old charge-pin data (from a version with a charging bug)")
+            log(f"Removed charge-pin data learned by an older version: {old}")
         except OSError:
             pass
     set_charging(True)  # start from a charging state; the limit logic decides next
@@ -1078,7 +1115,7 @@ def battery_guard():
                 # 1b) check that charging really stops / starts; fix the pin if not.
                 #     Also set the pin again every 30 s, in case anything else
                 #     (another UPS script, a crash) changed it.
-                reassert = _charge_check.observe(charging, ac, soc, now)
+                reassert = _charge_check.observe(charging, ac, soc, now, volt)
                 tick += 1
                 if charging is not None and (reassert or tick % 10 == 0):
                     set_charging(charging)
@@ -1164,10 +1201,7 @@ def apply_ups_config(new):
             halt = " " + eeprom_setup(halt_only=True)
         except (OSError, RuntimeError, subprocess.SubprocessError) as e:
             halt = f" (5 V setting not saved: {e})"
-    me = os.path.abspath(__file__)
-    if me != INSTALLED_SCRIPT:
-        shutil.copy2(me, INSTALLED_SCRIPT)
-        os.chmod(INSTALLED_SCRIPT, 0o755)
+    install_copy()
     if read(GUARD_UNIT_PATH) != GUARD_UNIT.strip():
         write(GUARD_UNIT_PATH, GUARD_UNIT)
         subprocess.run(["systemctl", "daemon-reload"], check=True)
@@ -1639,10 +1673,7 @@ WantedBy=multi-user.target
 
 def install_service():
     """Copy this script to /usr/local/bin and enable the boot service."""
-    me = os.path.abspath(__file__)
-    if me != INSTALLED_SCRIPT:
-        shutil.copy2(me, INSTALLED_SCRIPT)
-        os.chmod(INSTALLED_SCRIPT, 0o755)
+    install_copy()
     if read(SERVICE_PATH) != SERVICE_UNIT.strip():
         write(SERVICE_PATH, SERVICE_UNIT)
         subprocess.run(["systemctl", "daemon-reload"], check=True)
@@ -2146,6 +2177,87 @@ def run_root(extra, timeout=180):
 BG, CARD, FG, MUTED = "#1e1f24", "#2a2c33", "#e8e8e8", "#9aa0a6"
 
 
+SCROLLBAR = 18     # wide enough to drag with a finger on a touch screen
+
+
+def screen_room(win):
+    """Usable screen size for a window: minus the taskbar and the title bar."""
+    return win.winfo_screenwidth() - 16, win.winfo_screenheight() - 80
+
+
+def make_scrollable(win, footer=False, **pad):
+    """Build a window's contents in the frame this returns. If the screen is too small
+    for it (e.g. the 800x480 Touch Display) the window is sized to the screen and gets
+    scroll bars; on a big screen it looks exactly as without.
+    footer=True also returns a frame pinned below the scrolling part, for the
+    buttons, so they are always visible."""
+    bg = win["bg"]
+    canvas = tk.Canvas(win, bg=bg, highlightthickness=0, bd=0)
+    bar = {"width": SCROLLBAR, "bg": CARD, "troughcolor": bg, "activebackground": "#555",
+           "highlightthickness": 0, "bd": 0, "relief": "flat"}
+    vbar = tk.Scrollbar(win, orient="vertical", command=canvas.yview, **bar)
+    hbar = tk.Scrollbar(win, orient="horizontal", command=canvas.xview, **bar)
+    canvas.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+    canvas.grid(row=0, column=0, sticky="nsew")
+    win.grid_rowconfigure(0, weight=1)
+    win.grid_columnconfigure(0, weight=1)
+    inner = tk.Frame(canvas, bg=bg, **pad)
+    canvas.create_window(0, 0, window=inner, anchor="nw")
+    foot = None
+    if footer:
+        foot = tk.Frame(win, bg=bg, padx=pad.get("padx", 0))
+        foot.grid(row=2, column=0, columnspan=2, sticky="ew")
+
+    def fit(_=None):
+        w, h = inner.winfo_reqwidth(), inner.winfo_reqheight()
+        room_w, room_h = screen_room(win)
+        if foot is not None:
+            room_h -= foot.winfo_reqheight()
+        need_v = h > room_h
+        need_h = w > room_w - (SCROLLBAR if need_v else 0)
+        need_v = need_v or h > room_h - (SCROLLBAR if need_h else 0)
+        canvas.config(width=min(w, room_w - (SCROLLBAR if need_v else 0)),
+                      height=min(h, room_h - (SCROLLBAR if need_h else 0)),
+                      scrollregion=(0, 0, w, h))
+        if need_v:
+            vbar.grid(row=0, column=1, sticky="ns")
+        else:
+            vbar.grid_remove()
+            canvas.yview_moveto(0)
+        if need_h:
+            hbar.grid(row=1, column=0, sticky="ew")
+        else:
+            hbar.grid_remove()
+            canvas.xview_moveto(0)
+        win.scrolls = (need_v, need_h)
+    inner.bind("<Configure>", fit)
+    if foot is not None:
+        foot.bind("<Configure>", fit)
+
+    def wheel(e):
+        try:
+            if e.widget.winfo_toplevel() is not win or vbar.winfo_ismapped() == 0:
+                return
+        except (AttributeError, tk.TclError):
+            return
+        step = -1 if getattr(e, "num", 0) == 4 or getattr(e, "delta", 0) > 0 else 1
+        canvas.yview_scroll(step * 3, "units")
+    for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+        win.bind_all(seq, wheel, add="+")
+    win.scrolls = (False, False)
+    return (inner, foot) if footer else inner
+
+
+def keep_on_screen(win):
+    """Move a window back inside the screen if part of it is outside."""
+    win.update_idletasks()
+    room_w, room_h = screen_room(win)
+    x = max(0, min(win.winfo_rootx(), room_w - win.winfo_reqwidth()))
+    y = max(0, min(win.winfo_rooty(), room_h - win.winfo_reqheight()))
+    if (x, y) != (win.winfo_rootx(), win.winfo_rooty()):
+        win.geometry(f"+{x}+{y}")
+
+
 def temp_color(t):
     if t is None:
         return MUTED
@@ -2163,7 +2275,6 @@ class App:
         self.root = tk.Tk()
         self.root.title("Pi 5 Energy Plan")
         self.root.configure(bg=BG)
-        self.root.resizable(False, False)
         self.history = []
         self.buttons = {}
         self.busy = False
@@ -2178,12 +2289,19 @@ class App:
 
     def check_update(self):
         me = os.path.abspath(__file__)
-        if os.path.exists(INSTALLED_SCRIPT) and me != INSTALLED_SCRIPT and \
-                file_sha(me) != file_sha(INSTALLED_SCRIPT):
-            self.choose("Update", [("yes", "Update the background services now"),
-                                   ("no", "Not now")], self.do_update,
-                        text="This is a newer version of the script than the one the "
-                             "background services use. Nothing will be added twice.")
+        if me == INSTALLED_SCRIPT or not os.path.exists(INSTALLED_SCRIPT) or \
+                file_sha(me) == file_sha(INSTALLED_SCRIPT):
+            return
+        if installed_is_newer():
+            self.msg.config(text=f"This is an older copy (version {VERSION}). Version "
+                                 f"{fmt_version(version_of(INSTALLED_SCRIPT))} is installed: "
+                                 "open Pi 5 Energy Plan from the menu instead.", fg="#ffa726")
+            return
+        self.choose("Update", [("yes", "Update the background services now"),
+                               ("no", "Not now")], self.do_update,
+                    text=f"This copy (version {VERSION}) differs from the one the background "
+                         f"services use (version {fmt_version(version_of(INSTALLED_SCRIPT))})"
+                         ". Nothing will be added twice.")
 
     def do_update(self, answer):
         if answer == "yes" and not self.blocked("the update", lock_during_test=False):
@@ -2191,6 +2309,7 @@ class App:
             self.msg.config(text="Updating… (enter your password if asked)", fg=MUTED)
 
             def work():
+                refresh_old_copies()
                 if os.path.exists(AUTOSTART):
                     restart_tray()
                 if os.path.exists(LAUNCHER):
@@ -2259,10 +2378,11 @@ class App:
 
     def _build(self):
         pad = {"padx": 14, "pady": 6}
-        self._label(self.root, "Pi 5 Energy Plan", 15, bold=True).pack(anchor="w", **pad)
+        body, foot = make_scrollable(self.root, footer=True)
+        self._label(body, "Pi 5 Energy Plan", 15, bold=True).pack(anchor="w", **pad)
 
         # Live stats card
-        card = tk.Frame(self.root, bg=CARD, padx=12, pady=10)
+        card = tk.Frame(body, bg=CARD, padx=12, pady=10)
         card.pack(fill="x", padx=14)
         self.temp_lbl = self._label(card, "--.- °C", 30, bold=True)
         self.temp_lbl.grid(row=0, column=0, rowspan=6, sticky="w", padx=(0, 18))
@@ -2276,7 +2396,7 @@ class App:
             self.stat[key] = v
 
         # Battery card (Geekworm X120x UPS)
-        bcard = tk.Frame(self.root, bg=CARD, padx=12, pady=8)
+        bcard = tk.Frame(body, bg=CARD, padx=12, pady=8)
         bcard.pack(fill="x", padx=14, pady=(6, 0))
         self.bat_pct = self._label(bcard, "--%", 22, bold=True)
         self.bat_pct.grid(row=0, column=0, rowspan=3, sticky="w", padx=(0, 14))
@@ -2299,12 +2419,12 @@ class App:
         self.bat_banner.grid(row=4, column=0, columnspan=3, sticky="we", pady=(6, 0))
         self.bat_banner.grid_remove()
 
-        self.canvas = tk.Canvas(self.root, width=440, height=70, bg=CARD,
+        self.canvas = tk.Canvas(body, width=440, height=70, bg=CARD,
                                 highlightthickness=0)
         self.canvas.pack(padx=14, pady=(6, 4))
 
         # Plan buttons
-        plans = tk.Frame(self.root, bg=BG)
+        plans = tk.Frame(body, bg=BG)
         plans.pack(fill="x", padx=14, pady=4)
         for c, head in enumerate(("Plan", "Governor", "Fan", "")):
             self._label(plans, head, 8, MUTED).grid(row=0, column=c, sticky="w",
@@ -2339,16 +2459,16 @@ class App:
             self._label(plans, p["desc"], 9, MUTED, wraplength=170, justify="left") \
                 .grid(row=r, column=3, sticky="w", padx=(8, 0))
 
-        tk.Checkbutton(self.root, text="Keep this plan after reboot (config.txt + boot service)",
+        tk.Checkbutton(body, text="Keep this plan after reboot (config.txt + boot service)",
                        variable=self.save_var, bg=BG, fg=FG, selectcolor=CARD,
                        activebackground=BG, activeforeground=FG,
                        font=("DejaVu Sans", 9)).pack(anchor="w", padx=12)
 
-        self.msg = self._label(self.root, "Pick a plan.", 9, MUTED, wraplength=440,
+        self.msg = self._label(foot, "Pick a plan.", 9, MUTED, wraplength=440,
                                justify="left")
         self.msg.pack(anchor="w", padx=14, pady=(4, 6))
 
-        bottom = tk.Frame(self.root, bg=BG)
+        bottom = tk.Frame(foot, bg=BG)
         bottom.pack(fill="x", padx=14, pady=(0, 12))
         for text, cmd in (("Quit", self.root.destroy), ("Reboot now", self.on_reboot),
                           ("Find sweet spot…", self.on_autotest),
@@ -2508,12 +2628,12 @@ class App:
 
     def _build_ups_settings(self):
         cfg = load_battery_cfg()
-        win = self.ups_win = tk.Toplevel(self.root)
-        win.geometry(f"+{self.root.winfo_rootx() + 30}+{max(0, self.root.winfo_rooty() - 10)}")
-        win.title("UPS & battery settings")
-        win.configure(bg=BG, padx=16, pady=12)
-        win.resizable(False, False)
-        win.transient(self.root)
+        top = self.ups_win = tk.Toplevel(self.root)
+        top.geometry(f"+{self.root.winfo_rootx() + 30}+{max(0, self.root.winfo_rooty() - 10)}")
+        top.title("UPS & battery settings")
+        top.configure(bg=BG)
+        top.transient(self.root)
+        win, foot = make_scrollable(top, footer=True, padx=16, pady=12)  # widgets go here
 
         enabled = tk.BooleanVar(value=cfg["enabled"] or not os.path.exists(BATTERY_CFG))
         def step5(v, lo, hi, default):
@@ -2682,7 +2802,7 @@ class App:
                 self, "result", ("UPS settings", False) +
                 run_root(["--ups-config", json.dumps(new)])), daemon=True).start()
             self.root.after(200, self.poll_result)
-            win.destroy()
+            top.destroy()
 
         g = read_guard_status()
         topup_on = bool(g and g.get("topup"))
@@ -2696,7 +2816,7 @@ class App:
                 run_root(["--charge-full", "off" if topup_on else "on"])),
                 daemon=True).start()
             self.root.after(200, self.poll_result)
-            win.destroy()
+            top.destroy()
         if cfg["enabled"] and cfg["max"] < 100:
             row = tk.Frame(win, bg=BG)
             row.pack(fill="x", pady=(10, 0))
@@ -2707,14 +2827,15 @@ class App:
             self._label(row, "e.g. before a trip; the limit comes back when it's full", 8,
                         MUTED).pack(side="left", padx=(8, 0))
 
-        btns = tk.Frame(win, bg=BG)
-        btns.pack(fill="x", pady=(8, 0))
-        for text, cmd, bg in (("Save", save, "#43a047"), ("Cancel", win.destroy, CARD),
+        btns = tk.Frame(foot, bg=BG)
+        btns.pack(fill="x", pady=(4, 12))
+        for text, cmd, bg in (("Save", save, "#43a047"), ("Cancel", top.destroy, CARD),
                               ("Recommended (20–80 %)", recommended, CARD)):
             tk.Button(btns, text=text, command=cmd, relief="flat", bg=bg, fg=FG,
                       activebackground="#555", activeforeground=FG,
                       font=("DejaVu Sans", 9, "bold" if text == "Save" else "normal")) \
                 .pack(side="right", padx=(6, 0), ipadx=6, ipady=2)
+        keep_on_screen(top)
 
     def draw_graph(self):
         c = self.canvas
@@ -2913,17 +3034,49 @@ def install_launcher():
     print(f"Menu entry created: {path} (look under Preferences/System Tools)")
 
 
+def fmt_version(v):
+    return ".".join(map(str, v)) if v != (0,) else "an older one without a number"
+
+
+def refresh_old_copies():
+    """Bring older copies of this script that the menu entry / panel icon pointed at
+    up to date (the old copy is kept next to it as .previous). Otherwise opening
+    one later would run old code."""
+    me = os.path.abspath(__file__)
+    msgs = []
+    for entry in (LAUNCHER, AUTOSTART):
+        m = re.search(r"^Exec=.*?(\S*pi5_energyplan\.py)", read(entry, "") or "", re.M)
+        old = os.path.abspath(m.group(1)) if m else None
+        if not old or old in (me, INSTALLED_SCRIPT) or not os.path.isfile(old) or \
+                BLOCK_START not in (read(old, "") or "") or \
+                version_of(old) >= version_of(me) or not os.access(old, os.W_OK):
+            continue
+        shutil.copy2(old, old + ".previous")
+        shutil.copy2(me, old)
+        msgs.append(f"Older copy updated to version {VERSION}: {old}")
+    return msgs
+
+
+def install_desktop():
+    """User part of an install or update: older copies updated, then the menu entry
+    and panel icon pointing at this copy (each always the same single file)."""
+    msgs = refresh_old_copies()
+    install_launcher()
+    install_tray()
+    return msgs
+
+
 def update_root():
     """Root part of an update. Every step overwrites in place, so running it
     any number of times never adds anything twice."""
     msgs = []
     changed = False
-    me = os.path.abspath(__file__)
     installed = [p for p in (SERVICE_PATH, GUARD_UNIT_PATH) if os.path.exists(p)]
-    if installed and me != INSTALLED_SCRIPT and file_sha(me) != file_sha(INSTALLED_SCRIPT):
-        shutil.copy2(me, INSTALLED_SCRIPT)
-        os.chmod(INSTALLED_SCRIPT, 0o755)
-        msgs.append(f"System copy updated: {INSTALLED_SCRIPT}")
+    if installed and installed_is_newer():
+        msgs.append(f"A newer version ({fmt_version(version_of(INSTALLED_SCRIPT))}) is "
+                    f"installed: this older copy ({VERSION}) was not installed")
+    elif installed and install_copy():
+        msgs.append(f"System copy updated to version {VERSION}: {INSTALLED_SCRIPT}")
         changed = True
     reload_needed = False
     for path, unit in ((SERVICE_PATH, SERVICE_UNIT), (GUARD_UNIT_PATH, GUARD_UNIT)):
@@ -2936,9 +3089,12 @@ def update_root():
     if os.path.exists(GUARD_UNIT_PATH) and (changed or reload_needed):
         subprocess.run(["systemctl", "try-restart", GUARD_SERVICE], capture_output=True)
         msgs.append("Battery guard restarted with the new version")
-    if os.path.exists(OLD_CHARGE_PIN_FILE):
-        os.remove(OLD_CHARGE_PIN_FILE)
-        msgs.append("Old charge-pin data removed (it could keep charging switched off)")
+    old_pin = [f for f in OLD_CHARGE_PIN_FILES if os.path.exists(f)]
+    if old_pin:
+        for f in old_pin:
+            os.remove(f)
+        msgs.append("Old charge-pin data removed (an older version could learn it wrong); "
+                    "it is checked again")
         changed = True
         if os.path.exists(GUARD_UNIT_PATH):
             subprocess.run(["systemctl", "try-restart", GUARD_SERVICE], capture_output=True)
@@ -2955,7 +3111,7 @@ def update_root():
 
 def update_all():
     """User part (menu entry, panel icon) plus the root part when needed."""
-    msgs = []
+    msgs = refresh_old_copies()
     if os.path.exists(LAUNCHER):
         install_launcher()
         msgs.append("Menu entry refreshed")
@@ -2989,6 +3145,8 @@ def charge_debug():
     print("Adapter (GPIO6) :", run(["pinctrl", "get", str(PLD_GPIO)]) or "?")
     print("Charge pin (GPIO16):", run(["pinctrl", "get", str(CHARGE_GPIO)]) or "?")
     print("  normal board: 'pd | lo' or 'dl | lo' = charging allowed, 'dh | hi' = paused")
+    print("  Paused but the % still rises? Watch the cell voltage for 15-20 min: falling or")
+    print("  flat = charging really stopped (the gauge's % lags behind); rising = still charging")
     print("Guard service:", run(["systemctl", "is-active", GUARD_SERVICE]) or "?")
     g = read_guard_status()
     if g:
@@ -3128,6 +3286,9 @@ def main():
     ap.add_argument("--tray", action="store_true", help="run the panel battery icon")
     ap.add_argument("--install-tray", action="store_true",
                     help="add the battery icon to the panel and start it at login")
+    ap.add_argument("--install-desktop", action="store_true",
+                    help="menu entry + panel icon, and update older copies they used")
+    ap.add_argument("--version", action="store_true", help="print the version")
     ap.add_argument("--ups-config", metavar="JSON",
                     help='battery limits, e.g. \'{"enabled":true,"min":20,"max":80}\' (sudo)')
     ap.add_argument("--set-governor", nargs=2, metavar=("PLAN", "GOVERNOR"),
@@ -3229,6 +3390,13 @@ def main():
         return
     if args.install_tray:
         install_tray()
+        return
+    if args.install_desktop:
+        for line in install_desktop():
+            print(line)
+        return
+    if args.version:
+        print(VERSION)
         return
 
     if args.autotest_status:

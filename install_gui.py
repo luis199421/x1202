@@ -8,6 +8,7 @@ shows the progress, then adds the menu entry and panel battery icon for you.
 """
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -18,6 +19,21 @@ INSTALL_SH = os.path.join(HERE, "install.sh")
 INSTALLED = "/usr/local/bin/pi5_energyplan.py"
 TITLE = "Install Pi 5 Energy Plan"
 BG, CARD, FG, MUTED, GREEN, RED = "#1e1f24", "#2a2c33", "#e8e8e8", "#9aa0a6", "#66bb6a", "#ef5350"
+
+
+def version(path):
+    """The VERSION line of a copy of pi5_energyplan.py: '2.0.0', '0' if none, None if
+    there's no file."""
+    try:
+        with open(path) as f:
+            m = re.search(r'^VERSION = "([\d.]+)"', f.read(), re.M)
+    except OSError:
+        return None
+    return m.group(1) if m else "0"
+
+
+def newer(a, b):
+    return tuple(map(int, a.split("."))) > tuple(map(int, b.split(".")))
 
 
 def root_cmd(args):
@@ -56,8 +72,8 @@ class Installer:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title(TITLE)
-        self.root.configure(bg=BG, padx=16, pady=12)
-        self.root.minsize(560, 0)
+        self.root.configure(bg=BG)
+        self.small = self.root.winfo_screenheight() < 700   # e.g. 800x480, 1024x600
         self.q = queue.Queue()
         self.reboot_needed = False
         self.installed = os.path.exists(INSTALLED)
@@ -83,14 +99,29 @@ class Installer:
                          font=("DejaVu Sans", 10, "bold" if bold else "normal"))
 
     def _build(self):
-        r = self.root
+        r, foot = self.make_scrollable(self.root)
         self.label(r, "Pi 5 Energy Plan", 15, bold=True).pack(anchor="w")
         self.label(r, "Energy plans for the Raspberry Pi 5 and battery management for the "
                       "Geekworm X1202 UPS (X1200 / X1201 too).", 9, MUTED,
                    wraplength=530).pack(anchor="w", pady=(2, 8))
-        if self.installed:
-            self.label(r, "Already installed: Install again to update it.", 9,
-                       "#90caf9").pack(anchor="w", pady=(0, 6))
+        here, there = version(os.path.join(HERE, "pi5_energyplan.py")), version(INSTALLED)
+        self.install_label, self.force = "Install", False
+        if there is not None:
+            self.install_label = "Install again" if there == here else f"Update to {here}"
+            if newer(there, here):     # only on purpose: install.sh needs --force for this
+                self.install_label, self.force = f"Go back to {here}", True
+            if newer(there, here):
+                text, col = (f"Version {there} is installed, newer than this download "
+                             f"({here}): installing would go back to an older version.",
+                             "#ffa726")
+            elif there == here:
+                text, col = f"Version {here} is installed: Install again to repair it.", \
+                    "#90caf9"
+            else:
+                old = there if there != "0" else "an older one"
+                text, col = f"Installed: version {old}. Install updates it to {here}.", \
+                    "#90caf9"
+            self.label(r, text, 9, col, wraplength=530).pack(anchor="w", pady=(0, 6))
 
         box = tk.Frame(r, bg=CARD, padx=10, pady=8)
         box.pack(fill="x")
@@ -107,32 +138,75 @@ class Installer:
         self.check(box, "Menu entry and battery icon in the panel",
                    self.opt_desktop).pack(fill="x")
 
-        self.step = self.label(r, "Ready.", 10, bold=True)
-        self.step.pack(anchor="w", pady=(10, 2))
-        self.bar = tk.Canvas(r, height=6, bg=CARD, highlightthickness=0)
-        self.bar.pack(fill="x")
-        self.bar_pos = 0
-
         logf = tk.Frame(r, bg=BG)
-        logf.pack(fill="both", expand=True, pady=(6, 0))
-        self.log = tk.Text(logf, height=12, bg="#141519", fg="#c8c8c8", relief="flat",
-                           font=("DejaVu Sans Mono", 8), wrap="word", state="disabled")
+        logf.pack(fill="both", expand=True, pady=(10, 0))
+        self.log = tk.Text(logf, height=5 if self.small else 12, bg="#141519", fg="#c8c8c8",
+                           relief="flat", font=("DejaVu Sans Mono", 8), wrap="word",
+                           state="disabled")
         sb = tk.Scrollbar(logf, command=self.log.yview)
         self.log.config(yscrollcommand=sb.set)
         self.log.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
 
-        self.btns = tk.Frame(r, bg=BG)
-        self.btns.pack(fill="x", pady=(10, 0))
+        # progress and buttons stay visible at the bottom, even on a small screen
+        self.step = self.label(foot, "Ready.", 10, bold=True, wraplength=530)
+        self.step.pack(anchor="w", pady=(0, 2))
+        self.bar = tk.Canvas(foot, height=6, bg=CARD, highlightthickness=0)
+        self.bar.pack(fill="x")
+        self.bar_pos = 0
+        self.btns = tk.Frame(foot, bg=BG)
+        self.btns.pack(fill="x", pady=(8, 4))
         self.show_buttons("start")
+
+    def make_scrollable(self, win):
+        """Like pi5_energyplan.make_scrollable: scroll bars only when the screen is
+        too small for the window (e.g. the 800x480 Touch Display)."""
+        bar = 18
+        canvas = tk.Canvas(win, bg=BG, highlightthickness=0, bd=0)
+        vbar = tk.Scrollbar(win, orient="vertical", command=canvas.yview, width=bar, bg=CARD,
+                            troughcolor=BG, activebackground="#555", highlightthickness=0,
+                            bd=0, relief="flat")
+        canvas.configure(yscrollcommand=vbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        win.grid_rowconfigure(0, weight=1)
+        win.grid_columnconfigure(0, weight=1)
+        inner = tk.Frame(canvas, bg=BG, padx=16, pady=12)
+        canvas.create_window(0, 0, window=inner, anchor="nw")
+        foot = tk.Frame(win, bg=BG, padx=16, pady=8)    # status + buttons, always visible
+        foot.grid(row=1, column=0, columnspan=2, sticky="ew")
+
+        def fit(_=None):
+            room_w = win.winfo_screenwidth() - 16
+            room_h = win.winfo_screenheight() - 80 - foot.winfo_reqheight()
+            w, h = max(560, inner.winfo_reqwidth()), inner.winfo_reqheight()
+            need = h > room_h
+            canvas.config(width=min(w, room_w - (bar if need else 0)),
+                          height=min(h, room_h), scrollregion=(0, 0, w, h))
+            canvas.itemconfigure(1, width=min(w, room_w - (bar if need else 0)))
+            if need:
+                vbar.grid(row=0, column=1, sticky="ns")
+            else:
+                vbar.grid_remove()
+            win.scrolls = need
+        inner.bind("<Configure>", fit)
+        foot.bind("<Configure>", fit)
+
+        def wheel(e):
+            if vbar.winfo_ismapped():
+                canvas.yview_scroll(-3 if getattr(e, "num", 0) == 4 or
+                                    getattr(e, "delta", 0) > 0 else 3, "units")
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            win.bind_all(seq, wheel, add="+")
+        self.canvas = canvas
+        win.scrolls = False
+        return inner, foot
 
     def show_buttons(self, stage):
         for w in self.btns.winfo_children():
             w.destroy()
         b = []
         if stage == "start":
-            b.append(("Install" if not self.installed else "Install again (update)",
-                      self.start_install, "#43a047", True))
+            b.append((self.install_label, self.start_install, "#43a047", True))
             if self.installed:
                 b.append(("Uninstall", self.start_uninstall, CARD, False))
         elif stage == "done":
@@ -146,6 +220,8 @@ class Installer:
             b.append(("Close", self.root.destroy, CARD, False))
         for text, cmd, bg, bold in reversed(b):
             self.button(self.btns, text, cmd, bg, bold).pack(side="right", padx=(6, 0))
+        if getattr(self, "canvas", None) is not None and stage != "start":
+            self.root.after(50, lambda: self.canvas.yview_moveto(1))   # show the buttons
 
     def write(self, text):
         self.log.config(state="normal")
@@ -222,12 +298,12 @@ class Installer:
             args.append("--ups-recommended")
         if not self.opt_eeprom.get():
             args.append("--no-eeprom")
+        if self.force:
+            args.append("--force")
         steps = [("Installing (enter your password)", root_cmd(args))]
         if self.opt_desktop.get():
-            steps += [("Adding the menu entry", [sys.executable, INSTALLED,
-                                                 "--install-launcher"]),
-                      ("Adding the battery icon to the panel", [sys.executable, INSTALLED,
-                                                                "--install-tray"])]
+            steps.append(("Adding the menu entry and the battery icon to the panel",
+                          [sys.executable, INSTALLED, "--install-desktop"]))
         self.action = "install"
         self.reboot_needed = False
         self.run_bg(steps)

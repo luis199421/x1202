@@ -493,14 +493,25 @@ class TestUps(Base):
         cc = self.ep.ChargeCheck(log=lambda m: None)
         self.assertEqual(cc.pin_args(False), ["op", "dh"])
         self.assertEqual(cc.pin_args(True), ["ip", "pd"])
-        cc.observe(False, 1, 70.0, 0)
-        self.assertTrue(cc.observe(False, 1, 71.2, 60))     # rose while "paused"
+        cc.observe(False, 1, 70.0, 0, 3.95)
+        self.assertTrue(cc.observe(False, 1, 71.2, 60, 3.98))   # % and volts rose: charging
         self.assertEqual(cc.off_level, "low")
         self.assertEqual(cc.pin_args(False), ["op", "dl"])
-        cc.observe(False, 1, 72.0, 100)
-        self.assertTrue(cc.observe(False, 1, 73.5, 200))    # still rising
+        cc.observe(False, 1, 72.0, 100, 3.99)
+        self.assertTrue(cc.observe(False, 1, 73.5, 200, 4.02))  # still charging
         self.assertEqual(cc.status, "unsupported")
         self.assertEqual(cc.pin_args(False), ["ip", "pd"])  # pin released
+
+    def test_gauge_creeping_up_after_a_pause_is_not_charging(self):
+        """The LED goes off, the % keeps rising for a while, the voltage falls:
+        that's the fuel gauge catching up, so the pin must not be changed."""
+        cc = self.ep.ChargeCheck(log=lambda m: None)
+        cc.observe(False, 1, 80.0, 0, 4.10)
+        for i, (soc, volt) in enumerate([(80.4, 4.06), (80.9, 4.04), (81.5, 4.03),
+                                         (82.0, 4.02), (82.3, 4.02)], start=1):
+            self.assertFalse(cc.observe(False, 1, soc, i * 60, volt))
+        self.assertEqual((cc.off_level, cc.status), ("high", "unknown"))
+        self.assertEqual(cc.pin_args(False), ["op", "dh"])   # still pausing
 
     def test_charge_check_probe_is_undone_if_useless(self):
         cc = self.ep.ChargeCheck(log=lambda m: None)
@@ -977,6 +988,225 @@ class TestNothingTwice(Base):
         self.assertEqual(sum(c.startswith("rpi-eeprom-config --apply") for c in calls()), 1)
 
 
+PREVIOUS = os.path.join(HERE, "previous")
+
+
+class TestUpgrade(Base):
+    """Updating over an installed previous version, with the command line."""
+
+    def setUp(self):
+        super().setUp()
+        import tempfile
+        self.home = tempfile.mkdtemp()
+        self.env = dict(os.environ, HOME=self.home)
+        self.old_dir = os.path.join(self.home, "pi5-energyplan")
+
+    def tearDown(self):
+        subprocess.run(["pkill", "-f", "pi5_energyplan.py --tr" + "ay"])
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def run_py(self, script, *args, check=True):
+        r = subprocess.run([sys.executable, script, *args], capture_output=True, text=True,
+                           env=self.env, timeout=120)
+        if check:
+            self.assertEqual(r.returncode, 0, f"{args}: {r.stdout}{r.stderr}")
+        return r
+
+    def install_sh(self, *args, src_dir=None, check=True):
+        script = os.path.join(src_dir or os.path.dirname(HERE), "install.sh")
+        r = subprocess.run(["sh", script, *args], capture_output=True, text=True,
+                           env=self.env, timeout=180)
+        if check:
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return r
+
+    def set_up_previous(self, name):
+        """Install a previous version the way its users did: copy in ~/pi5-energyplan,
+        menu entry, panel icon, a plan, UPS settings, a fan choice."""
+        os.makedirs(self.old_dir)
+        old = os.path.join(self.old_dir, "pi5_energyplan.py")
+        shutil.copy2(os.path.join(PREVIOUS, name), old)
+        for args in (["--install-launcher"], ["--install-tray"], ["--apply", "Cool"],
+                     ["--ups-config", '{"enabled": true, "max": 85, "min": 25}'],
+                     ["--set-fan", "Eco", "Strong"]):
+            self.run_py(old, *args)
+        put("/etc/pi5-energyplan/charge_pin.json", '{"off_level": "low"}')  # old faulty data
+        put("/etc/pi5-energyplan/charge_pin_v2.json", '{"off_level": "low", "status": '
+            '"unknown", "tried_flip": true}')      # possibly learned from the gauge lag
+        self.assertEqual(get("/usr/local/bin/pi5_energyplan.py"), get(old))
+        return old
+
+    def check_updated(self, old, previous_name):
+        new = get(SCRIPT)
+        self.assertEqual(get("/usr/local/bin/pi5_energyplan.py"), new)
+        self.assertEqual(get("/var/lib/pi5-energyplan/previous-version.py"),
+                         get(os.path.join(PREVIOUS, previous_name)))
+        # settings from the old version are kept, new ones get their defaults
+        cfg = json.loads(get("/etc/pi5-energyplan/battery.json"))
+        self.assertEqual((cfg["enabled"], cfg["max"], cfg["min"]), (True, 85, 25))
+        self.assertEqual(json.loads(get("/etc/pi5-energyplan/fans.json")), {"Eco": "Strong"})
+        self.assertFalse(os.path.exists("/etc/pi5-energyplan/charge_pin.json"))
+        self.assertFalse(os.path.exists("/etc/pi5-energyplan/charge_pin_v2.json"))
+        conf = self.config()
+        self.assertEqual(conf.count("# >>> pi5-energyplan"), 1)
+        self.assertIn("# plan: Cool", conf)
+        self.assertIn("systemctl try-restart pi5-battery-guard.service", calls())
+        units = sorted(glob.glob("/etc/systemd/system/*"))
+        self.assertEqual(units, ["/etc/systemd/system/pi5-battery-guard.service",
+                                 "/etc/systemd/system/pi5-energyplan.service"])
+        st = self.run_py("/usr/local/bin/pi5_energyplan.py", "--status").stdout
+        self.assertIn("Saved plan  : Cool", st)
+        self.assertEqual(self.run_py("/usr/local/bin/pi5_energyplan.py", "--version")
+                         .stdout.strip(), self.ep.VERSION)
+
+        # the user part: the old copy the menu / panel used is brought up to date
+        out = self.run_py("/usr/local/bin/pi5_energyplan.py", "--install-desktop").stdout
+        self.assertIn(f"Older copy updated to version {self.ep.VERSION}: {old}", out)
+        self.assertEqual(get(old), new)
+        self.assertEqual(get(old + ".previous"), get(os.path.join(PREVIOUS, previous_name)))
+        apps = glob.glob(self.home + "/.local/share/applications/*")
+        auto = glob.glob(self.home + "/.config/autostart/*")
+        self.assertEqual(len(apps), 1)
+        self.assertEqual(len(auto), 1)
+        self.assertIn("/usr/local/bin/pi5_energyplan.py\n", get(apps[0]))
+        self.assertIn("/usr/local/bin/pi5_energyplan.py --tray", get(auto[0]))
+
+    def test_update_original_version_with_install_sh(self):
+        old = self.set_up_previous("pi5_energyplan_original.py")
+        out = self.install_sh().stdout
+        self.assertIn("Updating from version an older one without a number to "
+                      f"{self.ep.VERSION}", out)
+        self.check_updated(old, "pi5_energyplan_original.py")
+        before = {f: get(f) for f in glob.glob("/etc/pi5-energyplan/*") +
+                  glob.glob("/etc/systemd/system/*") + ["/boot/firmware/config.txt"]}
+        out = self.install_sh().stdout                     # running it again
+        self.assertIn(f"Version {self.ep.VERSION} is already installed", out)
+        self.assertEqual(get("/var/lib/pi5-energyplan/previous-version.py"),
+                         get(os.path.join(PREVIOUS, "pi5_energyplan_original.py")))
+        self.assertEqual({f: get(f) for f in before}, before)
+        self.assertEqual(self.run_py("/usr/local/bin/pi5_energyplan.py", "--install-desktop")
+                         .stdout.strip(), "Menu entry created: " + self.home +
+                         "/.local/share/applications/pi5-energyplan.desktop (look under "
+                         "Preferences/System Tools)\nBattery icon added to the panel and "
+                         "set to start at login.\nRemove it: rm " + self.home +
+                         "/.config/autostart/pi5-battery-tray.desktop  (and log out/in)")
+
+    def test_update_first_release_with_install_sh(self):
+        old = self.set_up_previous("pi5_energyplan_first_release.py")
+        out = self.install_sh().stdout
+        self.assertIn(f"to {self.ep.VERSION}", out)
+        self.check_updated(old, "pi5_energyplan_first_release.py")
+
+    def test_update_with_the_scripts_own_update_command(self):
+        """Old way: put the new file in ~/pi5-energyplan, then run --update there."""
+        old = self.set_up_previous("pi5_energyplan_original.py")
+        shutil.copy2(SCRIPT, old)
+        out = self.run_py(old, "--update").stdout
+        self.assertIn(f"System copy updated to version {self.ep.VERSION}", out)
+        self.assertIn("Old charge-pin data removed", out)
+        self.assertEqual(get("/usr/local/bin/pi5_energyplan.py"), get(SCRIPT))
+        self.assertIn("systemctl try-restart pi5-battery-guard.service", calls())
+        self.assertFalse(os.path.exists("/etc/pi5-energyplan/charge_pin.json"))
+        self.assertEqual(len(glob.glob(self.home + "/.config/autostart/*")), 1)
+        self.assertIn("System part already up to date", self.run_py(old, "--update").stdout)
+
+    def test_never_goes_back_to_an_older_version(self):
+        self.install_sh()
+        new = get("/usr/local/bin/pi5_energyplan.py")
+        # an older download: install.sh refuses unless --force
+        older = os.path.join(self.home, "old-download")
+        os.makedirs(older)
+        shutil.copy2(os.path.join(PREVIOUS, "pi5_energyplan_original.py"),
+                     os.path.join(older, "pi5_energyplan.py"))
+        shutil.copy2(os.path.join(os.path.dirname(HERE), "install.sh"), older)
+        r = self.install_sh(src_dir=older, check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn(f"Version {self.ep.VERSION} is installed, which is newer", r.stdout)
+        self.assertEqual(get("/usr/local/bin/pi5_energyplan.py"), new)
+        # an older numbered copy that applies a plan or saves settings doesn't copy itself
+        lower = os.path.join(older, "pi5_energyplan.py")
+        put(lower, new.replace(f'VERSION = "{self.ep.VERSION}"', 'VERSION = "1.9.0"'))
+        self.run_py(lower, "--apply", "Cool")
+        self.run_py(lower, "--ups-config", '{"enabled": true}')
+        self.run_py(lower, "--set-fan", "Cool", "Max")
+        self.assertIn("A newer version (" + self.ep.VERSION,
+                      self.run_py(lower, "--update").stdout)
+        self.assertEqual(get("/usr/local/bin/pi5_energyplan.py"), new)
+        # --force does it on purpose
+        self.install_sh("--force", src_dir=older)
+        self.assertIn('VERSION = "1.9.0"', get("/usr/local/bin/pi5_energyplan.py"))
+
+
+SCREEN_CHECK = r"""
+import importlib.util, json, sys, time
+sys.argv = ["x"]
+sys.path.insert(0, %(here)r)
+import test_sim as t
+res = {}
+def info(win, name):
+    for _ in range(8):
+        win.update()
+    res[name] = dict(w=win.winfo_width(), h=win.winfo_height(), x=win.winfo_rootx(),
+                     y=win.winfo_rooty(), sw=win.winfo_screenwidth(),
+                     sh=win.winfo_screenheight(), scrolls=win.scrolls)
+ep = t.load_module()
+app = ep.App()
+info(app.root, "main")
+app.open_ups_settings()
+info(app.ups_win, "ups")
+app.root.destroy()
+spec = importlib.util.spec_from_file_location("ig", %(gui)r)
+ig = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ig)
+inst = ig.Installer()
+info(inst.root, "installer")
+print(json.dumps(res))
+"""
+
+
+@unittest.skipUnless(shutil.which("Xvfb") and importlib.util.find_spec("tkinter"),
+                     "needs Xvfb and tkinter")
+class TestSmallScreens(Base):
+    def measure(self, w, h, n):
+        xvfb = subprocess.Popen(["Xvfb", f":{n}", "-screen", "0", f"{w}x{h}x24",
+                                 "-nolisten", "tcp"], stderr=subprocess.DEVNULL)
+        try:
+            for _ in range(50):
+                if os.path.exists(f"/tmp/.X11-unix/X{n}"):
+                    break
+                time.sleep(0.1)
+            code = SCREEN_CHECK % {"here": HERE,
+                                   "gui": os.path.join(os.path.dirname(HERE), "install_gui.py")}
+            r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                               env=dict(os.environ, DISPLAY=f":{n}"), timeout=120)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return json.loads(r.stdout.strip().splitlines()[-1])
+        finally:
+            xvfb.kill()
+            xvfb.wait()
+
+    def test_windows_fit_every_screen(self):
+        cli("--ups-config", '{"enabled": true, "saver_enabled": true}')
+        sizes = [(800, 480), (1024, 600), (1280, 720), (1920, 1080)]
+        big = None
+        for i, (w, h) in enumerate(sizes):
+            res = self.measure(w, h, 90 + i)
+            for name, r in res.items():
+                where = f"{name} at {w}x{h}: {r}"
+                # inside the screen, leaving room for the taskbar and title bar
+                self.assertLessEqual(r["x"] + r["w"], w, where)
+                self.assertLessEqual(r["y"] + r["h"], h - 60, where)
+            if (w, h) == (800, 480):
+                self.assertTrue(res["main"]["scrolls"][0], "main window should scroll")
+                self.assertTrue(res["ups"]["scrolls"][0], "UPS settings should scroll")
+            if (w, h) == (1920, 1080):
+                big = res
+        # on a big screen nothing scrolls: the windows look as they always did
+        self.assertEqual(big["main"]["scrolls"], [False, False])
+        self.assertEqual(big["ups"]["scrolls"], [False, False])
+        self.assertFalse(big["installer"]["scrolls"])
+
+
 HAVE_TK = bool(importlib.util.find_spec("tkinter") and os.environ.get("DISPLAY"))
 KEEP_TK = []
 
@@ -1006,6 +1236,34 @@ class TestInstallLauncher(unittest.TestCase):
 
 @unittest.skipUnless(HAVE_TK, "needs tkinter and a display (use xvfb-run)")
 class TestInstallGui(Base):
+    def test_button_says_update_reinstall_or_go_back(self):
+        spec = importlib.util.spec_from_file_location(
+            "ig", os.path.join(os.path.dirname(HERE), "install_gui.py"))
+        ig = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ig)
+        ver = self.ep.VERSION
+        cases = [(None, "Install", False),
+                 (get(os.path.join(PREVIOUS, "pi5_energyplan_original.py")),
+                  f"Update to {ver}", False),
+                 (get(SCRIPT), "Install again", False),
+                 (get(SCRIPT).replace(f'VERSION = "{ver}"', 'VERSION = "9.0.0"'),
+                  f"Go back to {ver}", True)]
+        for content, label, force in cases:
+            if content is None:
+                if os.path.exists(ig.INSTALLED):
+                    os.remove(ig.INSTALLED)
+            else:
+                put(ig.INSTALLED, content)
+            app = ig.Installer()
+            try:
+                app.root.update()
+                buttons = [w.cget("text") for w in app.btns.winfo_children()]
+                self.assertIn(label, buttons)
+                self.assertEqual(app.force, force)
+            finally:
+                app.root.destroy()
+                KEEP_TK.append(app)
+
     def test_install_and_uninstall_from_the_window(self):
         import tempfile
         home = tempfile.mkdtemp()

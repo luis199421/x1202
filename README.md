@@ -158,7 +158,7 @@ starts at every boot. Every 3 seconds it does the following:
 | Feature | What it does |
 |---|---|
 | **Charge limit** ("stop charging at X %") | Turns charging off at X % and back on 5 % below it. Keeping a Li-ion cell at 20–80 % gives it many more cycles. 100 % means no limit. |
-| **Charge-pin self-check** | Checks that charging really pauses and resumes. If the battery keeps rising while it should be paused, the script tries the opposite pin level once. If that also fails, it gives up and leaves charging to the board. It never leaves charging switched off by mistake. |
+| **Charge-pin self-check** | Checks that charging really pauses and resumes. If the battery keeps charging while it should be paused (the % **and** the cell voltage rise), the script tries the opposite pin level once. If that also fails, it gives up and leaves charging to the board. It never leaves charging switched off by mistake. A % that only creeps up after a pause is not counted: that's the fuel gauge catching up (see [Troubleshooting](#9-troubleshooting)). |
 | **Safe shutdown at Y %** | Only when **on battery**. It needs 3 readings in a row at or below Y % (or below 3.30 V per cell). Then it runs `shutdown -h +N` with a 1, 2 or 5-minute warning. **Plugging power back in cancels it.** |
 | **Shutdown after a power cut** | Optional: shut down when the power has been out for 15 seconds, or 1, 5, 15, 30 or 60 minutes. "15 seconds" is Geekworm's "shut down on power loss", with a short wait so a glitch doesn't turn the Pi off. If power comes back in time, nothing happens. |
 | **Charge to 100 % once** | A button in UPS settings (or `--charge-full on`): ignores the limit until the battery is full, for example before a trip, then the limit comes back. A reboot or 12 hours also end it. |
@@ -274,7 +274,8 @@ The options are:
   (see [5 V outputs after shutdown](#5-v-outputs-after-shutdown-bootloader-setting)).
 * **Menu entry and battery icon in the panel.**
 
-Run the same installer again to **update** (it says *Install again*) or to
+Run a newer download's installer to **update** (the button says *Update to …*; see
+[Updating from a previous version](#updating-from-a-previous-version)), or the same one to
 **Uninstall**. If the launcher doesn't start, double-click `install_gui.py` instead and
 click **Execute**.
 
@@ -288,7 +289,7 @@ sudo reboot          # only needed the first time, for I2C and the bootloader se
 ```
 
 Options: `--ups-recommended` (as above), `--no-eeprom` (leave the bootloader alone),
-`--uninstall`.
+`--force` (install even if a newer version is installed), `--uninstall`.
 
 ### What the installer does
 
@@ -372,6 +373,15 @@ Applying a plan or saving UPS settings for the first time copies the script to
   5 V outputs after shutdown, battery saver, and **Charge to 100 % once**.
 
 ![UPS settings](docs/ups-settings.png)
+
+### Small screens
+
+On a small screen, like the 7" Touch Display (800×480) or 1024×600, the windows fit
+the screen and get a scroll bar (mouse wheel works too). The buttons and the status
+line stay pinned at the bottom, so they're always visible. On a normal monitor
+nothing changes.
+
+![The window on an 800×480 screen](docs/small-screen.png)
 * **Battery in panel**: adds the panel icon.
 * **Find sweet spot…**: starts or cancels the overclock test.
 * When you run a newer copy of the script, the window offers to **update the
@@ -396,6 +406,8 @@ After `install.sh`, you can write `pi5_energyplan.py` instead of
 | `sudo python3 pi5_energyplan.py --charge-full on` | Charge to 100 % once, then back to the limit (`off` cancels) |
 | `sudo python3 pi5_energyplan.py --usb-5v-when-off on` | Keep the 5 V outputs on after shutdown (`off` = turn them off) |
 | `sudo python3 pi5_energyplan.py --eeprom-setup` | Set Geekworm's bootloader settings |
+| `python3 pi5_energyplan.py --version` | Print the version |
+| `python3 pi5_energyplan.py --install-desktop` | Menu entry and panel icon (and update older copies they pointed at) |
 | `python3 pi5_energyplan.py --charge-debug` | Everything about charging: pins, guard state, last log lines |
 | `sudo python3 pi5_energyplan.py --ups-config '{"enabled":true,"max":80,"min":20}'` | Set the UPS settings without the window (see below) |
 | `python3 pi5_energyplan.py --install-launcher` | Add the menu entry |
@@ -436,9 +448,11 @@ After `install.sh`, you can write `pi5_energyplan.py` instead of
 | `/etc/pi5-energyplan/battery.json` | UPS settings |
 | `/etc/pi5-energyplan/governors.json`, `fans.json` | Your per-plan governor and fan choices |
 | `/etc/pi5-energyplan/custom.json` | The "Sweet Spot" plan |
-| `/etc/pi5-energyplan/charge_pin_v2.json` | What the charge-pin self-check learned |
+| `/etc/pi5-energyplan/charge_pin_v3.json` | What the charge-pin self-check learned |
 | `/var/lib/pi5-energyplan/autotest.json`, `autotest.log` | Sweet spot test state and log |
 | `/var/lib/pi5-energyplan/eeprom-before.conf` | Your bootloader settings before the first change (made once) |
+| `/var/lib/pi5-energyplan/previous-version.py` | The version an update replaced, for going back |
+| `<old copy>.previous` | Next to an older copy that an update brought up to date |
 | Bootloader (EEPROM) | `POWER_OFF_ON_HALT` and `PSU_MAX_CURRENT` |
 | `/run/pi5-energyplan/battery-guard.json` | Live guard status, read by the window and the icon |
 | `/run/pi5-energyplan/charge-full-once` | Only while "Charge to 100 % once" is on |
@@ -449,18 +463,35 @@ After `install.sh`, you can write `pi5_energyplan.py` instead of
 
 ## 7. Updating and uninstalling
 
-**Update:** download the new ZIP and double-click **Install Pi 5 Energy Plan** again
-(it says *Install again (update)*), or in a terminal:
+### Updating from a previous version
 
-```bash
-cd x1202 && git pull
-sudo sh install.sh
-```
+Any earlier version can be updated in place, including the very first one (before
+version numbers) installed by hand in `~/pi5-energyplan`.
 
-This installs any new packages, replaces the system copy, refreshes both services,
-the menu entry and the panel icon, and never adds anything twice. If you installed
-manually, run `python3 pi5_energyplan.py --update` instead. The window also offers to
-update when it notices a newer version.
+* **Without a terminal:** download the new ZIP, extract it and double-click
+  **Install Pi 5 Energy Plan**. It shows the installed version and the button says
+  **Update to 2.0.0**.
+* **With the command:**
+
+  ```bash
+  cd x1202 && git pull          # or extract the new ZIP and cd into it
+  sudo sh install.sh            # prints "Updating from version … to 2.0.0"
+  ```
+
+* **Manual installs**, the old way: copy the new `pi5_energyplan.py` over your old one,
+  then run `python3 pi5_energyplan.py --update` in that folder.
+
+What an update does:
+
+| | |
+|---|---|
+| Kept | Your plan and `config.txt` block, UPS settings, per-plan governor and fan choices, the Sweet Spot plan, your 5 V choice. New settings get their defaults. |
+| Replaced | The system copy in `/usr/local/bin` (the old one is saved as `/var/lib/pi5-energyplan/previous-version.py`). Both services are refreshed, and the battery guard restarts with the new version. |
+| Older copies | If your menu entry or panel icon pointed at an older copy (for example `~/pi5-energyplan/pi5_energyplan.py`), that copy is updated too, with the old one kept as `.previous`. Otherwise opening it later would run old code. The menu entry and panel icon then point at `/usr/local/bin`; there's still only one of each. |
+| Cleaned up | Charge-pin data learned by older versions is forgotten and checked again (older versions could learn it wrong). |
+| Never | An older version never replaces a newer one: not from the window, not when an old copy applies a plan or saves settings, and not from `install.sh` (it stops with a message). To go back on purpose: `sudo sh install.sh --force`, or the installer's **Go back to …** button. |
+
+Close the Energy Plan window before updating, then open it again from the menu.
 
 **Uninstall:** double-click **Install Pi 5 Energy Plan** and click **Uninstall**, or:
 
@@ -513,6 +544,7 @@ over, then compare every managed file byte for byte.
 | Under-voltage warnings | Check the adapter, cables, load and pogo-pin contact. `PSU_MAX_CURRENT` doesn't fix a weak supply. |
 | Installer warns about Geekworm scripts | Stop them and remove them from autostart, cron or rc.local. Only one program may control the UPS pins. |
 | Battery shows "Plugged in" but never "Charging" | Run `python3 pi5_energyplan.py --charge-debug`. If it says the adapter is too weak, use a stronger supply: the Pi and the charger share it. |
+| **The charge LED turns off, but the battery % keeps going up** | Usually that's not charging. The X1202 has no current sensor: its fuel gauge (MAX17048) *estimates* the % from the cell voltage, and the estimate lags behind, so after charging stops it often creeps up 1–2 % more. Check the **cell voltage** (`pi5_energyplan.py --monitor`, or the "Cell … V" line in the window) for 15–20 minutes. If it falls or stays flat, charging really stopped. If it keeps rising, the board is still charging; the guard notices that by itself and tries the other pin setting. Send the output of `pi5_energyplan.py --charge-debug` if it stays unclear. |
 | Charge limit "✗": board can't pause charging | Your board revision ignores GPIO 16. The guard leaves charging to the board, which stops by itself at full (4.2 V). |
 | A shutdown is counting down and you want to stop it | Plug the adapter back in, or run `sudo shutdown -c`. |
 | *"No desktop display found"* | You are on SSH: use `--status`, `--apply`, `--battery`. |
@@ -547,7 +579,7 @@ The installer test for the menu entry and panel icon needs a throwaway user:
 `sudo INSTALL_TEST_USER=someuser sh tests/run_sim_tests.sh`. To run some tests only:
 `sudo TESTS="TestUps TestNothingTwice" sh tests/run_sim_tests.sh`.
 
-The 59 tests cover:
+The 66 tests cover:
 
 * **Plans:** applying each kind of plan, the live sysfs changes and governor fallback,
   `config.txt` editing (backup, commenting out conflicting lines, only `[all]`/`[pi5]`
@@ -574,6 +606,16 @@ The 59 tests cover:
   V/A, bootloader edits, and the 5 V choice surviving a reinstall.
 * **Nothing twice:** the install / update / boot cycle above, an old manual install,
   and only one battery guard and one boot task at a time.
+* **Updating from previous versions:** the original script and the first release are
+  installed for real (copy in `~/pi5-energyplan`, menu entry, panel icon, plan, UPS and
+  fan settings, old charge-pin data), then updated with `install.sh` and with the old
+  `--update` way. Settings are kept, old copies are brought up to date, and an older
+  version never replaces a newer one without `--force`.
+* **Small screens:** at 800×480, 1024×600, 1280×720 and 1920×1080 the main window, UPS
+  settings and installer all fit inside the screen, scroll where needed, and don't
+  change on a big screen.
+* **Charging:** the fuel gauge's % creeping up after a pause, with the voltage falling,
+  is not mistaken for "pause not working".
 * **GUI and panel icon:** the window builds and shows live values; the panel icon
   registers on D-Bus and serves a 64×64 icon and its tooltip.
 * **Uninstall:** `--uninstall-service` and `--uninstall-guard`.

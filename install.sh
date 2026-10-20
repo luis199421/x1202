@@ -15,6 +15,7 @@
 #                      (charge to 80 %, safe shutdown at 20 %, battery saver at 50 %)
 #                      unless UPS settings were already saved
 #   --skip-desktop     don't add the menu entry / panel icon (install_gui.py does it)
+#   --force            install even if the installed version is newer
 #
 # Install = apt packages, I2C on, bootloader settings, script in /usr/local/bin,
 # menu entry and panel battery icon for the user who ran sudo/pkexec.
@@ -38,13 +39,14 @@ UPS_RECOMMENDED='{"enabled": true, "max": 80, "min": 20, "outage_minutes": 0, "w
 
 say() { printf '\n==> %s\n' "$*"; }
 
-UNINSTALL="" EEPROM=1 UPS="" DESKTOP=1
+UNINSTALL="" EEPROM=1 UPS="" DESKTOP=1 FORCE=""
 for arg in "$@"; do
     case "$arg" in
         --uninstall) UNINSTALL=1 ;;
         --no-eeprom) EEPROM="" ;;
         --ups-recommended) UPS=1 ;;
         --skip-desktop) DESKTOP="" ;;
+        --force) FORCE=1 ;;
         *) echo "Unknown option: $arg"; exit 2 ;;
     esac
 done
@@ -103,6 +105,20 @@ if [ ! -f "$SRC" ]; then
     echo "pi5_energyplan.py not found next to install.sh ($HERE)"
     exit 1
 fi
+# version check: never put an older version over a newer one by accident
+ver() { sed -n 's/^VERSION = "\([0-9.]*\)".*/\1/p' "$1" 2>/dev/null | head -n 1; }
+NEW_VER=$(ver "$SRC"); NEW_VER=${NEW_VER:-0}
+OLD_VER=""
+if [ -f "$DEST" ]; then
+    OLD_VER=$(ver "$DEST"); OLD_VER=${OLD_VER:-0}
+    newest=$(printf '%s\n%s\n' "$OLD_VER" "$NEW_VER" | sort -V | tail -n 1)
+    if [ "$OLD_VER" != "$NEW_VER" ] && [ "$newest" = "$OLD_VER" ] && [ -z "$FORCE" ]; then
+        echo "Version $OLD_VER is installed, which is newer than this one ($NEW_VER)."
+        echo "Nothing was changed. To install this older version anyway: --force"
+        exit 1
+    fi
+fi
+
 if ! cat /proc/device-tree/model /sys/firmware/devicetree/base/model 2>/dev/null | \
         grep -q "Raspberry Pi 5\|Raspberry Pi 500\|Compute Module 5"; then
     echo "Warning: this doesn't look like a Raspberry Pi 5. Installing anyway."
@@ -145,8 +161,18 @@ elif ! grep -q "^dtparam=i2c_arm=on" "$CONFIG" 2>/dev/null; then
     echo "  raspi-config not found: add 'dtparam=i2c_arm=on' to $CONFIG and reboot"
 fi
 
-# 3) the script
-say "Installing the script to $DEST"
+# 3) the script (the replaced version is kept, for going back)
+if [ -z "$OLD_VER" ]; then
+    say "Installing version $NEW_VER to $DEST"
+elif cmp -s "$SRC" "$DEST"; then
+    say "Version $NEW_VER is already installed: refreshing the rest"
+else
+    [ "$OLD_VER" = 0 ] && OLD_VER="an older one without a number"
+    say "Updating from version $OLD_VER to $NEW_VER"
+    mkdir -p /var/lib/pi5-energyplan
+    cp -p "$DEST" /var/lib/pi5-energyplan/previous-version.py
+    echo "  previous version kept as /var/lib/pi5-energyplan/previous-version.py"
+fi
 install -m 755 "$SRC" "$DEST"
 if [ -f /etc/systemd/system/pi5-energyplan.service ] || \
         [ -f /etc/systemd/system/pi5-battery-guard.service ]; then
@@ -191,13 +217,12 @@ if [ -z "$DESKTOP" ]; then
     :
 elif [ -n "$DESK_USER" ]; then
     say "Adding the menu entry and panel battery icon for $DESK_USER"
-    as_user python3 "$DEST" --install-launcher
-    as_user python3 "$DEST" --install-tray
+    as_user python3 "$DEST" --install-desktop
 else
     echo
     echo "Not run through sudo from a desktop user: skipped the menu entry and panel icon."
     echo "Add them later as your normal user:"
-    echo "  python3 $DEST --install-launcher && python3 $DEST --install-tray"
+    echo "  python3 $DEST --install-desktop"
 fi
 
 say "Done"
