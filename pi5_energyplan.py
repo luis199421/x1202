@@ -190,6 +190,11 @@ CHARGE_GPIO = 16           # X120x charge control: high = charging off, low = on
 BATTERY_CFG = "/etc/pi5-energyplan/battery.json"
 GUARD_STATUS = "/run/pi5-energyplan/battery-guard.json"
 TOPUP_FILE = "/run/pi5-energyplan/charge-full-once"  # in /run: forgotten on reboot
+GOV_RECORD = "/run/pi5-energyplan/governor.json"    # who last set the governor, this boot
+NO_BOOT_SERVICE = "/etc/pi5-energyplan/no-boot-service"  # --uninstall-service was used
+# Used at boot (and when the power comes back) while no plan is saved, instead of the
+# kernel's boot-time "powersave"
+DEFAULT_PLAN = "Performance"
 TOPUP_MAX_H = 12           # give up on "charge to 100 % once" after this long
 GUARD_SERVICE = "pi5-battery-guard.service"
 GUARD_UNIT_PATH = "/etc/systemd/system/" + GUARD_SERVICE
@@ -402,6 +407,22 @@ def throttle_text():
     if v & 0xF0000:
         return "OK (issues earlier since boot)"
     return "OK"
+
+
+def governor_source(current):
+    """Who set the current governor since boot, for --status / the window."""
+    try:
+        with open(GOV_RECORD) as f:
+            g = json.load(f)
+    except (OSError, ValueError):
+        return ("not set by Pi 5 Energy Plan since boot" +
+                (": the kernel starts in powersave (is pi5-energyplan.service on?)"
+                 if current == "powersave" else ""))
+    if g.get("governor") != current:
+        return "changed by something else"
+    by = {"boot": "set at boot", "battery saver": "battery saver on",
+          "power back": "restored when the power came back"}.get(g.get("by"), "")
+    return g.get("plan", "?") + (f", {by}" if by else "")
 
 
 def saved_plan():
@@ -902,7 +923,12 @@ def set_custom(c, reapply=True):
             + (f" +{ovd // 1000} mV" if ovd else "") + f", GPU {gpu} MHz, "
             f"{c['fan_profile']} fan, {c['governor']} governor"]
     if reapply and find_plan(saved_plan() or "") == CUSTOM:
-        msgs += apply_plan(CUSTOM)
+        if saver_active():
+            write_config(CUSTOM)
+            msgs.append("Saved to config.txt; the battery saver is on, so the rest applies "
+                        "when the power is back")
+        else:
+            msgs += apply_plan(CUSTOM)
     subprocess.run(["systemctl", "try-restart", GUARD_SERVICE], capture_output=True)
     sync_installed_copy()
     return msgs
@@ -925,8 +951,11 @@ def set_plan_governor(name, gov):
     PLANS[plan]["governor"] = gov
     msg = f"{plan} will use the {gov} governor"
     if find_plan(saved_plan() or "") == plan:
-        apply_live(plan)
-        msg += " (applied now)"
+        if saver_active():
+            msg += " (battery saver is on: it applies when the power is back)"
+        else:
+            apply_live(plan)
+            msg += " (applied now)"
     # the battery guard keeps plans in memory: restart it so the saver uses this too
     subprocess.run(["systemctl", "try-restart", GUARD_SERVICE], capture_output=True)
     sync_installed_copy()
@@ -940,6 +969,12 @@ def write_json_atomic(path, data):
         json.dump(data, f, indent=1)
     os.chmod(tmp, 0o644)
     os.replace(tmp, path)
+
+
+def saver_active():
+    """Name of the battery saver plan while the guard has it on, else None."""
+    g = read_guard_status()
+    return g.get("saver_active") if g else None
 
 
 def read_guard_status():
@@ -1131,6 +1166,7 @@ def battery_guard():
     charging, low_count, pending, outage_since = None, 0, None, None
     blind_since, gauge_ok, ac = None, True, None
     saver = None  # name of the saver plan while it's active
+    saver_count = 0   # readings in a row that want the saver (a glitch isn't enough)
     volt_high = False
     tick = 0
     for old in OLD_CHARGE_PIN_FILES:  # forget what the older, faulty checks learned
@@ -1144,8 +1180,10 @@ def battery_guard():
         pending = {"reason": "shutdown already scheduled", "at": None}
 
     def restore_plan():
-        name = find_plan(saved_plan() or "") or "Balanced"
-        apply_live(name)
+        name = find_plan(saved_plan() or "") or DEFAULT_PLAN
+        if PLANS[name].get("empty"):
+            name = DEFAULT_PLAN
+        apply_live(name, by="power back")
         return name
 
     log("Battery guard started")
@@ -1160,8 +1198,9 @@ def battery_guard():
             if b["ok"]:
                 want_saver = (cfg["saver_enabled"] and b["ac"] == 0 and
                               b["soc"] <= cfg["saver_below"])
-                if want_saver and not saver:
-                    apply_live(cfg["saver_plan"])
+                saver_count = saver_count + 1 if want_saver else 0
+                if saver_count >= 2 and not saver:
+                    apply_live(cfg["saver_plan"], by="battery saver")
                     saver = cfg["saver_plan"]
                     log(f"Battery saver ON at {b['soc']:.0f}%: switched to {saver}")
                 elif saver and (b["ac"] == 1 or not cfg["saver_enabled"]):
@@ -1775,8 +1814,9 @@ def set_trip_points(fan):
     return False
 
 
-def apply_live(name):
-    """Settings that take effect immediately but are lost on reboot."""
+def apply_live(name, by="plan"):
+    """Settings that take effect immediately but are lost on reboot.
+    `by` (plan / boot / battery saver / power back) is remembered for --status."""
     p = PLANS[name]
     msgs = []
     needs_reboot = False
@@ -1801,6 +1841,11 @@ def apply_live(name):
         msgs.append(f"CPU: {used_gov} governor now; {p['max_freq_mhz']} MHz unlocks after reboot")
     else:
         msgs.append(f"CPU: {used_gov} governor, max {p['max_freq_mhz']} MHz (applied now)")
+    try:
+        write_json_atomic(GOV_RECORD, {"plan": name, "by": by, "governor": used_gov,
+                                       "time": time.time()})
+    except OSError:
+        pass
 
     if set_trip_points(p["fan"]):
         msgs.append("Fan temps: applied now (new speeds after reboot)")
@@ -1844,6 +1889,8 @@ WantedBy=multi-user.target
 
 def install_service():
     """Copy this script to /usr/local/bin and enable the boot service."""
+    if os.path.exists(NO_BOOT_SERVICE):
+        os.remove(NO_BOOT_SERVICE)
     install_copy()
     if read(SERVICE_PATH) != SERVICE_UNIT.strip():
         write(SERVICE_PATH, SERVICE_UNIT)
@@ -1854,14 +1901,17 @@ def install_service():
 
 def uninstall_service():
     subprocess.run(["systemctl", "disable", SERVICE_NAME], capture_output=True)
+    os.makedirs(os.path.dirname(NO_BOOT_SERVICE), exist_ok=True)
+    write(NO_BOOT_SERVICE, "removed with --uninstall-service: updates don't add it back\n")
     # the battery guard runs from the same system copy: keep it while the guard is there
     paths = [SERVICE_PATH] + ([] if os.path.exists(GUARD_UNIT_PATH) else [INSTALLED_SCRIPT])
     for path in paths:
         if os.path.exists(path):
             os.remove(path)
     subprocess.run(["systemctl", "daemon-reload"])
-    print("Boot service removed. Fan curve in config.txt is kept; "
-          "pick 'Balanced' first if you want defaults back.")
+    print("Boot service removed (updates won't add it back; applying a plan with 'keep "
+          "after reboot' does). Fan curve in config.txt is kept; pick 'Balanced' first if "
+          "you want defaults back.")
 
 
 def uninstall_guard():
@@ -1878,22 +1928,32 @@ def uninstall_guard():
 
 
 def boot_apply():
-    """Run by the service at boot: re-apply the saved plan's live settings."""
+    """Run by the service at boot: re-apply the saved plan's live settings.
+
+    The Raspberry Pi kernel starts in the 'powersave' governor (1.5 GHz). Without a
+    saved plan, use DEFAULT_PLAN (performance governor, full speed) instead of
+    leaving it there."""
     st = load_state()
     if st and st.get("phase") in ("pending", "running"):
         autotest_boot(st)
         return
     name = find_plan(saved_plan() or "")
-    if not name:
-        print("No saved plan in config.txt, nothing to do")
-        return
-    for line in apply_live(name):
-        print(f"[{name}] {line}")
+    if not name or PLANS[name].get("empty"):
+        print(f"No saved plan: using {DEFAULT_PLAN} ({PLANS[DEFAULT_PLAN]['governor']} "
+              "governor, full speed) instead of the kernel's boot-time powersave")
+        name = DEFAULT_PLAN
     # Raspberry Pi OS may switch the governor back to 'ondemand' shortly after
     # boot, so apply once more after things have settled.
-    time.sleep(60)
-    for line in apply_live(name):
-        print(f"[{name}] re-check: {line}")
+    for again in (False, True):
+        if again:
+            time.sleep(60)
+        g = read_guard_status()
+        if g and g.get("saver_active"):     # on battery: the saver's plan stays
+            print(f"Battery saver is on ({g['saver_active']}): {name} comes back when the "
+                  "power does")
+            continue
+        for line in apply_live(name, by="boot"):
+            print(f"[{name}] {'re-check: ' if again else ''}{line}")
 
 
 # --------------------------------------------------------------------------- #
@@ -2664,10 +2724,15 @@ class App:
                              fg=temp_color(t))
         self.stat["Fan"].config(text=fmt_fan(s))
         self.stat["CPU"].config(text=fmt_freq(s))
-        self.stat["Governor"].config(text=s["governor"] or "?")
+        gov = s["governor"] or "?"
+        src = governor_source(gov)
+        short = "not set since boot" if src.startswith("not set") else \
+            "battery saver" if "battery saver" in src else src.split(",")[0]
+        self.stat["Governor"].config(text=f"{gov} · {short}",
+                                     fg="#ffa726" if short == "not set since boot" else FG)
         thr = s["throttled"] or "?"
         self.stat["Power"].config(text=thr, fg="#ef5350" if thr.startswith("NOW") else FG)
-        self.stat["Saved plan"].config(text=s["plan"] or "none")
+        self.stat["Saved plan"].config(text=s["plan"] or f"none ({DEFAULT_PLAN} at boot)")
         sweet = autotest_summary()
         self.stat["Sweet spot"].config(text=sweet, fg="#ffa726" if sweet.startswith(
             "TESTING") else "#ef5350" if sweet.startswith("error") else FG)
@@ -3453,6 +3518,100 @@ def update_all():
     return msgs or ["Nothing installed yet, nothing to update"]
 
 
+CHARGE_TEST_LOG = STATE_DIR + "/charge-test.log"
+
+
+def pin_level(pin):
+    """'hi' / 'lo' of a GPIO, from pinctrl."""
+    try:
+        out = subprocess.run(["pinctrl", "get", str(pin)], capture_output=True, text=True,
+                             timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return "?"
+    m = re.search(r"\|\s*(hi|lo)\b", out)
+    return m.group(1) if m else "?"
+
+
+def charge_test(minutes=10, interval=15):
+    """Does this board really stop charging when GPIO 16 is high? Pause charging for
+    a while and watch the cell VOLTAGE: it rises only while current flows into the
+    cells. The % isn't proof: the fuel gauge's estimate keeps rising for a while after
+    charging stops. Charging is always switched back on at the end."""
+    log_lines = []
+
+    def out(line=""):
+        print(line, flush=True)
+        log_lines.append(line)
+
+    guard_on = subprocess.run(["systemctl", "is-active", "--quiet", GUARD_SERVICE]).returncode == 0
+    if guard_on:   # it sets the pin every 30 s; stopping it switches charging on
+        subprocess.run(["systemctl", "stop", GUARD_SERVICE], capture_output=True)
+    bat = Battery()
+    samples = []
+    try:
+        b = bat.read()
+        if not b["ok"]:
+            raise RuntimeError(b["error"])
+        if b["ac"] != 1:
+            raise RuntimeError("plug in the adapter first: the test needs mains power")
+        out(f"Charge test: charging paused (GPIO 16 high) for {minutes} min, "
+            f"reading every {interval} s. Charging is switched back on at the end.")
+        if b["soc"] >= 95:
+            out("Note: the battery is nearly full, so the charger may be stopping by "
+                "itself. The test is clearest below 90 %.")
+        subprocess.run(["pinctrl", "set", str(CHARGE_GPIO), "op", "dh"], capture_output=True,
+                       timeout=3)
+        out("  time   battery   cell V   GPIO16  adapter")
+        end = time.time() + minutes * 60
+        while True:
+            b = bat.read()
+            if b["ok"]:
+                samples.append((b["soc"], b["volt"]))
+                out(f"  {time.strftime('%H:%M:%S')}  {b['soc']:5.1f} %  {b['volt']:.3f}    "
+                    f"{pin_level(CHARGE_GPIO):5}  {'yes' if b['ac'] == 1 else 'NO'}")
+                if b["ac"] != 1:
+                    raise RuntimeError("the adapter was unplugged during the test")
+            if time.time() >= end:
+                break
+            time.sleep(interval)
+    finally:
+        subprocess.run(["pinctrl", "set", str(CHARGE_GPIO), "ip", "pd"], capture_output=True,
+                       timeout=3)
+        if guard_on:
+            subprocess.run(["systemctl", "start", GUARD_SERVICE], capture_output=True)
+        out("Charging switched back on." + (" Battery guard restarted." if guard_on else ""))
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            write(CHARGE_TEST_LOG, "\n".join(log_lines) + "\n")
+        except OSError:
+            pass
+
+    if len(samples) < 4:
+        return "Too few readings for a result: run it again (at least 2 minutes)."
+    volts = [v for _, v in samples]
+    lowest = min(volts[:max(2, len(volts) // 3)])     # right after the pause starts
+    last = sum(volts[-3:]) / 3
+    soc_rise = samples[-1][0] - samples[0][0]
+    verdict = (f"Result: cell voltage {lowest:.3f} → {last:.3f} V ({(last - lowest) * 1000:+.0f} mV), "
+               f"battery {samples[0][0]:.1f} → {samples[-1][0]:.1f} %.\n")
+    if last - lowest >= ChargeCheck.PAUSE_VRISE:
+        verdict += ("STILL CHARGING with GPIO 16 high: the voltage kept rising. This board "
+                    "doesn't stop charging with the pin, so a charge limit can't work on it. "
+                    "(The battery guard sees this too and leaves charging to the board.)")
+    elif soc_rise >= 0.5:
+        verdict += ("Charging STOPS correctly: the voltage didn't rise. The % went up only "
+                    "because the fuel gauge's estimate catches up after charging stops; it "
+                    "settles. The charge limit works on this board.")
+    else:
+        verdict += "Charging STOPS correctly: the charge limit works on this board."
+    try:
+        with open(CHARGE_TEST_LOG, "a") as f:
+            f.write(verdict + "\n")
+    except OSError:
+        pass
+    return verdict + f"\nLog: {CHARGE_TEST_LOG}"
+
+
 def charge_debug():
     """Everything needed to see why the battery is or isn't charging."""
     def run(cmd):
@@ -3478,6 +3637,10 @@ def charge_debug():
     else:
         print("  (guard not running or no status yet)")
     print("Learned pin data:", read(CHARGE_PIN_FILE, "(none)"))
+    if os.path.exists(CHARGE_TEST_LOG):
+        print("Last charge test:", (read(CHARGE_TEST_LOG, "") or "").strip().splitlines()[-1])
+    else:
+        print("Charge test   : not run yet (sudo pi5_energyplan.py --charge-test)")
     print("Settings     :", read(BATTERY_CFG, "(none)"))
     pm = read_pmic()
     if pm.get("ext5v"):
@@ -3493,11 +3656,11 @@ def print_status():
     print(f"Temperature : {t:.1f} °C" if t is not None else "Temperature : ?")
     print(f"Fan         : {fmt_fan(s)}")
     print(f"CPU         : {fmt_freq(s)}")
-    print(f"Governor    : {s['governor']}")
+    print(f"Governor    : {s['governor']} ({governor_source(s['governor'])})")
     gpu = gpu_clock_mhz()
     print(f"GPU (3D)    : {f'{gpu} MHz' if gpu else '?'}")
     print(f"Power       : {s['throttled']}")
-    print(f"Saved plan  : {s['plan'] or 'none'}")
+    print(f"Saved plan  : {s['plan'] or f'none ({DEFAULT_PLAN} is used at boot)'}")
     print(f"Sweet spot  : {autotest_summary()}")
     print(f"Battery     : {battery_line(Battery().read())}")
     print(f"Pi power    : {fmt_pmic(read_pmic())}")
@@ -3581,6 +3744,8 @@ def main():
     ap.add_argument("--status", action="store_true", help="show temperature, fan, CPU")
     ap.add_argument("--install-launcher", action="store_true",
                     help="add a desktop menu entry for the GUI")
+    ap.add_argument("--install-service", action="store_true",
+                    help="restore the saved plan (or Performance) at every boot (sudo)")
     ap.add_argument("--uninstall-service", action="store_true",
                     help="stop restoring the plan at boot (needs sudo)")
     ap.add_argument("--uninstall-guard", action="store_true",
@@ -3600,6 +3765,9 @@ def main():
                     help="continue a sweet spot test that stopped (reboots)")
     ap.add_argument("--charge-debug", action="store_true",
                     help="show why the battery is or isn't charging")
+    ap.add_argument("--charge-test", nargs="?", type=int, const=10, metavar="MINUTES",
+                    help="pause charging for 10 min and check the board really stops "
+                         "charging (sudo, adapter plugged in)")
     ap.add_argument("--battery", action="store_true",
                     help="live battery readout in the terminal (every 3 s)")
     ap.add_argument("--monitor", nargs="?", type=float, const=3, metavar="SECONDS",
@@ -3717,6 +3885,14 @@ def main():
     if args.charge_debug:
         charge_debug()
         return
+    if args.charge_test is not None:
+        if os.geteuid() != 0:
+            sys.exit("Needs root: run with sudo")
+        try:
+            print(charge_test(max(2, args.charge_test)))
+        except (RuntimeError, OSError) as e:
+            sys.exit(f"Error: {e}")
+        return
     if args.tray:
         for _ in range(10):  # an old icon may still be closing after an update
             if single_instance("pi5-energyplan-tray"):
@@ -3751,6 +3927,16 @@ def main():
             sys.exit(f"Error: {e}")
         return
 
+    if args.install_service:
+        if os.geteuid() != 0:
+            sys.exit("Needs root: run with sudo")
+        if os.path.exists(NO_BOOT_SERVICE) and not args.yes:
+            print("Boot service not added: it was removed with --uninstall-service "
+                  "(add it back with --install-service --yes)")
+            return
+        install_service()
+        print(f"Boot service on: the saved plan (or {DEFAULT_PLAN}) is set at every boot")
+        return
     if args.boot or args.uninstall_service or args.uninstall_guard or args.autotest or \
             args.autotest_cancel:
         if os.geteuid() != 0:

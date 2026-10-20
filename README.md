@@ -111,7 +111,7 @@ speed)*:
 | **Right away** | CPU governor and max frequency | writes `/sys/devices/system/cpu/cpufreq/policy*/scaling_governor` and `scaling_max_freq` |
 | **Right away** (if the kernel allows it) | Fan start temperatures | writes the active trip points in `/sys/class/thermal/thermal_zone0` |
 | **After a reboot** | Full fan curve (temperatures **and** speeds), `arm_freq`, `over_voltage_delta`, `gpu_freq` | a managed block at the end of `/boot/firmware/config.txt` |
-| **At every boot** | Governor and max frequency again (Linux resets them on boot) | `pi5-energyplan.service` |
+| **At every boot** | Governor and max frequency again. The Raspberry Pi kernel always starts in `powersave` (1.5 GHz); with no saved plan, **Performance** is used instead. If the battery saver is on (on battery), it's left on. | `pi5-energyplan.service`, installed with the program |
 
 The block in `config.txt` looks like this. The script only ever changes the text between
 the two markers:
@@ -142,8 +142,11 @@ Safety details:
 ### Live status
 
 The window and `--status` show the CPU temperature (with a 4.5-minute graph in the
-window), fan level, PWM and RPM, CPU speed, governor, power warnings from
-`vcgencmd get_throttled` (under-voltage, throttling), and the saved plan.
+window), fan level, PWM and RPM, CPU speed, GPU clock, power warnings from
+`vcgencmd get_throttled` (under-voltage, throttling), the saved plan, and the
+governor **with who set it**: for example `performance (Performance, set at boot)`,
+`powersave (Underclock, battery saver on)`, or `powersave (not set by Pi 5 Energy Plan
+since boot …)`, which means the boot service didn't run.
 
 ---
 
@@ -194,7 +197,7 @@ starts at every boot. Every 3 seconds it does the following:
 | **Shutdown after a power cut** | Optional: shut down when the power has been out for 15 seconds, or 1, 5, 15, 30 or 60 minutes. "15 seconds" is Geekworm's "shut down on power loss", with a short wait so a glitch doesn't turn the Pi off. If power comes back in time, nothing happens. |
 | **Charge to 100 % once** | A button in UPS settings (or `--charge-full on`): ignores the limit until the battery is full, for example before a trip, then the limit comes back. A reboot or 12 hours also end it. |
 | **If the fuel gauge stops answering** | GPIO 6 still shows whether the power is on. The power-cut timer keeps working, and on battery with no battery reading for 5 minutes the Pi shuts down safely instead of running until the power just cuts. On mains nothing happens. |
-| **Battery saver** | On battery, below Z % (or as soon as the power goes out if Z is 100 %), switches to **Underclock** or **Eco**. When power returns, it switches back to your saved plan. |
+| **Battery saver** | On battery, below Z % (or as soon as the power goes out if Z is 100 %), switches to **Underclock** or **Eco**, after 2 readings in a row so a glitch doesn't trigger it. When power returns, it switches back to your saved plan (or Performance). While it's on, the boot service and editing a plan don't undo it. |
 | **Overcharge watch** | Warns in the window if a cell goes above 4.25 V. That means the board's charger isn't stopping. |
 | **Never a boot loop** | It never shuts down while the adapter is plugged in. When the guard stops, charging is always switched back on. |
 | **Only one guard** | A second copy (for example started by hand) refuses to start, so two programs never fight over the charge pin. |
@@ -448,6 +451,7 @@ After `install.sh`, you can write `pi5_energyplan.py` instead of
 | `python3 pi5_energyplan.py --version` | Print the version |
 | `python3 pi5_energyplan.py --install-desktop` | Menu entry and panel icon (and update older copies they pointed at) |
 | `python3 pi5_energyplan.py --charge-debug` | Everything about charging: pins, guard state, last log lines |
+| `sudo python3 pi5_energyplan.py --charge-test [MINUTES]` | Pause charging for 10 min (adapter plugged in) and check by the cell voltage that the board really stops charging; prints a verdict and saves `/var/lib/pi5-energyplan/charge-test.log` |
 | `sudo python3 pi5_energyplan.py --ups-config '{"enabled":true,"max":80,"min":20}'` | Set the UPS settings without the window (see below) |
 | `python3 pi5_energyplan.py --install-launcher` | Add the menu entry |
 | `python3 pi5_energyplan.py --install-tray` | Add the panel battery icon |
@@ -455,7 +459,8 @@ After `install.sh`, you can write `pi5_energyplan.py` instead of
 | `python3 pi5_energyplan.py --autotest-status` | Test progress and log |
 | `sudo python3 pi5_energyplan.py --autotest-cancel` | Stop the test |
 | `python3 pi5_energyplan.py --update` | After replacing the script: refresh everything it installed |
-| `sudo python3 pi5_energyplan.py --uninstall-service` | Stop restoring the plan at boot |
+| `sudo python3 pi5_energyplan.py --install-service` | Set the saved plan (or Performance) at every boot; the installer does this |
+| `sudo python3 pi5_energyplan.py --uninstall-service` | Stop restoring the plan at boot (updates then don't add it back) |
 | `sudo python3 pi5_energyplan.py --uninstall-guard` | Remove the battery guard service |
 
 `--ups-config` keys (keys you leave out keep their current value):
@@ -608,7 +613,9 @@ over, then compare every managed file byte for byte.
 | Under-voltage warnings | Check the adapter, cables, load and pogo-pin contact. `PSU_MAX_CURRENT` doesn't fix a weak supply. |
 | Installer warns about Geekworm scripts | Stop them and remove them from autostart, cron or rc.local. Only one program may control the UPS pins. |
 | Battery shows "Plugged in" but never "Charging" | Run `python3 pi5_energyplan.py --charge-debug`. If it says the adapter is too weak, use a stronger supply: the Pi and the charger share it. |
+| **The governor is always `powersave` after starting** | The Raspberry Pi kernel starts in `powersave`; older versions only changed it if you had saved a plan. Version 2.0.0 installs the boot service with the program, and sets your saved plan, or **Performance** with no saved plan, at every boot. `pi5_energyplan.py --status` shows who set the governor: `battery saver on` means it's on battery below the saver level (UPS settings); `not set … since boot` means the boot service didn't run (`systemctl status pi5-energyplan`). |
 | **Sound (or another device) stopped working after an update** | Versions before 2.0.0 had a bug: a line added at the **end** of `config.txt` (audio HAT guides say "add `dtoverlay=…` at the end") was moved into the section above the plan block when the block was rewritten. On a stock Raspberry Pi OS file that's `[cm5]`, which a Pi 5 ignores, so the line stopped working. Version 2.0.0 keeps such lines under `[all]`, and its update **repairs** files the old versions changed, then says *"config.txt repaired: … moved back under [all]"*. Reboot afterwards. The file before the repair is kept as `config.txt.before-repair`. To check by hand: `diff /boot/firmware/config.txt.energyplan.bak /boot/firmware/config.txt`. If audio is still off, check the output device (`wpctl status`, or right-click the speaker icon in the taskbar): updates of Raspberry Pi OS itself can change the default output, for example between the two HDMI ports. |
+| **It still charges to 100 % with a charge limit** | 1) Update to 2.0.0: older versions could take the fuel gauge's % creeping up after a pause for "pausing doesn't work" and switch GPIO 16 to the setting that *charges*; 2.0.0 checks the voltage instead and forgets what they learned. 2) Check that **Turn on battery protection** is ticked in UPS settings, and that **Charge to 100 % once** isn't on. 3) Run `sudo pi5_energyplan.py --charge-test` with the adapter plugged in and the battery below 90 %. It tells you whether your board really stops charging with GPIO 16: if it says *STILL CHARGING*, the board ignores the pin and a limit can't work on it. |
 | **The charge LED turns off, but the battery % keeps going up** | Usually that's not charging. The X1202 has no current sensor: its fuel gauge (MAX17048) *estimates* the % from the cell voltage, and the estimate lags behind, so after charging stops it often creeps up 1–2 % more. Check the **cell voltage** (`pi5_energyplan.py --monitor`, or the "Cell … V" line in the window) for 15–20 minutes. If it falls or stays flat, charging really stopped. If it keeps rising, the board is still charging; the guard notices that by itself and tries the other pin setting. Send the output of `pi5_energyplan.py --charge-debug` if it stays unclear. |
 | Charge limit "✗": board can't pause charging | Your board revision ignores GPIO 16. The guard leaves charging to the board, which stops by itself at full (4.2 V). |
 | A shutdown is counting down and you want to stop it | Plug the adapter back in, or run `sudo shutdown -c`. |
@@ -680,7 +687,14 @@ The 80 tests cover:
   settings and installer all fit inside the screen, scroll where needed, and don't
   change on a big screen.
 * **Charging:** the fuel gauge's % creeping up after a pause, with the voltage falling,
-  is not mistaken for "pause not working".
+  is not mistaken for "pause not working"; `--charge-test` tells a board that keeps
+  charging from one that stops, always switches charging back on (also when the
+  adapter is unplugged mid-test) and restarts the guard.
+* **Boot governor:** the kernel's boot-time `powersave` is replaced by the saved plan,
+  or Performance without one; the battery saver is left on at boot and when editing a
+  plan; the saver ignores a single glitch; `--status` says who set the governor; the
+  boot service is installed with the program but not added back after
+  `--uninstall-service`.
 * **Packages and updates:** the package's dependencies, install and remove steps; and
   with the **real apt**, a published repository: a new version shows up as upgradable
   (what the Pi's updater sees), downloads with signature and hash checks, and

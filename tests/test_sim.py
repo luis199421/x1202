@@ -233,6 +233,13 @@ class Base(unittest.TestCase):
         make_pi()
         self.ep = load_module()
 
+    def no_sleep(self):
+        """Skip the boot task's waits. `ep.time` is the shared time module, so undo it
+        after the test (other tests need real pauses)."""
+        real = time.sleep
+        time.sleep = lambda s: None
+        self.addCleanup(setattr, time, "sleep", real)
+
     def config(self):
         return get("/boot/firmware/config.txt")
 
@@ -396,7 +403,7 @@ class TestPlans(Base):
         cli("--apply", "Underclock")
         put(CPUFREQ + "/scaling_governor", "ondemand")   # what Linux does on boot
         put(CPUFREQ + "/scaling_max_freq", 2400000)
-        self.ep.time.sleep = lambda s: None
+        self.no_sleep()
         self.ep.boot_apply()
         self.assertEqual(get(CPUFREQ + "/scaling_governor"), "powersave")
         self.assertEqual(get(CPUFREQ + "/scaling_max_freq"), "1500000")
@@ -542,7 +549,7 @@ class TestUps(Base):
 
         self.run_guard({"enabled": True, "max": 80, "min": 20, "saver_enabled": True,
                         "saver_below": 50, "saver_plan": "Underclock"},
-                       [paused, resumed, saver_on, not_yet, not_yet, shutdown_started,
+                       [paused, resumed, None, saver_on, not_yet, not_yet, shutdown_started,
                         still_one, cancelled])
         self.assertEqual(hw()["pin16"], "ip pd")   # guard always leaves charging on
 
@@ -706,6 +713,7 @@ class TestUninstall(Base):
 
 class TestInstaller(Base):
     INSTALL = os.path.join(os.path.dirname(HERE), "install.sh")
+    run_guard = TestUps.run_guard
 
     def install(self, *args, user=None):
         env = dict(os.environ)
@@ -960,7 +968,7 @@ class TestNothingTwice(Base):
         home = tempfile.mkdtemp()
         env = dict(os.environ, HOME=home)
         ep = self.ep
-        ep.time.sleep = lambda s: None
+        self.no_sleep()
 
         def sh(*args):
             r = subprocess.run(["sh", self.INSTALL, *args], capture_output=True, text=True,
@@ -1088,6 +1096,142 @@ class TestNothingTwice(Base):
         cfg = json.loads(get("/etc/pi5-energyplan/battery.json"))
         self.assertEqual((cfg["max"], cfg["enabled"], cfg["usb_5v_when_off"]), (90, True, True))
         self.assertEqual(sum(c.startswith("rpi-eeprom-config --apply") for c in calls()), 1)
+
+
+class TestBootGovernor(Base):
+    """The Raspberry Pi kernel boots in 'powersave' (1.5 GHz). The boot service must
+    always leave the Pi on its saved plan, or on Performance."""
+    INSTALL = os.path.join(os.path.dirname(HERE), "install.sh")
+
+    def setUp(self):
+        super().setUp()
+        put(CPUFREQ + "/scaling_governor", "powersave")      # how the kernel starts
+        put(CPUFREQ + "/scaling_max_freq", 1500000)
+        self.no_sleep()
+
+    def test_status_shows_nobody_set_it(self):
+        st = cli("--status").stdout
+        self.assertIn("Governor    : powersave (not set by Pi 5 Energy Plan since boot: "
+                      "the kernel starts in powersave", st)
+        self.assertIn("Saved plan  : none (Performance is used at boot)", st)
+
+    def test_no_saved_plan_boots_in_performance(self):
+        self.ep.boot_apply()
+        self.assertEqual(get(CPUFREQ + "/scaling_governor"), "performance")
+        self.assertEqual(get(CPUFREQ + "/scaling_max_freq"), "2400000")
+        self.assertIn("Governor    : performance (Performance, set at boot)",
+                      cli("--status").stdout)
+        # the same when the power comes back after the battery saver
+        self.ep.apply_live("Underclock", by="battery saver")
+        hw(pld=0, soc=40)
+        TestUps.run_guard(self, {"saver_enabled": True, "saver_below": 50},
+                          [None, None, lambda: hw(pld=1), None])
+        self.assertEqual(get(CPUFREQ + "/scaling_governor"), "performance")
+
+    def test_saved_plan_boots_with_it(self):
+        cli("--apply", "Cool")
+        put(CPUFREQ + "/scaling_governor", "powersave")
+        self.ep.boot_apply()
+        self.assertEqual(get(CPUFREQ + "/scaling_governor"), "schedutil")
+        self.assertIn("(Cool, set at boot)", cli("--status").stdout)
+
+    def test_boot_leaves_the_battery_saver_alone(self):
+        cli("--apply", "Performance")
+        self.ep.apply_live("Underclock", by="battery saver")
+        self.ep.write_json_atomic(self.ep.GUARD_STATUS, {"updated": time.time(),
+                                                         "saver_active": "Underclock"})
+        self.ep.boot_apply()
+        self.assertEqual(get(CPUFREQ + "/scaling_governor"), "powersave")
+        self.assertEqual(get(CPUFREQ + "/scaling_max_freq"), "1500000")
+        self.assertIn("(Underclock, battery saver on)", cli("--status").stdout)
+        # editing the plan in use doesn't undo the saver either
+        out = cli("--set-governor", "Performance", "ondemand").stdout
+        self.assertIn("battery saver is on: it applies when the power is back", out)
+        self.assertEqual(get(CPUFREQ + "/scaling_governor"), "powersave")
+
+    def test_saver_ignores_a_single_glitch(self):
+        cli("--apply", "Cool")
+        hw(pld=1, soc=40)
+        st = TestUps.run_guard(self, {"enabled": True, "saver_enabled": True,
+                                      "saver_below": 50},
+                               [lambda: hw(pld=0), lambda: hw(pld=1), None,
+                                lambda: hw(pld=0), None, None])
+        self.assertEqual(st["saver_active"], "Underclock")    # 2 readings in a row: on
+        self.assertEqual(calls().count("systemctl try-restart pi5-battery-guard.service"), 0)
+
+    def test_saver_glitch_does_not_switch(self):
+        cli("--apply", "Cool")
+        hw(pld=1, soc=40)
+        TestUps.run_guard(self, {"enabled": True, "saver_enabled": True, "saver_below": 50},
+                          [lambda: hw(pld=0), lambda: hw(pld=1), None, None])
+        self.assertEqual(get(CPUFREQ + "/scaling_governor"), "schedutil")
+
+    def test_install_adds_the_boot_service_but_respects_removing_it(self):
+        TestInstaller.install(self)
+        self.assertTrue(os.path.exists("/etc/systemd/system/pi5-energyplan.service"))
+        self.assertIn("systemctl enable pi5-energyplan.service", calls())
+        cli("--uninstall-service")
+        out = TestInstaller.install(self)                     # an update
+        self.assertIn("Boot service not added: it was removed with --uninstall-service", out)
+        self.assertFalse(os.path.exists("/etc/systemd/system/pi5-energyplan.service"))
+        cli("--apply", "Eco")                                 # keep-after-reboot adds it again
+        self.assertTrue(os.path.exists("/etc/systemd/system/pi5-energyplan.service"))
+
+
+class TestChargeTest(Base):
+    """--charge-test: does the board really stop charging when GPIO 16 is high?"""
+
+    def run_test(self, readings, minutes=2, unplug_at=None):
+        ep = self.ep
+        it = iter(readings)
+        n = [0]
+
+        def on_sleep():
+            n[0] += 1
+            if unplug_at is not None and n[0] == unplug_at:
+                hw(pld=0)
+            try:
+                soc, volt = next(it)
+                hw(soc=soc, volt=volt)
+            except StopIteration:
+                pass
+        ep.time = Clock(on_sleep)
+        return ep.charge_test(minutes=minutes, interval=15)
+
+    def test_board_that_keeps_charging(self):
+        hw(soc=70, volt=3.95, active=["pi5-battery-guard.service"])
+        rising = [(70 + i * 0.1, 3.95 + i * 0.003) for i in range(1, 10)]
+        out = self.run_test(rising)
+        self.assertIn("STILL CHARGING with GPIO 16 high", out)
+        self.assertIn("op dh", " ".join(c for c in calls() if c.startswith("pinctrl set 16")))
+        self.assertEqual(hw()["pin16"], "ip pd")                 # always back on
+        self.assertIn("systemctl stop pi5-battery-guard.service", calls())
+        self.assertIn("systemctl start pi5-battery-guard.service", calls())
+        self.assertIn("STILL CHARGING", get("/var/lib/pi5-energyplan/charge-test.log"))
+
+    def test_board_that_stops_while_the_gauge_catches_up(self):
+        hw(soc=80, volt=4.08)
+        # LED off, % still creeping up, but the voltage falls: no current flows in
+        creeping = [(80.3, 4.05), (80.6, 4.04), (80.9, 4.035), (81.2, 4.03), (81.4, 4.03),
+                    (81.6, 4.028), (81.7, 4.027), (81.8, 4.027), (81.8, 4.026)]
+        out = self.run_test(creeping)
+        self.assertIn("Charging STOPS correctly", out)
+        self.assertIn("fuel gauge's estimate catches up", out)
+        self.assertEqual(hw()["pin16"], "ip pd")
+        self.assertIn("Last charge test:", subprocess.run(
+            [sys.executable, SCRIPT, "--charge-debug"], capture_output=True, text=True).stdout)
+
+    def test_unplugging_stops_the_test_and_charging_comes_back(self):
+        hw(soc=60, volt=3.9)
+        with self.assertRaises(RuntimeError):
+            self.run_test([(60, 3.9)] * 9, unplug_at=3)
+        self.assertEqual(hw()["pin16"], "ip pd")
+
+    def test_needs_the_adapter(self):
+        hw(pld=0)
+        r = cli("--charge-test", "2", check=False)
+        self.assertIn("plug in the adapter first", r.stderr)
+        self.assertEqual(hw()["pin16"], "ip pd")
 
 
 class TestCustomPlan(Base):
@@ -1736,7 +1880,7 @@ class TestGui(Base):
             for _ in range(5):
                 app.root.update()
             self.assertEqual(app.stat["Saved plan"].cget("text"), "Cool")
-            self.assertEqual(app.stat["Governor"].cget("text"), "schedutil")
+            self.assertEqual(app.stat["Governor"].cget("text"), "schedutil · Cool")
             self.assertIn("52.3", app.temp_lbl.cget("text"))
             self.assertEqual(app.bat_pct.cget("text"), "76%")
             self.assertEqual(app.buttons["Cool"].cget("bg"), ep.PLANS["Cool"]["color"])

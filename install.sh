@@ -202,12 +202,12 @@ system_part() {
         fi
         install -m 755 "$SRC" "$DEST"
     fi
-    if [ -f /etc/systemd/system/pi5-energyplan.service ] || \
-            [ -f /etc/systemd/system/pi5-battery-guard.service ]; then
-        # refresh service files, tidy config.txt, run the new version
-        python3 "$DEST" --update-root
-        systemctl try-restart pi5-battery-guard.service || true
-    fi
+    # the boot service: the kernel starts in "powersave"; it sets the saved plan (or
+    # Performance) at every boot. Not added back if it was removed on purpose.
+    python3 "$DEST" --install-service | sed 's/^/  /'
+    # refresh service files, tidy config.txt, run the new version
+    python3 "$DEST" --update-root
+    systemctl try-restart pi5-battery-guard.service || true
 
     # menu entry / panel icon of everyone who has them: point at the new version
     for u in $(desktop_users); do
