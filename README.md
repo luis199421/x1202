@@ -56,6 +56,30 @@ see [Geekworm's scripts: what's included](#geekworms-scripts-whats-included-and-
 | OC 2.8 GHz | ondemand | 2.8 GHz, +0.05 V, GPU 1.05 GHz | Strong | Medium overclock |
 | OC 3.0 GHz | ondemand | 3.0 GHz, +0.05 V, GPU 1.1 GHz | Max | Not every chip is stable |
 | Sweet Spot | ondemand | found by the test | Strong | Only appears after the [test](#3-sweet-spot-overclock-test) |
+| **Custom** | your choice | your choice | your choice | Empty until you fill it in: see [Your own plan](#your-own-plan-custom) |
+
+### Your own plan (Custom)
+
+The last row, **Custom**, starts empty. Click it (or its **Edit…** button) and choose:
+
+| Setting | Range |
+|---|---|
+| CPU max speed | 1.5–3.0 GHz in 100 MHz steps (2.4 GHz is the Pi 5's normal top speed) |
+| Extra CPU voltage | None, +0.025 V or +0.05 V (2.8 GHz and more usually need it) |
+| GPU (3D) speed | 600–1100 MHz in 10 MHz steps (960 MHz = default, which writes nothing) |
+| Fan profile | Silent, Quiet, Default, Cool, Strong, Max |
+| CPU governor | powersave, conservative, ondemand, schedutil, performance |
+
+**Save** keeps it for later; **Save and use** applies it right away, like any other plan
+(with the overclock warning when it's an overclock). Changing it while it's the plan in
+use applies the new values again. From the terminal:
+
+```bash
+sudo pi5_energyplan.py --set-custom '{"max_freq_mhz": 2600, "over_voltage_delta": 25000,
+  "v3d_freq": 1000, "fan_profile": "Strong", "governor": "ondemand"}' --apply Custom
+```
+
+![The Custom plan editor](docs/custom-plan.png)
 
 **GPU overclock:** the overclock plans also raise the 3D GPU (`v3d_freq`) step by step
 from the Pi 5's default of 960 MHz. Only the 3D block is raised, as the Raspberry Pi
@@ -415,6 +439,7 @@ After `install.sh`, you can write `pi5_energyplan.py` instead of
 | `sudo python3 pi5_energyplan.py --apply Eco --no-config` | Apply until the next reboot only (no `config.txt` change) |
 | `sudo python3 pi5_energyplan.py --set-governor Eco performance` | Change the governor a plan uses |
 | `sudo python3 pi5_energyplan.py --set-fan Eco Strong` | Change a plan's fan profile (Silent, Quiet, Default, Cool, Strong, Max) |
+| `sudo python3 pi5_energyplan.py --set-custom '{…}' [--apply Custom]` | Fill in the Custom plan (see [Your own plan](#your-own-plan-custom)) |
 | `python3 pi5_energyplan.py --battery` | Live battery readout every 3 s (Ctrl+C to stop) |
 | `python3 pi5_energyplan.py --monitor [SECONDS]` | Full UPS and Pi report, refreshed in place (Ctrl+C to stop) |
 | `sudo python3 pi5_energyplan.py --charge-full on` | Charge to 100 % once, then back to the limit (`off` cancels) |
@@ -465,7 +490,7 @@ After `install.sh`, you can write `pi5_energyplan.py` instead of
 | `/etc/systemd/system/pi5-battery-guard.service` | Battery guard |
 | `/etc/pi5-energyplan/battery.json` | UPS settings |
 | `/etc/pi5-energyplan/governors.json`, `fans.json` | Your per-plan governor and fan choices |
-| `/etc/pi5-energyplan/custom.json` | The "Sweet Spot" plan |
+| `/etc/pi5-energyplan/custom.json` | The "Sweet Spot" and "Custom" plans |
 | `/etc/pi5-energyplan/charge_pin_v3.json` | What the charge-pin self-check learned |
 | `/var/lib/pi5-energyplan/autotest.json`, `autotest.log` | Sweet spot test state and log |
 | `/var/lib/pi5-energyplan/eeprom-before.conf` | Your bootloader settings before the first change (made once) |
@@ -619,7 +644,7 @@ The installer test for the menu entry and panel icon needs a throwaway user:
 `sudo INSTALL_TEST_USER=someuser sh tests/run_sim_tests.sh`. To run some tests only:
 `sudo TESTS="TestUps TestNothingTwice" sh tests/run_sim_tests.sh`.
 
-The 73 tests cover:
+The 80 tests cover:
 
 * **Plans:** applying each kind of plan, the live sysfs changes and governor fallback,
   `config.txt` editing (backup, commenting out conflicting lines, only `[all]`/`[pi5]`
@@ -664,6 +689,10 @@ The 73 tests cover:
 * **config.txt sections:** a line added at the end (like an audio overlay) stays under
   `[all]` through plan changes and updates; an update repairs what the original
   version moved into `[cm5]`; lines that were in `[cm5]` from the start stay there.
+* **Custom plan:** empty at first and can't be applied; filled in from the window
+  (editor click-through) or with `--set-custom`; its CPU, voltage, GPU, fan and
+  governor end up in `config.txt` and live; the GPU default writes nothing; bad values
+  are refused; changing it while in use applies it again; it coexists with Sweet Spot.
 * **GPU overclock:** 1000 → 1050 → 1100 MHz for the three overclock plans, none for
   the others, and a hand-made `v3d_freq` can't override the plan.
 * **GUI and panel icon:** the window builds and shows live values; the panel icon

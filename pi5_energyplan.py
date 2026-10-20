@@ -214,13 +214,29 @@ BOOT_DELAY = 45  # seconds after boot before each test (time to cancel / settle)
 AUTOTEST_STEPS = [(2600, 0), (2600, 25000), (2800, 25000), (2800, 50000), (3000, 50000)]
 
 
+# "Custom": a plan you fill in yourself in the window (Custom → Edit…) or with
+# --set-custom. Until then it's empty and can't be applied.
+CUSTOM = "Custom"
+CUSTOM_COLOR = "#8d6e63"
+CUSTOM_VOLTAGES = [(0, "None"), (25000, "+0.025 V"), (50000, "+0.05 V")]
+V3D_DEFAULT = 960          # Pi 5 3D GPU clock, MHz
+CPU_RANGE, GPU_RANGE = (1500, 3000, 100), (600, 1100, 10)   # min, max, step (MHz)
+
+
+def custom_empty():
+    return {"desc": "Empty: click to choose CPU and GPU speed, fan and governor.",
+            "governor": "ondemand", "max_freq_mhz": 2400, "color": CUSTOM_COLOR,
+            "fan": list(FAN_PROFILES["Default"]), "empty": True}
+
+
 def load_custom_plans():
-    """Add plans saved by the auto test (e.g. 'Sweet Spot') to PLANS."""
+    """Add plans from custom.json to PLANS: the "Sweet Spot" from the auto test and
+    the "Custom" plan (always last; empty until it's filled in)."""
     try:
         with open(CUSTOM_PLANS) as f:
             data = json.load(f)
     except (OSError, ValueError):
-        return
+        data = {}
     for name, p in data.items():
         if isinstance(p, dict) and "max_freq_mhz" in p:
             p.setdefault("governor", "ondemand")
@@ -228,6 +244,7 @@ def load_custom_plans():
             p.setdefault("color", "#66bb6a")
             p["fan"] = [tuple(x) for x in p.get("fan", SWEET_FAN)]
             PLANS[name] = p
+    PLANS[CUSTOM] = PLANS.pop(CUSTOM, None) or custom_empty()   # keep it last
 
 
 load_custom_plans()
@@ -272,17 +289,18 @@ def load_fan_overrides():
 
 
 def reload_plan_settings():
-    """Reset plans to built-in governor/fan, then apply the saved choices."""
+    """Reset plans to built-in (or custom.json) governor/fan, then apply the saved
+    choices."""
+    load_custom_plans()
     for p in PLANS.values():
-        p["governor"] = p.get("_default_gov", p["governor"])
-        p["fan"] = list(p.get("_default_fan", p["fan"]))
+        p.setdefault("_default_gov", p["governor"])
+        p.setdefault("_default_fan", list(p["fan"]))
+        p["governor"] = p["_default_gov"]
+        p["fan"] = list(p["_default_fan"])
     load_governor_overrides()
     load_fan_overrides()
 
 
-for _p in PLANS.values():
-    _p["_default_gov"] = _p["governor"]
-    _p["_default_fan"] = list(_p["fan"])
 reload_plan_settings()
 
 
@@ -819,6 +837,75 @@ def file_sha(path):
             return hashlib.sha256(f.read()).hexdigest()
     except OSError:
         return None
+
+
+def custom_desc(cpu, ovd, gpu):
+    return (f"Yours: CPU {cpu / 1000:.1f} GHz" + (f" +{ovd / 1e6:.3g} V" if ovd else "")
+            + f", GPU {gpu} MHz" + (" (default)" if gpu == V3D_DEFAULT else "") + ".")
+
+
+def validate_custom(c):
+    if not isinstance(c, dict):
+        raise ValueError("expected settings like {\"max_freq_mhz\": 2600, ...}")
+
+    def num(key, default, lo, hi, step, what):
+        try:
+            v = int(c.get(key, default))
+        except (TypeError, ValueError):
+            raise ValueError(f"{what}: not a number") from None
+        if not lo <= v <= hi or (v - lo) % step:
+            raise ValueError(f"{what}: {lo}-{hi} MHz in steps of {step}")
+        return v
+    cpu = num("max_freq_mhz", 2400, *CPU_RANGE, "CPU speed")
+    gpu = num("v3d_freq", V3D_DEFAULT, *GPU_RANGE, "GPU speed")
+    ovd = c.get("over_voltage_delta", 0)
+    if ovd not in [v for v, _ in CUSTOM_VOLTAGES]:
+        raise ValueError("Extra voltage: 0, 25000 or 50000 (µV)")
+    fan = c.get("fan_profile", "Default")
+    if fan not in FAN_PROFILES:
+        raise ValueError(f"Fan profile: one of {', '.join(FAN_PROFILES)}")
+    gov = c.get("governor", "ondemand")
+    if gov not in GOV_INFO:
+        raise ValueError(f"Governor: one of {', '.join(GOV_INFO)}")
+    return {"max_freq_mhz": cpu, "v3d_freq": gpu, "over_voltage_delta": ovd,
+            "fan_profile": fan, "governor": gov}
+
+
+def set_custom(c, reapply=True):
+    """Save the Custom plan (root). If it's the plan in use, apply it again."""
+    c = validate_custom(c)
+    cpu, gpu, ovd = c["max_freq_mhz"], c["v3d_freq"], c["over_voltage_delta"]
+    plan = {"desc": custom_desc(cpu, ovd, gpu), "governor": c["governor"],
+            "max_freq_mhz": cpu, "fan": FAN_PROFILES[c["fan_profile"]],
+            "color": CUSTOM_COLOR, "warn": cpu > 2400 or ovd > 0 or gpu > V3D_DEFAULT}
+    if ovd:
+        plan["over_voltage_delta"] = ovd
+    if gpu != V3D_DEFAULT:          # the default writes no line at all
+        plan["v3d_freq"] = gpu
+    try:
+        with open(CUSTOM_PLANS) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    data[CUSTOM] = plan
+    write_json_atomic(CUSTOM_PLANS, data)
+    for path in (GOV_FILE, FAN_FILE):   # the editor's choice wins over the row pickers
+        try:
+            with open(path) as f:
+                over = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if over.pop(CUSTOM, None) is not None:
+            write_json_atomic(path, over)
+    reload_plan_settings()
+    msgs = [f"Custom plan saved: CPU {cpu} MHz"
+            + (f" +{ovd // 1000} mV" if ovd else "") + f", GPU {gpu} MHz, "
+            f"{c['fan_profile']} fan, {c['governor']} governor"]
+    if reapply and find_plan(saved_plan() or "") == CUSTOM:
+        msgs += apply_plan(CUSTOM)
+    subprocess.run(["systemctl", "try-restart", GUARD_SERVICE], capture_output=True)
+    sync_installed_copy()
+    return msgs
 
 
 def set_plan_governor(name, gov):
@@ -1723,6 +1810,9 @@ def apply_live(name):
 
 
 def apply_plan(name, save_config=True):
+    if PLANS[name].get("empty"):
+        raise ValueError(f"The {name} plan is empty: fill it in first (in the window: "
+                         f"{name} → Edit…, or with --set-custom)")
     msgs = apply_live(name)
     if save_config:
         path = write_config(name)
@@ -2510,7 +2600,7 @@ class App:
         for c, head in enumerate(("Plan", "Governor", "Fan", "")):
             self._label(plans, head, 8, MUTED).grid(row=0, column=c, sticky="w",
                                                     padx=(0 if c == 0 else 8, 0))
-        self.gov_vars, self.fan_vars = {}, {}
+        self.gov_vars, self.fan_vars, self.desc_labels = {}, {}, {}
         govs = available_governors()
         for r, name in enumerate(PLANS, start=1):
             p = PLANS[name]
@@ -2537,8 +2627,16 @@ class App:
                 current=fan_profile_of(PLANS[n]["fan"]))).grid(row=r, column=2, sticky="w")
             self.fan_vars[name] = fvar
 
-            self._label(plans, p["desc"], 9, MUTED, wraplength=170, justify="left") \
-                .grid(row=r, column=3, sticky="w", padx=(8, 0))
+            cell = tk.Frame(plans, bg=BG)
+            cell.grid(row=r, column=3, sticky="w", padx=(8, 0))
+            self.desc_labels[name] = self._label(cell, p["desc"], 9, MUTED, wraplength=170,
+                                                 justify="left")
+            self.desc_labels[name].pack(anchor="w")
+            if name == CUSTOM:
+                tk.Button(cell, text="Edit…", command=self.open_custom_editor, relief="flat",
+                          bd=0, padx=8, pady=1, bg="#3a3d45", fg=FG,
+                          activebackground="#4a4d55", activeforeground=FG,
+                          font=("DejaVu Sans", 9)).pack(anchor="w", pady=(2, 0))
 
         tk.Checkbutton(body, text="Keep this plan after reboot (config.txt + boot service)",
                        variable=self.save_var, bg=BG, fg=FG, selectcolor=CARD,
@@ -2971,15 +3069,12 @@ class App:
         return False
 
     def on_plan(self, name):
+        if PLANS[name].get("empty"):
+            self.open_custom_editor()
+            return
         if self.blocked("the plan"):
             return
-        if PLANS[name].get("warn") and not messagebox.askyesno(
-                "Overclock",
-                f"{name} raises CPU speed and voltage.\n\n"
-                "• Use the official 27 W power supply\n"
-                "• If the Pi freezes or won't boot, put the SD card in a PC and\n"
-                "  delete the 'pi5-energyplan' block at the end of config.txt\n\n"
-                "Continue?"):
+        if PLANS[name].get("warn") and not self.confirm_overclock(name):
             return
         self.set_busy(f"applying {name}")
         for b in self.buttons.values():
@@ -2989,6 +3084,141 @@ class App:
         threading.Thread(target=lambda: setattr(self, "result",
                          (name, save) + run_privileged(name, save)), daemon=True).start()
         self.root.after(200, self.poll_result)
+
+    @staticmethod
+    def confirm_overclock(name):
+        return messagebox.askyesno(
+                "Overclock",
+                f"{name} raises the CPU / GPU speed or voltage.\n\n"
+                "• Use the official 27 W power supply\n"
+                "• If the Pi freezes or won't boot, put the SD card in a PC and\n"
+                "  delete the 'pi5-energyplan' block at the end of config.txt\n\n"
+                "Continue?")
+
+    # ----- Custom plan editor -----
+    def open_custom_editor(self):
+        old = getattr(self, "custom_win", None)
+        if old is not None and old.winfo_exists():
+            old.destroy()
+        p = PLANS[CUSTOM]
+        empty = p.get("empty")
+        top = self.custom_win = tk.Toplevel(self.root)
+        top.title("Custom plan")
+        top.configure(bg=BG)
+        top.transient(self.root)
+        win, foot = make_scrollable(top, footer=True, padx=16, pady=12)
+
+        vcpu = tk.IntVar(value=p["max_freq_mhz"])
+        vgpu = tk.IntVar(value=V3D_DEFAULT if empty else p.get("v3d_freq", V3D_DEFAULT))
+        volt_lbl = dict(CUSTOM_VOLTAGES)
+        vvolt = tk.StringVar(value=volt_lbl.get(p.get("over_voltage_delta", 0), "None"))
+        vfan = tk.StringVar(value=fan_profile_of(p["fan"]) if not empty else "Default")
+        vgov = tk.StringVar(value=p["governor"])
+
+        self._label(win, "Custom plan", 13, bold=True).pack(anchor="w")
+        self._label(win, "Choose the speeds, fan and governor. Speeds and the GPU change after "
+                         "a reboot; governor and fan start right away.", 9, MUTED,
+                    wraplength=380, justify="left").pack(anchor="w", pady=(2, 6))
+
+        def slider(title, var, rng, fmt, hint):
+            box = tk.Frame(win, bg=CARD, padx=10, pady=6)
+            box.pack(fill="x", pady=(6, 0))
+            top_row = tk.Frame(box, bg=CARD)
+            top_row.pack(fill="x")
+            self._label(top_row, title, 10).pack(side="left")
+            val = self._label(top_row, "", 12, bold=True)
+            val.pack(side="right")
+            tk.Scale(box, from_=rng[0], to=rng[1], resolution=rng[2], orient="horizontal",
+                     variable=var, showvalue=False, length=360, bg=CARD,
+                     troughcolor="#3a3d45", highlightthickness=0, bd=0,
+                     activebackground="#90caf9",
+                     command=lambda *_: refresh()).pack(fill="x")
+            self._label(box, hint, 8, MUTED, wraplength=360, justify="left").pack(anchor="w")
+            return lambda: val.config(text=fmt(var.get()))
+
+        def picker(title, var, options):
+            row = tk.Frame(win, bg=BG)
+            row.pack(fill="x", pady=(8, 0))
+            self._label(row, title, 10).pack(side="left")
+            self.picker_button(row, var, max(len(v) for v, _ in options) + 2,  # value width
+                               lambda btn: self.choose(title, options, var.set, anchor=btn,
+                                                       current=var.get())).pack(side="right")
+
+        show_cpu = slider("CPU max speed", vcpu, CPU_RANGE, lambda v: f"{v / 1000:.1f} GHz",
+                          "2.4 GHz = the Pi 5's normal top speed. Above it is an overclock.")
+        picker("Extra CPU voltage", vvolt, [(lbl, lbl) for _, lbl in CUSTOM_VOLTAGES])
+        show_gpu = slider("GPU (3D) speed", vgpu, GPU_RANGE,
+                          lambda v: f"{v} MHz" + (" · default" if v == V3D_DEFAULT else ""),
+                          "960 MHz = default. Lower saves power, higher is a GPU overclock.")
+        picker("Fan profile", vfan, [(f, f"{f}  ·  {fan_profile_info(f)}")
+                                     for f in FAN_PROFILES])
+        picker("CPU governor", vgov, [(g, f"{g}  ·  {GOV_INFO[g]}")
+                                      for g in available_governors()])
+        note = self._label(win, "", 9, "#ffa726", wraplength=380, justify="left")
+        note.pack(anchor="w", pady=(10, 0))
+
+        def settings():
+            return {"max_freq_mhz": vcpu.get(), "v3d_freq": vgpu.get(),
+                    "over_voltage_delta": [v for v, lbl in CUSTOM_VOLTAGES
+                                           if lbl == vvolt.get()][0],
+                    "fan_profile": vfan.get(), "governor": vgov.get()}
+
+        def refresh(*_):
+            show_cpu()
+            show_gpu()
+            c = settings()
+            warn = []
+            if c["max_freq_mhz"] > 2400 or c["v3d_freq"] > V3D_DEFAULT or \
+                    c["over_voltage_delta"]:
+                warn.append("Overclock: use the official 27 W power supply and the Active "
+                            "Cooler. If it doesn't boot, remove the 'pi5-energyplan' block "
+                            "from config.txt on another computer.")
+            if c["max_freq_mhz"] >= 2800 and not c["over_voltage_delta"]:
+                warn.append("2.8 GHz and more usually need extra voltage.")
+            if c["over_voltage_delta"] and c["max_freq_mhz"] <= 2400:
+                warn.append("Extra voltage only makes the Pi warmer at 2.4 GHz or less.")
+            note.config(text="\n".join(warn))
+        for v in (vvolt, vfan, vgov):
+            v.trace_add("write", refresh)
+        refresh()
+
+        def save(use):
+            c = settings()
+            overclock = c["max_freq_mhz"] > 2400 or c["v3d_freq"] > V3D_DEFAULT or \
+                c["over_voltage_delta"]
+            if self.blocked("the plan" if use else "the Custom plan",
+                            lock_during_test=use):
+                return
+            if use and overclock and not self.confirm_overclock(CUSTOM):
+                return
+            args = ["--set-custom", json.dumps(c)]
+            save_cfg = self.save_var.get()
+            if use:
+                args += ["--apply", CUSTOM] + ([] if save_cfg else ["--no-config"])
+            self.set_busy("saving the Custom plan")
+            self.msg.config(text="Saving the Custom plan… (enter your password if asked)",
+                            fg=MUTED)
+            threading.Thread(target=lambda: setattr(
+                self, "result", ("Custom plan", use and save_cfg) + run_root(args)),
+                daemon=True).start()
+            self.root.after(200, self.poll_result)
+            top.destroy()
+
+        btns = tk.Frame(foot, bg=BG)
+        btns.pack(fill="x", pady=(4, 12))
+        self.custom_controls = {"cpu": vcpu, "gpu": vgpu, "volt": vvolt, "fan": vfan,
+                                "gov": vgov, "note": note}
+        for text, cmd, bg in (("Save and use", lambda: save(True), "#43a047"),
+                              ("Save", lambda: save(False), CARD),
+                              ("Cancel", top.destroy, CARD)):
+            b = tk.Button(btns, text=text, command=cmd, relief="flat", bg=bg, fg=FG,
+                          activebackground="#555", activeforeground=FG,
+                          font=("DejaVu Sans", 9, "bold" if text == "Save and use" else
+                                "normal"))
+            b.pack(side="right", padx=(6, 0), ipadx=6, ipady=2)
+            self.custom_controls[text] = b
+        top.geometry(f"+{self.root.winfo_rootx() + 30}+{max(0, self.root.winfo_rooty() - 10)}")
+        keep_on_screen(top)
 
     def on_governor(self, name, gov):
         if self.blocked("the governor"):
@@ -3027,6 +3257,8 @@ class App:
             var.set(PLANS[name]["governor"])
         for name, var in getattr(self, "fan_vars", {}).items():
             var.set(fan_profile_of(PLANS[name]["fan"]))
+        for name, lbl in getattr(self, "desc_labels", {}).items():
+            lbl.config(text=PLANS[name]["desc"])
 
     def poll_result(self):
         if self.result is None:
@@ -3385,6 +3617,10 @@ def main():
                     help='battery limits, e.g. \'{"enabled":true,"min":20,"max":80}\' (sudo)')
     ap.add_argument("--set-governor", nargs=2, metavar=("PLAN", "GOVERNOR"),
                     help="choose the CPU governor a plan uses (sudo)")
+    ap.add_argument("--set-custom", metavar="JSON",
+                    help='fill in the Custom plan (sudo), e.g. \'{"max_freq_mhz": 2600, '
+                         '"v3d_freq": 1000, "over_voltage_delta": 25000, "fan_profile": '
+                         '"Strong", "governor": "ondemand"}\'; add --apply Custom to use it')
     ap.add_argument("--set-fan", nargs=2, metavar=("PLAN", "PROFILE"),
                     help=f"choose a plan's fan profile: {', '.join(FAN_PROFILES)} (sudo)")
     ap.add_argument("--eeprom-setup", action="store_true",
@@ -3401,6 +3637,16 @@ def main():
     ap.add_argument("--boot", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
+    if args.set_custom:
+        if os.geteuid() != 0:
+            sys.exit("Needs root: run with sudo")
+        try:
+            print("\n".join(set_custom(json.loads(args.set_custom),
+                                        reapply=not args.apply)))
+        except (ValueError, OSError, subprocess.CalledProcessError) as e:
+            sys.exit(f"Error: {e}")
+        if not args.apply:
+            return
     if args.set_governor or args.set_fan or args.update_root:
         if os.geteuid() != 0:
             sys.exit("Needs root: run with sudo")
@@ -3537,6 +3783,10 @@ def main():
 
     if args.list:
         for name, p in PLANS.items():
+            if p.get("empty"):
+                print(f"{name:12} (empty: fill it in the window, Custom → Edit…, or with "
+                      "--set-custom)")
+                continue
             print(f"{name:12} {p['governor']:12} fan {fan_profile_of(p['fan']):8} {p['desc']}")
         return
     if args.status:

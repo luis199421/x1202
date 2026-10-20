@@ -1090,6 +1090,92 @@ class TestNothingTwice(Base):
         self.assertEqual(sum(c.startswith("rpi-eeprom-config --apply") for c in calls()), 1)
 
 
+class TestCustomPlan(Base):
+    MINE = {"max_freq_mhz": 2700, "v3d_freq": 1020, "over_voltage_delta": 25000,
+            "fan_profile": "Strong", "governor": "conservative"}
+
+    def block(self):
+        return self.config().split("# >>> pi5-energyplan")[1]
+
+    def test_starts_empty_and_cant_be_applied(self):
+        self.assertEqual(list(self.ep.PLANS)[-1], "Custom")
+        self.assertTrue(self.ep.PLANS["Custom"]["empty"])
+        self.assertRegex(cli("--list").stdout, r"Custom\s+\(empty: fill it in the window")
+        r = cli("--apply", "Custom", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("The Custom plan is empty", r.stderr)
+        self.assertEqual(self.config(), STOCK_CONFIG.rstrip("\n"))
+
+    def test_fill_in_and_use(self):
+        out = cli("--set-custom", json.dumps(self.MINE)).stdout
+        self.assertIn("Custom plan saved: CPU 2700 MHz +25 mV, GPU 1020 MHz, Strong fan, "
+                      "conservative governor", out)
+        self.assertRegex(cli("--list").stdout,
+                         r"Custom\s+conservative\s+fan Strong\s+Yours: CPU 2.7 GHz \+0.025 V, "
+                         r"GPU 1020 MHz.")
+        out = cli("--apply", "Custom").stdout
+        self.assertIn("Overclock: Custom", out)
+        self.assertIn("2700 MHz unlocks after reboot", out)
+        block = self.block()
+        self.assertIn("# plan: Custom", block)
+        self.assertIn("dtparam=fan_temp0=35000", block)          # Strong profile
+        self.assertIn("arm_freq=2700\nover_voltage_delta=25000\nv3d_freq=1020\n", block)
+        self.assertEqual(get(CPUFREQ + "/scaling_governor"), "conservative")
+        self.assertIn("Saved plan  : Custom", cli("--status").stdout)
+
+    def test_set_and_use_in_one_step(self):
+        out = cli("--set-custom", json.dumps(self.MINE), "--apply", "Custom").stdout
+        self.assertEqual(out.count("Saved to /boot/firmware/config.txt"), 1)   # applied once
+        self.assertIn("# plan: Custom", self.config())
+
+    def test_defaults_write_nothing_extra(self):
+        cli("--set-custom", '{"max_freq_mhz": 2000, "v3d_freq": 960, "fan_profile": "Quiet",'
+                            ' "governor": "powersave"}', "--apply", "Custom")
+        block = self.block()
+        self.assertIn("arm_freq=2000\n# <<<", block)
+        self.assertNotIn("v3d_freq", block)
+        self.assertNotIn("over_voltage", block)
+        self.assertEqual(get(CPUFREQ + "/scaling_max_freq"), "2000000")
+        self.assertFalse(self.ep.PLANS["Custom"].get("warn"))
+        self.ep.reload_plan_settings()
+        self.assertFalse(self.ep.PLANS["Custom"].get("warn"))
+        self.assertNotIn("Overclock", cli("--apply", "Custom").stdout)
+
+    def test_changing_it_while_in_use_applies_again(self):
+        cli("--set-custom", json.dumps(self.MINE), "--apply", "Custom")
+        out = cli("--set-custom", json.dumps(dict(self.MINE, max_freq_mhz=2500,
+                                                  over_voltage_delta=0))).stdout
+        self.assertIn("Saved to /boot/firmware/config.txt", out)
+        self.assertIn("arm_freq=2500\nv3d_freq=1020\n", self.block())
+
+    def test_bad_values_are_refused(self):
+        for bad, why in (({"max_freq_mhz": 3200}, "CPU speed: 1500-3000 MHz"),
+                         ({"max_freq_mhz": 2650}, "in steps of 100"),
+                         ({"v3d_freq": 1300}, "GPU speed: 600-1100 MHz"),
+                         ({"over_voltage_delta": 75000}, "Extra voltage"),
+                         ({"fan_profile": "Turbo"}, "Fan profile"),
+                         ({"governor": "fast"}, "Governor"),
+                         ([1, 2], "expected settings")):
+            r = cli("--set-custom", json.dumps(bad), check=False)
+            self.assertNotEqual(r.returncode, 0, bad)
+            self.assertIn(why, r.stderr)
+        self.assertTrue(self.ep.PLANS["Custom"]["empty"])
+        self.assertFalse(os.path.exists("/etc/pi5-energyplan/custom.json"))
+
+    def test_editor_wins_over_the_row_pickers_and_sweet_spot_stays(self):
+        self.ep.save_custom_plan(2600, 0)                   # a Sweet Spot from the test
+        cli("--set-custom", json.dumps(self.MINE))
+        cli("--set-fan", "Custom", "Max")
+        cli("--set-governor", "Custom", "performance")
+        self.assertRegex(cli("--list").stdout, r"Custom\s+performance\s+fan Max")
+        cli("--set-custom", json.dumps(dict(self.MINE, fan_profile="Quiet")))
+        lst = cli("--list").stdout
+        self.assertRegex(lst, r"Custom\s+conservative\s+fan Quiet")
+        self.assertIn("Sweet Spot", lst)
+        self.assertEqual(lst.strip().splitlines()[-1].split()[0], "Custom")   # still last
+        self.assertNotIn("Custom", json.loads(get("/etc/pi5-energyplan/fans.json")))
+
+
 class TestConfigLinesKeepTheirSection(Base):
     """A line added at the end of config.txt (e.g. an audio HAT overlay) must keep
     working after plan changes and updates."""
@@ -1476,6 +1562,8 @@ app = ep.App()
 info(app.root, "main")
 app.open_ups_settings()
 info(app.ups_win, "ups")
+app.open_custom_editor()
+info(app.custom_win, "custom")
 app.root.destroy()
 spec = importlib.util.spec_from_file_location("ig", %(gui)r)
 ig = importlib.util.module_from_spec(spec)
@@ -1660,6 +1748,27 @@ class TestGui(Base):
             win = app.choose("Test", [("a", "A"), ("b", "B")], picked.append, current="a")
             app.root.update()
             win.destroy()
+            # the Custom plan: empty → editor → Save and use
+            self.assertIn("Empty", app.desc_labels["Custom"].cget("text"))
+            app.on_plan("Custom")                           # empty: opens the editor
+            app.root.update()
+            self.assertTrue(app.custom_win.winfo_exists())
+            ep.messagebox.askyesno = lambda *a: True
+            ctl = app.custom_controls
+            self.assertEqual((ctl["cpu"].get(), ctl["gpu"].get(), ctl["fan"].get()),
+                             (2400, 960, "Default"))         # starts at the Pi's defaults
+            ctl["cpu"].set(2600)
+            ctl["volt"].set("+0.025 V")                       # triggers the warning text
+            app.root.update()
+            self.assertIn("Overclock", ctl["note"].cget("text"))
+            ctl["Save and use"].invoke()
+            end = time.time() + 60
+            while app.busy and time.time() < end:
+                app.root.update()
+                time.sleep(0.05)
+            self.assertIn("# plan: Custom", self.config())
+            self.assertIn("arm_freq=2600", self.config())
+            self.assertIn("Yours: CPU 2.6 GHz", app.desc_labels["Custom"].cget("text"))
             # banners for the guard states
             b = {"on_battery": True, "soc": 18}
             g = {"enabled": True, "min": 20, "outage_minutes": 0}
