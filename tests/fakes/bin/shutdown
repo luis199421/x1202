@@ -1,0 +1,10 @@
+#!/usr/bin/python3
+"""Fake shutdown: only records how it was called."""
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import _common as c
+
+c.log_call("shutdown")
+if "shutdown" == "systemctl" and sys.argv[1:2] == ["is-active"]:
+    sys.exit(3)

@@ -1,0 +1,26 @@
+#!/usr/bin/python3
+"""Fake pinctrl: GPIO6 = power-loss detect, GPIO16 = charge control."""
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import _common as c
+
+hw = c.load()
+args = sys.argv[1:]
+if args[:1] == ["get"]:
+    pin = int(args[1])
+    if pin == 6:
+        print(f" 6: ip    pd | {'hi' if hw['pld'] else 'lo'} // GPIO6 = input")
+    elif pin == 16:
+        st = hw["pin16"]
+        level = "hi" if st == "op dh" else "lo"
+        func = st.split()[0]
+        print(f"16: {func}    pd | {level} // GPIO16 = {'output' if func == 'op' else 'input'}")
+    sys.exit(0)
+if args[:1] == ["set"]:
+    c.log_call("pinctrl")
+    if int(args[1]) == 16:
+        hw["pin16"] = " ".join(args[2:])
+        c.save(hw)
+    sys.exit(0)
+sys.exit(1)

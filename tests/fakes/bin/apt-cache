@@ -1,0 +1,17 @@
+#!/usr/bin/python3
+"""Fake apt-cache for the installer tests."""
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import _common as c
+
+c.log_call("apt-cache")
+hw = c.load()
+args = sys.argv[1:]
+if "apt-cache" == "apt-cache" and args[:1] == ["show"]:
+    sys.exit(100 if args[1] in hw.get("apt_missing", []) else 0)
+if "apt-cache" == "raspi-config" and args == ["nonint", "get_i2c"]:
+    print(hw.get("i2c", 1))
+if "apt-cache" == "raspi-config" and args == ["nonint", "do_i2c", "0"]:
+    hw["i2c"] = 0
+    c.save(hw)
