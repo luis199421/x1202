@@ -1,10 +1,10 @@
 #!/usr/bin/python3
-"""Fake systemctl: only records how it was called."""
+"""Fake systemctl: records how it was called. `is-active` answers from hw.json."""
 import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import _common as c
 
 c.log_call("systemctl")
-if "systemctl" == "systemctl" and sys.argv[1:2] == ["is-active"]:
-    sys.exit(3)
+if "is-active" in sys.argv[1:]:
+    sys.exit(0 if sys.argv[-1] in c.load().get("active", []) else 3)

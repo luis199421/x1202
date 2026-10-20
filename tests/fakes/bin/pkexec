@@ -1,10 +1,10 @@
 #!/usr/bin/python3
-"""Fake pkexec: only records how it was called."""
+"""Fake pkexec: records the call, then runs the command (tests already run as root)."""
 import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import _common as c
 
 c.log_call("pkexec")
-if "pkexec" == "systemctl" and sys.argv[1:2] == ["is-active"]:
-    sys.exit(3)
+os.environ["PKEXEC_UID"] = str(c.load().get("pkexec_uid", 0))
+os.execvp(sys.argv[1], sys.argv[1:])

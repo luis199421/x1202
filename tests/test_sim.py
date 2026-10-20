@@ -76,7 +76,7 @@ def make_pi(governors="conservative ondemand userspace powersave performance sch
     """A fresh Raspberry Pi 5 with Active Cooler and an X1202."""
     for d in ("/sys/class", "/sys/devices/system/cpu", "/boot", "/etc/systemd/system",
               "/usr/local/bin", "/etc/pi5-energyplan", "/var/lib/pi5-energyplan",
-              "/run/pi5-energyplan", STATE):
+              "/run/pi5-energyplan", "/sys/firmware", STATE):
         clear(d)
     put(CPUFREQ + "/scaling_available_governors", governors)
     put(CPUFREQ + "/scaling_governor", "ondemand")
@@ -102,6 +102,7 @@ def make_pi(governors="conservative ondemand userspace powersave performance sch
     put("/sys/class/hwmon/hwmon2/fan1_input", 2500)
     os.makedirs("/boot/firmware")
     put("/boot/firmware/config.txt", STOCK_CONFIG.rstrip("\n"))
+    put("/sys/firmware/devicetree/base/model", "Raspberry Pi 5 Model B Rev 1.0\x00")
     hw(soc=76.5, volt=3.95, pld=1, pin16="ip pd", throttled="0x0", crate=0, ups=True)
 
 
@@ -330,8 +331,8 @@ class TestUps(Base):
     def test_ups_config(self):
         out = cli("--ups-config", json.dumps({"enabled": True, "max": 80, "min": 20,
                                              "outage_minutes": 5, "warn_minutes": 2})).stdout
-        self.assertIn("Saved: charge to 80%, safe shutdown at 20%, or after a 5 minutes "
-                      "outage.", out)
+        self.assertIn("Saved: charge to 80%, safe shutdown at 20%, or after 5 minutes "
+                      "without power.", out)
         cfg = json.loads(get("/etc/pi5-energyplan/battery.json"))
         self.assertEqual(cfg["outage_minutes"], 5)
         self.assertIn("ExecStart=/usr/bin/python3 /usr/local/bin/pi5_energyplan.py "
@@ -622,30 +623,68 @@ class TestInstaller(Base):
         return r.stdout
 
     def apt_installed(self):
-        line = [c for c in calls() if c.startswith("apt-get install")][-1]
-        return line.split()[3:]
+        line = [c for c in calls() if c.startswith("apt-get") and " install -y " in c][-1]
+        return line.split(" install -y ")[1].split()
 
     def test_trixie_packages_and_i2c(self):
         hw(i2c=1, apt_missing=["policykit-1", "libraspberrypi-bin"])
         out = self.install()
         self.assertEqual(self.apt_installed(), [
-            "python3", "python3-tk", "python3-smbus", "i2c-tools", "raspi-utils",
-            "python3-gi", "gir1.2-gdkpixbuf-2.0", "librsvg2-common", "pkexec",
-            "stress-ng", "python3-libgpiod"])
+            "python3", "python3-tk", "python3-smbus2", "i2c-tools", "raspi-utils",
+            "python3-libgpiod", "gpiod", "rpi-eeprom", "python3-gi", "gir1.2-gdkpixbuf-2.0",
+            "librsvg2-common", "pkexec", "stress-ng"])
+        self.assertIn("apt-get -o DPkg::Lock::Timeout=300 update", calls())
         self.assertIn("raspi-config nonint do_i2c 0", calls())
-        self.assertIn("reboot once so the battery can be read", out)
+        self.assertIn("REBOOT_NEEDED=1", out)
+        # Geekworm's bootloader settings, other lines kept
+        self.assertEqual(hw()["eeprom"], "[all]\nBOOT_UART=1\nPOWER_OFF_ON_HALT=1\n"
+                                         "BOOT_ORDER=0xf41\nPSU_MAX_CURRENT=5000\n")
+        self.assertFalse(os.path.exists("/etc/pi5-energyplan/battery.json"))
         self.assertTrue(os.access("/usr/local/bin/pi5_energyplan.py", os.X_OK))
         self.assertIn("Battery     : 76.5%", out)          # --status ran at the end
         self.assertIn("skipped the menu entry", out)
 
     def test_older_package_names_used_when_needed(self):
-        hw(i2c=0, apt_missing=["pkexec", "raspi-utils", "python3-smbus"])
+        hw(i2c=0, apt_missing=["pkexec", "raspi-utils", "python3-smbus2"],
+           eeprom="[all]\nPOWER_OFF_ON_HALT=1\nPSU_MAX_CURRENT=5000\n")
         out = self.install()
         pk = self.apt_installed()
-        for p in ("policykit-1", "libraspberrypi-bin", "python3-smbus2"):
+        for p in ("policykit-1", "libraspberrypi-bin", "python3-smbus"):
             self.assertIn(p, pk)
         self.assertNotIn("raspi-config nonint do_i2c 0", calls())
-        self.assertNotIn("reboot once", out)
+        self.assertIn("Bootloader already set", out)
+        self.assertNotIn("REBOOT_NEEDED", out)
+
+    def test_no_eeprom_and_recommended_ups(self):
+        out = self.install("--no-eeprom", "--ups-recommended")
+        self.assertNotIn("Bootloader", out)
+        self.assertFalse(any(c.startswith("rpi-eeprom-config") for c in calls()))
+        cfg = json.loads(get("/etc/pi5-energyplan/battery.json"))
+        self.assertEqual((cfg["enabled"], cfg["max"], cfg["min"], cfg["saver_enabled"],
+                          cfg["saver_below"]), (True, 80, 20, True, 50))
+        self.assertTrue(os.path.exists("/etc/systemd/system/pi5-battery-guard.service"))
+        cli("--ups-config", '{"enabled": true, "max": 90}')
+        out = self.install("--ups-recommended")       # keeps the user's own settings
+        self.assertIn("already saved, left as they are", out)
+        self.assertEqual(json.loads(get("/etc/pi5-energyplan/battery.json"))["max"], 90)
+
+    def test_warns_about_geekworm_scripts(self):
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)",
+                              "/home/pi/x120x/merged-trixie.py"])
+        try:
+            out = self.install()
+        finally:
+            p.kill()
+            p.wait()
+        self.assertIn("WARNING: Geekworm UPS scripts are running", out)
+        self.assertIn("merged-trixie.py", out)
+
+    def test_not_a_pi5_skips_bootloader(self):
+        os.remove("/sys/firmware/devicetree/base/model")
+        out = self.install()
+        self.assertIn("doesn't look like a Raspberry Pi 5", out)
+        self.assertIn("skipped: Error: these bootloader settings are for the Raspberry Pi 5",
+                      out)
 
     def test_rerun_updates_services(self):
         self.install()
@@ -682,7 +721,337 @@ class TestInstaller(Base):
         self.assertFalse(os.path.exists(home + "/.config/autostart/pi5-battery-tray.desktop"))
 
 
+class TestGeekwormFunctions(Base):
+    """The functions of Geekworm's example scripts, done the safe way."""
+    run_guard = TestUps.run_guard
+    status = TestUps.status
+
+    def test_shutdown_15_s_after_power_cut(self):
+        hw(pld=0, soc=90, volt=4.0)
+        steps = [None] * 4 + [lambda: self.assertFalse(
+            any(c.startswith("shutdown -h") for c in calls()))] + [None]
+        self.run_guard({"enabled": True, "outage_minutes": 0.25}, steps)
+        sd = [c for c in calls() if c.startswith("shutdown -h")]
+        self.assertEqual(len(sd), 1)
+        self.assertIn("+1 Battery guard: power out for 15 seconds", sd[0])
+
+    def test_short_glitch_does_not_shut_down(self):
+        hw(pld=0)
+        self.run_guard({"enabled": True, "outage_minutes": 0.25},
+                       [None, None, lambda: hw(pld=1), None, lambda: hw(pld=0), None, None])
+        self.assertFalse(any(c.startswith("shutdown") for c in calls()))
+
+    def test_gauge_lost_on_battery(self):
+        hw(ups=False, pld=0)          # fuel gauge silent, GPIO 6 says on battery
+        steps = [None] * 99 + [lambda: self.assertFalse(
+            any(c.startswith("shutdown -h") for c in calls()))] + [None]
+        st = self.run_guard({"enabled": True}, steps)
+        self.assertFalse(st["gauge_ok"])
+        self.assertEqual(st["ac"], 0)
+        sd = [c for c in calls() if c.startswith("shutdown -h")]
+        self.assertEqual(len(sd), 1)
+        self.assertIn("battery level can't be read", sd[0])
+
+    def test_gauge_lost_outage_timer_still_works(self):
+        hw(ups=False, pld=0)
+        self.run_guard({"enabled": True, "outage_minutes": 1}, [None] * 21)
+        sd = [c for c in calls() if c.startswith("shutdown -h")]
+        self.assertEqual(len(sd), 1)
+        self.assertIn("power out for 1 minute", sd[0])
+
+    def test_gauge_lost_on_mains_is_fine(self):
+        hw(ups=False, pld=1)
+        self.run_guard({"enabled": True}, [None] * 120)
+        self.assertFalse(any(c.startswith("shutdown") for c in calls()))
+
+    def test_charge_full_once(self):
+        ep = self.ep
+        hw(soc=85, pld=1)
+
+        def paused():
+            self.assertEqual(hw()["pin16"], "op dh")
+            put(ep.TOPUP_FILE, int(time.time()))        # "Charge to 100 % once"
+
+        def charging():
+            self.assertEqual(hw()["pin16"], "ip pd")
+            st = self.status()
+            self.assertTrue(st["topup"])
+            self.assertEqual((st["max"], st["limit"]), (100, 80))
+            hw(soc=99.7)
+
+        def back_to_limit():
+            self.assertFalse(os.path.exists(ep.TOPUP_FILE))
+            self.assertEqual(hw()["pin16"], "op dh")
+            self.assertFalse(self.status()["topup"])
+        self.run_guard({"enabled": True, "max": 80}, [paused, charging, back_to_limit])
+
+    def test_charge_full_cli(self):
+        cli("--ups-config", '{"enabled": true, "max": 80}')
+        r = cli("--charge-full", "on", check=False)
+        self.assertIn("battery guard isn't running", r.stderr)
+        hw(active=["pi5-battery-guard.service"])
+        self.assertIn("Charging to 100 % once", cli("--charge-full", "on").stdout)
+        self.assertTrue(os.path.exists(self.ep.TOPUP_FILE))
+        self.assertIn("Back to the normal 80% charge limit",
+                      cli("--charge-full", "off").stdout)
+        self.assertFalse(os.path.exists(self.ep.TOPUP_FILE))
+        cli("--ups-config", '{"enabled": true, "max": 100, "min": 20}')
+        self.assertIn("already charges to 100 %", cli("--charge-full", "on").stdout)
+
+    def test_monitor_report(self):
+        ep = self.ep
+        hw(pld=0, soc=40, volt=3.62)
+        txt = ep.monitor_report(ep.Battery())
+        for want in ("Battery      : 40.0 % (Medium) · 3.620 V per cell",
+                     "Mains power  : LOST, running on battery",
+                     "Charging     : board default (battery guard not running)",
+                     "Protection   : off (no auto shutdown)",
+                     "WARNING      : Battery approaching critical",
+                     "Pi power     : input 5.14 V · uses",
+                     "CPU core 0.800 V 1.00 A",
+                     "CPU          : 52.3 °C · 1.50 GHz (max 2.4) · ondemand",
+                     "Fan          : level 1/4 · 29% · 2500 rpm"):
+            self.assertIn(want, txt)
+        hw(soc=20)
+        self.assertIn("Battery critical", ep.monitor_report(ep.Battery()))
+        self.assertIn("CPU core 0.800 V 1.00 A", cli("--status").stdout)
+
+    def test_eeprom_setup(self):
+        hw(eeprom="[all]\nBOOT_UART=1\nPSU_MAX_CURRENT=3000\n\n[gpio4=1]\nBOOT_ORDER=0x1\n")
+        out = cli("--eeprom-setup").stdout
+        self.assertIn("take effect after a reboot", out)
+        self.assertEqual(hw()["eeprom"], "[all]\nBOOT_UART=1\nPSU_MAX_CURRENT=5000\n"
+                                         "POWER_OFF_ON_HALT=1\n\n[gpio4=1]\nBOOT_ORDER=0x1\n")
+        self.assertIn("PSU_MAX_CURRENT=3000", get("/var/lib/pi5-energyplan/eeprom-before.conf"))
+        self.assertIn("already set", cli("--eeprom-setup").stdout)
+        self.assertEqual(sum(c.startswith("rpi-eeprom-config --apply") for c in calls()), 1)
+
+
+class TestNothingTwice(Base):
+    """Reinstalling, updating, re-applying and rebooting must never add anything twice."""
+    INSTALL = TestInstaller.INSTALL
+
+    def snapshot(self, home):
+        files = {}
+        for pattern in ("/boot/firmware/*", "/etc/systemd/system/*", "/etc/pi5-energyplan/*",
+                        "/usr/local/bin/*", "/var/lib/pi5-energyplan/eeprom-before.conf",
+                        home + "/.local/share/applications/*",
+                        home + "/.config/autostart/*"):
+            for f in sorted(glob.glob(pattern)):
+                files[f] = get(f)
+        files["eeprom"] = hw()["eeprom"]
+        return files
+
+    def test_reinstall_update_boot_cycle(self):
+        import tempfile
+        home = tempfile.mkdtemp()
+        env = dict(os.environ, HOME=home)
+        ep = self.ep
+        ep.time.sleep = lambda s: None
+
+        def sh(*args):
+            r = subprocess.run(["sh", self.INSTALL, *args], capture_output=True, text=True,
+                               env=env, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+        def me(*args):
+            r = subprocess.run([sys.executable, "/usr/local/bin/pi5_energyplan.py", *args],
+                               capture_output=True, text=True, env=env, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+        try:
+            sh("--ups-recommended")
+            me("--install-launcher")
+            me("--install-tray")
+            me("--apply", "Cool")
+            me("--set-fan", "Cool", "Strong")
+            first = self.snapshot(home)
+
+            for _ in range(3):                      # reinstall / update / reboot, again and again
+                sh("--ups-recommended")
+                sh()
+                me("--install-launcher")
+                me("--install-tray")
+                me("--update")
+                me("--update-root")
+                me("--eeprom-setup")
+                me("--apply", "Cool")
+                ep.boot_apply()                     # what runs at every boot
+                ep.boot_apply()
+            again = self.snapshot(home)
+        finally:
+            subprocess.run(["pkill", "-f", "pi5_energyplan.py --tray"])
+            shutil.rmtree(home, ignore_errors=True)
+
+        self.assertEqual(sorted(again), sorted(first))   # no new files
+        for f in first:
+            self.assertEqual(again[f], first[f], f)       # and nothing changed inside
+        cfg = again["/boot/firmware/config.txt"]
+        self.assertEqual(cfg.count("# >>> pi5-energyplan"), 1)
+        self.assertEqual(cfg.count("# <<< pi5-energyplan <<<"), 1)
+        self.assertEqual(cfg.count("dtparam=fan_temp0="), 2)    # ours + the old one, disabled
+        self.assertEqual(cfg.count("#energyplan-disabled#"), 3)
+        self.assertEqual(again["eeprom"].count("POWER_OFF_ON_HALT"), 1)
+        self.assertEqual(again["eeprom"].count("PSU_MAX_CURRENT"), 1)
+        self.assertEqual(sum(c.startswith("rpi-eeprom-config --apply") for c in calls()), 1)
+        units = [f for f in again if f.startswith("/etc/systemd/system/")]
+        self.assertEqual(sorted(units), ["/etc/systemd/system/pi5-battery-guard.service",
+                                         "/etc/systemd/system/pi5-energyplan.service"])
+        autostart = [f for f in again if "/autostart/" in f]
+        self.assertEqual(len(autostart), 1)
+
+    def test_old_manual_install_is_replaced_not_doubled(self):
+        """Someone ran the script from ~/pi5-energyplan before using install.sh."""
+        import tempfile
+        home = tempfile.mkdtemp()
+        old = os.path.join(home, "pi5-energyplan")
+        os.makedirs(old)
+        shutil.copy2(SCRIPT, old)
+        env = dict(os.environ, HOME=home)
+        try:
+            for args in (["--install-launcher"], ["--install-tray"]):
+                subprocess.run([sys.executable, os.path.join(old, "pi5_energyplan.py"), *args],
+                               check=True, capture_output=True, env=env)
+            subprocess.run(["sh", TestInstaller.INSTALL], check=True, capture_output=True,
+                           env=env)
+            for args in (["--install-launcher"], ["--install-tray"]):
+                subprocess.run([sys.executable, "/usr/local/bin/pi5_energyplan.py", *args],
+                               check=True, capture_output=True, env=env)
+            apps = glob.glob(home + "/.local/share/applications/*")
+            auto = glob.glob(home + "/.config/autostart/*")
+            self.assertEqual(len(apps), 1)
+            self.assertEqual(len(auto), 1)
+            self.assertIn("/usr/local/bin/pi5_energyplan.py", get(apps[0]))
+            self.assertIn("/usr/local/bin/pi5_energyplan.py --tray", get(auto[0]))
+        finally:
+            subprocess.run(["pkill", "-f", "pi5_energyplan.py --tray"])
+            shutil.rmtree(home, ignore_errors=True)
+
+    def second_copy_refused(self, args, message):
+        first = subprocess.Popen([sys.executable, SCRIPT, *args],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            time.sleep(1.5)
+            self.assertIsNone(first.poll(), "first copy should still be running")
+            r = cli(*args, check=False)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn(message, r.stderr)
+        finally:
+            first.terminate()
+            first.wait()
+
+    def test_only_one_battery_guard(self):
+        self.second_copy_refused(["--battery-guard"], "already running")
+
+    def test_only_one_boot_task(self):
+        cli("--apply", "Cool")
+        self.second_copy_refused(["--boot"], "already running")
+
+    def test_usb_5v_when_off_choice(self):
+        stock = "[all]\nBOOT_UART=1\nPOWER_OFF_ON_HALT=0\nBOOT_ORDER=0xf41\n"
+        hw(eeprom=stock)
+        out = cli("--usb-5v-when-off", "off").stdout
+        self.assertIn("POWER_OFF_ON_HALT=1", out)
+        self.assertEqual(hw()["eeprom"], stock.replace("HALT=0", "HALT=1"))  # only that key
+        self.assertIn("already set", cli("--usb-5v-when-off", "off").stdout)
+        cli("--usb-5v-when-off", "on")
+        self.assertIn("POWER_OFF_ON_HALT=0", hw()["eeprom"])
+        self.assertTrue(json.loads(get("/etc/pi5-energyplan/battery.json"))["usb_5v_when_off"])
+
+        # a reinstall adds PSU_MAX_CURRENT but keeps the "stay on" choice
+        r = subprocess.run(["sh", TestInstaller.INSTALL], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(hw()["eeprom"], "[all]\nBOOT_UART=1\nPOWER_OFF_ON_HALT=0\n"
+                                         "BOOT_ORDER=0xf41\nPSU_MAX_CURRENT=5000\n")
+
+    def test_ups_window_choice_changes_only_when_needed(self):
+        hw(eeprom="[all]\nPOWER_OFF_ON_HALT=1\n")
+        cli("--ups-config", '{"enabled": true, "usb_5v_when_off": false}')
+        self.assertFalse(any(c.startswith("rpi-eeprom-config --apply") for c in calls()))
+        out = cli("--ups-config", '{"enabled": true, "usb_5v_when_off": true}').stdout
+        self.assertIn("POWER_OFF_ON_HALT=0", out)
+        self.assertEqual(hw()["eeprom"], "[all]\nPOWER_OFF_ON_HALT=0\n")
+        cli("--ups-config", '{"max": 90}')                # other keys keep their values
+        cfg = json.loads(get("/etc/pi5-energyplan/battery.json"))
+        self.assertEqual((cfg["max"], cfg["enabled"], cfg["usb_5v_when_off"]), (90, True, True))
+        self.assertEqual(sum(c.startswith("rpi-eeprom-config --apply") for c in calls()), 1)
+
+
 HAVE_TK = bool(importlib.util.find_spec("tkinter") and os.environ.get("DISPLAY"))
+KEEP_TK = []
+
+
+class TestInstallLauncher(unittest.TestCase):
+    def test_double_click_launcher_finds_the_installer(self):
+        """Run the .desktop Exec line the way PCManFM (libfm) does: %k = the folder
+        of the .desktop file, unquoted, then split like a shell would."""
+        import shlex
+        import tempfile
+        repo = os.path.dirname(HERE)
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(tmp, "my downloads", "x1202-main")
+            os.makedirs(folder)
+            for f in ("install_gui.py", "install.sh", "Install Pi 5 Energy Plan.desktop"):
+                shutil.copy2(os.path.join(repo, f), folder)
+            with open(os.path.join(folder, "Install Pi 5 Energy Plan.desktop")) as f:
+                exec_line = [x for x in f.read().splitlines() if x.startswith("Exec=")][0]
+            argv = shlex.split(exec_line[5:].replace("%k", folder))
+            env = {k: v for k, v in os.environ.items()
+                   if k not in ("DISPLAY", "WAYLAND_DISPLAY")}
+            r = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=30)
+        # it got into the folder and started the installer, which then stops
+        # because this test has no desktop
+        self.assertIn("No desktop found", r.stderr)
+
+
+@unittest.skipUnless(HAVE_TK, "needs tkinter and a display (use xvfb-run)")
+class TestInstallGui(Base):
+    def test_install_and_uninstall_from_the_window(self):
+        import tempfile
+        home = tempfile.mkdtemp()
+        os.environ["HOME"] = home
+        spec = importlib.util.spec_from_file_location(
+            "ig", os.path.join(os.path.dirname(HERE), "install_gui.py"))
+        ig = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ig)
+        ig.os.geteuid = lambda: 1000        # behave like the desktop user: use pkexec
+        hw(i2c=1)
+        app = ig.Installer()
+        try:
+            self.assertTrue(app.opt_ups.get() and app.opt_eeprom.get())
+            app.start_install()
+            end = time.time() + 120
+            while time.time() < end and not app.step.cget("text").startswith(("✔", "✘")):
+                app.root.update()
+                time.sleep(0.02)
+            self.assertTrue(app.step.cget("text").startswith("✔ Installed"),
+                            app.step.cget("text") + app.log.get("1.0", "end")[-2000:])
+            self.assertTrue(app.reboot_needed)
+            labels = sorted(b.cget("text") for b in app.btns.winfo_children())
+            self.assertEqual(labels, ["Close", "Open Energy Plan", "Reboot now"])
+            pk = [c for c in calls() if c.startswith("pkexec")]
+            self.assertEqual(len(pk), 1)                 # one password prompt
+            self.assertIn("--skip-desktop --ups-recommended", pk[0])
+            self.assertTrue(os.path.exists("/usr/local/bin/pi5_energyplan.py"))
+            self.assertTrue(os.path.exists("/etc/pi5-energyplan/battery.json"))
+            self.assertTrue(os.path.exists(
+                home + "/.local/share/applications/pi5-energyplan.desktop"))
+            self.assertTrue(os.path.exists(home + "/.config/autostart/pi5-battery-tray.desktop"))
+
+            ig.messagebox.askyesno = lambda *a: True
+            app.start_uninstall()
+            end = time.time() + 60
+            while time.time() < end and not app.step.cget("text").startswith(
+                    ("✔ Uninstalled", "✘")):
+                app.root.update()
+                time.sleep(0.02)
+            self.assertEqual(app.step.cget("text"), "✔ Uninstalled.")
+            self.assertFalse(os.path.exists("/usr/local/bin/pi5_energyplan.py"))
+        finally:
+            subprocess.run(["pkill", "-f", "pi5_energyplan.py --tray"])
+            app.root.destroy()
+            KEEP_TK.append(app)   # freed at exit on the main thread (Tk aborts otherwise)
+            shutil.rmtree(home, ignore_errors=True)
 
 
 @unittest.skipUnless(HAVE_TK, "needs tkinter and a display (use xvfb-run)")
@@ -721,6 +1090,7 @@ class TestGui(Base):
             self.assertEqual(errors, [])
         finally:
             app.root.destroy()
+            KEEP_TK.append(app)   # freed at exit on the main thread (Tk aborts otherwise)
 
 
 @unittest.skipUnless(shutil.which("dbus-daemon"), "needs dbus-daemon")

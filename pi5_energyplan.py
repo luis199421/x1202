@@ -15,12 +15,17 @@ CLI:   python3 pi5_energyplan.py --list
        python3 pi5_energyplan.py --autotest-status        (progress / results)
        sudo python3 pi5_energyplan.py --autotest-cancel
        python3 pi5_energyplan.py --install-tray           (battery % in the panel)
+       sudo python3 pi5_energyplan.py --eeprom-setup      (Geekworm bootloader settings)
+       sudo python3 pi5_energyplan.py --usb-5v-when-off on|off  (5 V outputs after shutdown)
        python3 pi5_energyplan.py --battery                (live battery in terminal)
+       python3 pi5_energyplan.py --monitor                (full UPS + Pi report, live)
+       sudo python3 pi5_energyplan.py --charge-full on    (charge to 100 % once)
 
 UPS / battery (Geekworm X1200/X1201/X1202): open "UPS settings…" in the GUI to set
   * Stop charging at X %        (charge limit, resumes 5 % below)
   * Safe shutdown at Y %        (on battery only; cancelled if power returns)
-  * Shutdown after a power outage of N minutes, with a 1-5 minute warning
+  * Shutdown after a power outage of 15 s to 1 h, with a 1-5 minute warning
+  * Charge to 100 % once (e.g. before a trip), then back to the limit
   * Battery saver below Z %     (switches to Underclock/Eco on battery, back when plugged in)
   These run in the background as pi5-battery-guard.service, even with the GUI closed.
 
@@ -174,10 +179,13 @@ PLD_GPIO = 6               # X120x power-loss-detect pin: high = adapter OK
 CHARGE_GPIO = 16           # X120x charge control: high = charging off, low = on
 BATTERY_CFG = "/etc/pi5-energyplan/battery.json"
 GUARD_STATUS = "/run/pi5-energyplan/battery-guard.json"
+TOPUP_FILE = "/run/pi5-energyplan/charge-full-once"  # in /run: forgotten on reboot
+TOPUP_MAX_H = 12           # give up on "charge to 100 % once" after this long
 GUARD_SERVICE = "pi5-battery-guard.service"
 GUARD_UNIT_PATH = "/etc/systemd/system/" + GUARD_SERVICE
 RESUME_GAP = 5             # resume charging this many % below the max limit
 VOLT_FLOOR = 3.30          # also shut down below this cell voltage (on battery)
+BLIND_MINUTES = 5          # on battery with the fuel gauge silent this long: shut down
 SERVICE_NAME = "pi5-energyplan.service"
 SERVICE_PATH = "/etc/systemd/system/" + SERVICE_NAME
 INSTALLED_SCRIPT = "/usr/local/bin/pi5_energyplan.py"
@@ -404,16 +412,28 @@ def fmt_freq(s):
 # --------------------------------------------------------------------------- #
 #  Battery: Geekworm X1200 / X1201 / X1202 UPS
 #
-#  Fixes compared with Geekworm's own scripts (github.com/geekworm-com/x120x):
-#   * They open 'gpiochip4' with the old gpiod v1 API. Newer Pi OS kernels call
-#     the header chip gpiochip0 and ship gpiod v2, so pld.py / merged.py crash.
-#     Here the power-loss pin is read with `pinctrl` (no chip name needed), with
-#     a gpiod v1/v2 fallback that finds the RP1 chip by its label.
-#   * bat.py shuts down on ONE voltage reading under 3.2 V even when the adapter
-#     is plugged in; merged.py shuts down below 20 % even while charging (which
-#     can cause a boot loop after an outage). This script never shuts down.
-#   * qtx120x.py re-runs `shutdown +5` every 30 s below 15 %, which keeps
-#     pushing the shutdown back so it never happens.
+#  Everything Geekworm's example scripts do (wiki "X120X Software", scripts from
+#  github.com/suptronics/x120x 6bbfaa7) is done here, without their problems:
+#   * GPIO: pld.py / merged.py open 'gpiochip4' with the gpiod v1 API, and the
+#     -trixie.py versions hard-code 'gpiochip0' with the v2 API, so each one
+#     only works on some kernels. Here GPIO 6 is read with `pinctrl` (no chip
+#     name needed), with a gpiod v1/v2 fallback that finds the RP1 chip by name.
+#   * bat.py shuts down on ONE reading under 3.2 V, even on mains. merged.py
+#     shuts down below 20 % even while charging (a boot loop after an outage),
+#     exits after one good check (Loop=False), and always shuts down after a
+#     ~2 minute power cut (no setting). merged-trixie.py and
+#     pld*.py have their shutdown commented out, and merged-trixie.py turns an
+#     I2C error into "0 %" and hides crashes with `except: pass`.
+#     Here: shutdown only on battery, after 3 readings in a row, with a warning
+#     and cancelled when power returns; a power cut has its own timer (15 s to 1 h).
+#   * qtx120x.py (Geekworm copy) re-runs `shutdown +5` every 30 s below 15 %, which
+#     keeps pushing the shutdown back so it never happens. Its charge control
+#     stops at a fixed 90 % with no gap, so it can switch on and off every 30 s,
+#     and it makes a new GPIO device each time. Here the limit is yours, with
+#     a 5 % gap, and the pin is checked to really pause / resume charging.
+#   * If the fuel gauge stops answering, the scripts crash or read 0. Here GPIO 6
+#     keeps working: the outage timer still runs, and on battery with no
+#     reading for 5 minutes the Pi shuts down safely.
 #   * Battery % isn't clamped (can read 103 %); "== 100" checks on a float.
 #   * None of them can show time left: the board's fuel gauge has no current
 #     sensor. Here the time is estimated from how fast the % changes.
@@ -674,10 +694,12 @@ def read_pmic():
 # --------------------------------------------------------------------------- #
 DEFAULT_BATTERY_CFG = {"enabled": False, "max": 80, "min": 20,
                        "outage_minutes": 0, "warn_minutes": 1,
-                       "saver_enabled": False, "saver_below": 50, "saver_plan": "Underclock"}
+                       "saver_enabled": False, "saver_below": 50, "saver_plan": "Underclock",
+                       "usb_5v_when_off": False}
 SAVER_PLANS = [("Underclock", "Underclock · 1.5 GHz · powersave"),
                ("Eco", "Eco · 1.8 GHz · conservative")]
-OUTAGE_CHOICES = [(0, "Never"), (1, "1 minute"),
+# 0.25 = 15 s: "shut down when the power goes", with a short debounce for glitches
+OUTAGE_CHOICES = [(0, "Never"), (0.25, "15 seconds"), (1, "1 minute"),
                   (5, "5 minutes"), (15, "15 minutes"), (30, "30 minutes"), (60, "1 hour")]
 WARN_CHOICES = [(1, "1 minute"), (2, "2 minutes"), (5, "5 minutes")]
 
@@ -708,6 +730,7 @@ def validate_battery_cfg(cfg):
     c["saver_below"] = int(min(100, max(15, c["saver_below"])))
     if c["saver_plan"] not in [p for p, _ in SAVER_PLANS]:
         raise ValueError("Unknown battery saver plan")
+    c["usb_5v_when_off"] = bool(c["usb_5v_when_off"])
     return c
 
 
@@ -965,6 +988,7 @@ def battery_guard():
     _charge_check = ChargeCheck(log)
     bat = Battery()
     charging, low_count, pending, outage_since = None, 0, None, None
+    blind_since, gauge_ok, ac = None, True, None
     saver = None  # name of the saver plan while it's active
     volt_high = False
     tick = 0
@@ -1009,26 +1033,47 @@ def battery_guard():
                     log(f"WARNING: battery at {b['volt']:.2f} V: charger is not stopping")
                 volt_high = b["ok"] and b["volt"] > VOLT_MAX
 
+            # "Charge to 100 % once": lift the limit until the battery is full
+            topup = as_int(read(TOPUP_FILE))
+            if topup is not None and (not cfg["enabled"] or cfg["max"] >= 100 or
+                                      (b["ok"] and b["soc"] >= 99.5) or
+                                      now - topup > TOPUP_MAX_H * 3600):
+                if cfg["enabled"] and cfg["max"] < 100:
+                    log(f"Charge to 100 % once: done, back to the {cfg['max']}% limit")
+                try:
+                    os.remove(TOPUP_FILE)
+                except OSError:
+                    pass
+                topup = None
+            limit = 100 if topup is not None else cfg["max"]
+
+            # GPIO 6 still works when the fuel gauge doesn't answer on I2C
+            ac = b["ac"] if b["ok"] else read_pld()
+            soc, volt = (b["soc"], b["volt"]) if b["ok"] else (None, None)
+            if b["ok"] != gauge_ok:
+                log("UPS fuel gauge answering again" if b["ok"] else
+                    f"UPS fuel gauge not answering: {b['error']}")
+                gauge_ok = b["ok"]
+
             if not cfg["enabled"]:
                 tick += 1
                 if (charging is not True or tick % 10 == 0) and set_charging(True):
                     if charging is False:
                         log("Protection off: charging allowed again")
                     charging = True
-            elif b["ok"]:
-                soc, ac, volt = b["soc"], b["ac"], b["volt"]
 
+            if cfg["enabled"] and b["ok"]:
                 # 1) charge limit with a gap so it doesn't toggle constantly
-                if cfg["max"] >= 100 or soc <= cfg["max"] - RESUME_GAP:
+                if limit >= 100 or soc <= limit - RESUME_GAP:
                     want = True
-                elif soc >= cfg["max"]:
+                elif soc >= limit:
                     want = False
                 else:
                     want = True if charging is None else charging
                 if want != charging and set_charging(want):
                     charging = want
                     log(f"Charging {'ON' if want else 'PAUSED'} at {soc:.0f}% "
-                        f"(limit {cfg['max']}%)")
+                        f"(limit {limit}%)")
 
                 # 1b) check that charging really stops / starts; fix the pin if not.
                 #     Also set the pin again every 30 s, in case anything else
@@ -1038,11 +1083,15 @@ def battery_guard():
                 if charging is not None and (reassert or tick % 10 == 0):
                     set_charging(charging)
 
+            if cfg["enabled"]:
                 # 2) shutdown conditions (only when really on battery)
                 on_batt = ac == 0
                 outage_since = (outage_since or now) if on_batt else None
-                low = (on_batt and (soc <= cfg["min"] or volt < VOLT_FLOOR)) or \
-                      (ac is None and volt < VOLT_FLOOR)
+                # on battery with no battery reading: can't see the level, so after a
+                # while shut down safely rather than risk the power just being cut
+                blind_since = (blind_since or now) if on_batt and not b["ok"] else None
+                low = b["ok"] and ((on_batt and (soc <= cfg["min"] or volt < VOLT_FLOOR)) or
+                                   (ac is None and volt < VOLT_FLOOR))
                 low_count = low_count + 1 if low else 0   # 3 readings in a row
                 reason = None
                 if low_count >= 3:
@@ -1050,7 +1099,9 @@ def battery_guard():
                               if soc <= cfg["min"] else f"battery voltage low ({volt:.2f} V)")
                 elif on_batt and cfg["outage_minutes"] and \
                         now - outage_since >= cfg["outage_minutes"] * 60:
-                    reason = f"power out for {cfg['outage_minutes']} min"
+                    reason = f"power out for {dict(OUTAGE_CHOICES)[cfg['outage_minutes']]}"
+                elif blind_since and now - blind_since >= BLIND_MINUTES * 60:
+                    reason = "on battery and the battery level can't be read (I2C)"
 
                 if reason and not pending:
                     warn = cfg["warn_minutes"]
@@ -1065,7 +1116,8 @@ def battery_guard():
 
             write_json_atomic(GUARD_STATUS, {
                 "updated": now, "enabled": cfg["enabled"], "min": cfg["min"],
-                "max": cfg["max"], "outage_minutes": cfg["outage_minutes"],
+                "max": limit, "limit": cfg["max"], "topup": topup is not None,
+                "outage_minutes": cfg["outage_minutes"],
                 "charging_allowed": charging, "on_battery_since": outage_since,
                 "shutdown_pending": bool(pending),
                 "shutdown_reason": pending["reason"] if pending else None,
@@ -1075,7 +1127,8 @@ def battery_guard():
                 "charge_check": _charge_check.status, "charge_note": _charge_check.note,
                 "charge_warn": _charge_check.warn,
                 "charge_probe": _charge_check.probe is not None,
-                "volt_high": volt_high, "volt": b.get("volt")})
+                "volt_high": volt_high, "volt": b.get("volt"), "gauge_ok": b["ok"],
+                "ac": ac})
             time.sleep(REFRESH_MS / 1000)
     finally:
         _charge_check.probe = None
@@ -1099,9 +1152,18 @@ WantedBy=multi-user.target
 """
 
 
-def apply_ups_config(cfg):
-    cfg = validate_battery_cfg(cfg)
+def apply_ups_config(new):
+    old = load_battery_cfg()
+    cfg = validate_battery_cfg({**old, **new})   # keys left out keep their value
     write_json_atomic(BATTERY_CFG, cfg)
+    halt = ""
+    # only touch the bootloader when this choice really changed (the window always
+    # sends it, and someone who skipped the bootloader settings shouldn't get them)
+    if "usb_5v_when_off" in new and cfg["usb_5v_when_off"] != old["usb_5v_when_off"]:
+        try:
+            halt = " " + eeprom_setup(halt_only=True)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as e:
+            halt = f" (5 V setting not saved: {e})"
     me = os.path.abspath(__file__)
     if me != INSTALLED_SCRIPT:
         shutil.copy2(me, INSTALLED_SCRIPT)
@@ -1116,11 +1178,106 @@ def apply_ups_config(cfg):
              + ("when power goes out." if cfg["saver_below"] >= 100
                 else f"below {cfg['saver_below']}% on battery."))
     if not cfg["enabled"]:
-        return "Battery protection is off (charging always on, no auto shutdown)." + saver
+        return "Battery protection is off (charging always on, no auto shutdown)." + saver \
+            + halt
     outage = dict(OUTAGE_CHOICES)[cfg["outage_minutes"]]
     return (f"Saved: charge to {cfg['max']}%, safe shutdown at {cfg['min']}%"
-            + ("" if not cfg["outage_minutes"] else f", or after a {outage} outage")
-            + "." + saver)
+            + ("" if not cfg["outage_minutes"] else f", or after {outage} without power")
+            + "." + saver + halt)
+
+
+def set_topup(on):
+    """Start or stop "charge to 100 % once" (needs root; the guard does the work)."""
+    cfg = load_battery_cfg()
+    if not on:
+        try:
+            os.remove(TOPUP_FILE)
+        except OSError:
+            pass
+        return f"Back to the normal {cfg['max']}% charge limit."
+    if not cfg["enabled"] or cfg["max"] >= 100:
+        return "There is no charge limit set, so the battery already charges to 100 %."
+    if subprocess.run(["systemctl", "is-active", "--quiet", GUARD_SERVICE]).returncode:
+        raise RuntimeError("the battery guard isn't running (save UPS settings first)")
+    os.makedirs(os.path.dirname(TOPUP_FILE), exist_ok=True)
+    write(TOPUP_FILE, int(time.time()))
+    return (f"Charging to 100 % once. The {cfg['max']}% limit comes back when the battery "
+            f"is full (or after {TOPUP_MAX_H} h, or a reboot).")
+
+
+# Geekworm's X120x setup (wiki "Configure EEPROM"): tell the firmware the UPS can
+# supply 5 A (otherwise USB is limited to 600 mA), and POWER_OFF_ON_HALT, which
+# decides the Pi's 5 V outputs (USB, GPIO 5 V) once it is shut down:
+#   1 = switched off (saves battery; Geekworm's setting), 0 = stay on.
+# The choice is "usb_5v_when_off" in the UPS settings.
+EEPROM_SETTINGS = {"POWER_OFF_ON_HALT": "1", "PSU_MAX_CURRENT": "5000"}
+EEPROM_BACKUP = STATE_DIR + "/eeprom-before.conf"
+
+
+def eeprom_wanted(halt_only=False):
+    halt = "0" if load_battery_cfg()["usb_5v_when_off"] else "1"
+    if halt_only:
+        return {"POWER_OFF_ON_HALT": halt}
+    return dict(EEPROM_SETTINGS, POWER_OFF_ON_HALT=halt)
+
+
+def eeprom_with_settings(text, settings=None):
+    """Return the bootloader config with `settings` set in its [all] part.
+    Every other line is kept as it is."""
+    settings = settings or EEPROM_SETTINGS
+    out, seen, section, insert_at = [], set(), "all", None
+    for line in text.splitlines():
+        st = line.strip()
+        if st.startswith("[") and st.endswith("]"):
+            section = st[1:-1].strip().lower()
+            if section != "all" and insert_at is None:
+                insert_at = len(out)   # new keys go before the first filter section
+        key = st.split("=", 1)[0].strip() if "=" in st and not st.startswith("#") else None
+        if key in settings and section == "all":
+            if key in seen:
+                continue               # a duplicate: the first one is set below
+            seen.add(key)
+            line = f"{key}={settings[key]}"
+        out.append(line)
+    missing = [f"{k}={v}" for k, v in settings.items() if k not in seen]
+    if insert_at is None:
+        insert_at = len(out)
+    while insert_at and not out[insert_at - 1].strip():
+        insert_at -= 1                 # right after the last setting, not after a gap
+    out[insert_at:insert_at] = missing
+    if not any(line.strip().startswith("[") for line in out):
+        out.insert(0, "[all]")
+    return "\n".join(out).strip("\n") + "\n"
+
+
+def eeprom_setup(halt_only=False):
+    """Apply the bootloader settings (needs root; takes effect after a reboot).
+    Writes nothing when they are already set."""
+    if not is_pi5():
+        raise RuntimeError("these bootloader settings are for the Raspberry Pi 5")
+    if not shutil.which("rpi-eeprom-config"):
+        raise RuntimeError("rpi-eeprom-config not found: sudo apt install rpi-eeprom")
+    cur = subprocess.run(["rpi-eeprom-config"], capture_output=True, text=True,
+                         timeout=30, check=True).stdout
+    if not cur.strip():
+        raise RuntimeError("couldn't read the current bootloader settings")
+    settings = eeprom_wanted(halt_only)
+    new = eeprom_with_settings(cur, settings)
+    wanted = ", ".join(f"{k}={v}" for k, v in settings.items())
+    if new.strip() == cur.strip():
+        return f"Bootloader already set: {wanted}"
+    os.makedirs(STATE_DIR, exist_ok=True)
+    if not os.path.exists(EEPROM_BACKUP):
+        write(EEPROM_BACKUP, cur)
+    tmp = STATE_DIR + "/eeprom-new.conf"
+    write(tmp, new)
+    r = subprocess.run(["rpi-eeprom-config", "--apply", tmp], capture_output=True,
+                       text=True, timeout=300)
+    if r.returncode != 0:
+        raise RuntimeError("rpi-eeprom-config --apply failed: " +
+                           (r.stderr or r.stdout).strip()[-300:])
+    return (f"Bootloader settings saved ({wanted}); they take effect after a reboot. "
+            f"Old settings: {EEPROM_BACKUP}")
 
 
 def single_instance(name):
@@ -1591,7 +1748,9 @@ def booted_with_tryboot():
 
 
 def is_pi5():
-    model = read("/proc/device-tree/model", "") or ""
+    # /proc/device-tree is a link to /sys/firmware/devicetree/base
+    model = read("/proc/device-tree/model") or \
+        read("/sys/firmware/devicetree/base/model", "") or ""
     return any(m in model for m in ("Raspberry Pi 5", "Raspberry Pi 500",
                                     "Compute Module 5"))
 
@@ -2273,6 +2432,10 @@ class App:
             info.append(f"Pi input {pm['ext5v']:.2f} V")
         if pm.get("watts"):
             info.append(f"Pi uses {pm['watts']:.1f} W")
+        if pm.get("core_v") is not None and pm.get("core_a") is not None:
+            info.append(f"CPU core {pm['core_v']:.2f} V {pm['core_a']:.2f} A")
+        if g and g.get("topup"):
+            info.append("Charging to 100 % once")
         info.append("Protection ON" if g and g.get("enabled") else "Protection off")
         if g and g.get("enabled") and g.get("max", 100) < 100:
             info.append({"ok": "Charge stop ✓ verified", "unsupported": "Charge stop ✗",
@@ -2311,16 +2474,17 @@ class App:
             return "", None
         soc = b["soc"]
         limit = g["min"] if g and g.get("enabled") else 15
-        if soc <= limit + 5:
+        if soc <= max(24, limit + 5):
             text, bg = "⚠ Battery critical: plug in power now", red
         elif soc <= 50:
-            text, bg = "Battery getting low: running on backup power", orange
+            text, bg = "Battery approaching critical: running on backup power", orange
         else:
             text, bg = "Running on backup battery power", orange
         if g and g.get("enabled") and g.get("outage_minutes") and g.get("on_battery_since"):
             left = g["outage_minutes"] * 60 - (time.time() - g["on_battery_since"])
             if left > 0:
-                text += f" · auto shutdown in {fmt_hours(left / 3600)} if power stays off"
+                when = f"{int(left)} s" if left < 60 else fmt_hours(left / 3600)
+                text += f" · auto shutdown in {when} if power stays off"
         elif not (g and g.get("enabled")):
             text += " · no auto shutdown set (UPS settings)"
         if g and g.get("saver_active"):
@@ -2411,6 +2575,16 @@ class App:
         menu("If the power goes out, shut down after", vout, OUTAGE_CHOICES)
         menu("Warning before shutting down", vwarn, WARN_CHOICES)
 
+        # POWER_OFF_ON_HALT: the Pi's 5 V outputs after it has shut down
+        usb_choices = [(False, "Turn off · saves battery"), (True, "Stay on · powers USB")]
+        usb_lbl = dict(usb_choices)
+        vusb = tk.StringVar(value=usb_lbl[bool(cfg["usb_5v_when_off"])])
+        menu("After shutdown, the Pi's 5 V outputs", vusb, usb_choices)
+        self._label(win, "USB ports and GPIO 5 V pins. 'Turn off' is Geekworm's setting "
+                         "(POWER_OFF_ON_HALT=1); 'Stay on' keeps USB devices powered from "
+                         "the battery. Takes effect after a reboot.", 8, MUTED,
+                    wraplength=380, justify="left").pack(anchor="w")
+
         # Battery saver
         vsaver_on = tk.BooleanVar(value=cfg["saver_enabled"] or not os.path.exists(BATTERY_CFG))
         vsaver = tk.IntVar(value=step5(cfg["saver_below"], 15, 100, 50))
@@ -2455,7 +2629,7 @@ class App:
                 w.config(state="normal" if on else "disabled")
             if not on:
                 summary.config(text="Protection off: charges to 100 % and never shuts down "
-                                    "by itself." + saver_txt)
+                                    "by itself." + saver_txt + usb_txt())
                 return
             parts = [("Charges to 100 %." if vmax.get() >= 100 else
                       f"Charges to {vmax.get()} %, starts again below "
@@ -2463,9 +2637,9 @@ class App:
                      f"On battery, shuts down safely at {vmin.get()} %"]
             o = [m for m, l in OUTAGE_CHOICES if l == vout.get()][0]
             if o:
-                parts[-1] += f" or after a {vout.get()} power outage"
+                parts[-1] += f" or after {vout.get()} without power"
             parts[-1] += f", with a {vwarn.get()} warning. Plugging in cancels it."
-            summary.config(text=" ".join(parts) + saver_txt)
+            summary.config(text=" ".join(parts) + saver_txt + usb_txt())
         refresh_summary.last = "max"
 
         def touched(which):
@@ -2476,7 +2650,10 @@ class App:
         max_scale.config(command=touched("max"))
         min_scale.config(command=touched("min"))
         saver_scale.config(command=touched("saver"))
-        for v in (vout, vwarn, enabled, vsaver_on, vsplan):
+        def usb_txt():
+            return (" After shutdown, USB / 5 V stay powered." if vusb.get() == usb_lbl[True]
+                    else "")
+        for v in (vout, vwarn, enabled, vsaver_on, vsplan, vusb):
             v.trace_add("write", refresh_summary)
         refresh_summary()
 
@@ -2494,7 +2671,8 @@ class App:
                    "outage_minutes": [m for m, l in OUTAGE_CHOICES if l == vout.get()][0],
                    "warn_minutes": [m for m, l in WARN_CHOICES if l == vwarn.get()][0],
                    "saver_enabled": vsaver_on.get(), "saver_below": vsaver.get(),
-                   "saver_plan": [p for p, l in saver_choices if l == vsplan.get()][0]}
+                   "saver_plan": [p for p, l in saver_choices if l == vsplan.get()][0],
+                   "usb_5v_when_off": vusb.get() == usb_lbl[True]}
             if self.blocked("UPS settings", lock_during_test=False):
                 return
             self.set_busy("saving UPS settings")
@@ -2505,6 +2683,29 @@ class App:
                 run_root(["--ups-config", json.dumps(new)])), daemon=True).start()
             self.root.after(200, self.poll_result)
             win.destroy()
+
+        g = read_guard_status()
+        topup_on = bool(g and g.get("topup"))
+
+        def topup():
+            if self.blocked("charging", lock_during_test=False):
+                return
+            self.set_busy("changing charging")
+            threading.Thread(target=lambda: setattr(
+                self, "result", ("Charging", False) +
+                run_root(["--charge-full", "off" if topup_on else "on"])),
+                daemon=True).start()
+            self.root.after(200, self.poll_result)
+            win.destroy()
+        if cfg["enabled"] and cfg["max"] < 100:
+            row = tk.Frame(win, bg=BG)
+            row.pack(fill="x", pady=(10, 0))
+            tk.Button(row, text=("Stop charging to 100 %" if topup_on
+                                 else "Charge to 100 % once"), command=topup,
+                      relief="flat", bg=CARD, fg=FG, activebackground="#555",
+                      activeforeground=FG, font=("DejaVu Sans", 9)).pack(side="left", ipadx=6)
+            self._label(row, "e.g. before a trip; the limit comes back when it's full", 8,
+                        MUTED).pack(side="left", padx=(8, 0))
 
         btns = tk.Frame(win, bg=BG)
         btns.pack(fill="x", pady=(8, 0))
@@ -2791,7 +2992,8 @@ def charge_debug():
     print("Guard service:", run(["systemctl", "is-active", GUARD_SERVICE]) or "?")
     g = read_guard_status()
     if g:
-        keys = ("enabled", "max", "min", "charging_allowed", "charge_check", "charge_probe",
+        keys = ("enabled", "max", "limit", "topup", "min", "charging_allowed", "charge_check",
+                "charge_probe",
                 "charge_warn", "charge_note", "volt_high")
         for k in keys:
             print(f"  {k:17}: {g.get(k)}")
@@ -2818,6 +3020,75 @@ def print_status():
     print(f"Saved plan  : {s['plan'] or 'none'}")
     print(f"Sweet spot  : {autotest_summary()}")
     print(f"Battery     : {battery_line(Battery().read())}")
+    print(f"Pi power    : {fmt_pmic(read_pmic())}")
+
+
+def fmt_pmic(pm):
+    parts = []
+    if pm.get("ext5v"):
+        parts.append(f"input {pm['ext5v']:.2f} V")
+    if pm.get("watts"):
+        parts.append(f"uses {pm['watts']:.1f} W")
+    if pm.get("core_v") is not None and pm.get("core_a") is not None:
+        parts.append(f"CPU core {pm['core_v']:.3f} V {pm['core_a']:.2f} A")
+    return " · ".join(parts) or "? (vcgencmd pmic_read_adc not available)"
+
+
+def monitor_report(bat):
+    """Full UPS + Pi report, like Geekworm's qtx120xTerminal.py but read-only:
+    it never changes charging or schedules a shutdown (the battery guard does that)."""
+    b, g, s = bat.read(), read_guard_status(), get_status()
+    out = [time.strftime("==== X120x UPS ====================  %H:%M:%S")]
+    if not b["ok"]:
+        out.append(f"UPS          : {b['error']}")
+    else:
+        out.append(f"Battery      : {b['soc']:.1f} % ({battery_health(b['volt'])}) · "
+                   f"{b['volt']:.3f} V per cell")
+        out.append(f"State        : {b['state']}" + (f" · {b['eta']}" if b["eta"] else ""))
+        out.append("Mains power  : " + {1: "OK (adapter connected)",
+                                         0: "LOST, running on battery"}.get(
+                                             b["ac"], "unknown (GPIO 6 not readable)"))
+        if not g:
+            charge = "board default (battery guard not running)"
+        elif g.get("charging_allowed") is False:
+            charge = f"paused at the {g['max']}% limit"
+        else:
+            charge = "allowed" + (" (charging to 100 % once)" if g.get("topup") else
+                                  f", limit {g['max']}%" if g.get("enabled") and
+                                  g["max"] < 100 else "")
+        out.append(f"Charging     : {charge}")
+        if g and g.get("enabled"):
+            prot = f"on (shutdown at {g['min']}% on battery"
+            if g.get("outage_minutes"):
+                prot += f", or after {dict(OUTAGE_CHOICES).get(g['outage_minutes'], '?')}" \
+                        " without power"
+            out.append(f"Protection   : {prot})")
+        else:
+            out.append("Protection   : off (no auto shutdown)")
+        warn = App.battery_banner(b, g)[0]
+        if warn:
+            out.append(f"WARNING      : {warn}")
+    t = s["temp"]
+    out += ["==== Raspberry Pi 5 ===============",
+            f"Pi power     : {fmt_pmic(read_pmic())}",
+            f"CPU          : {f'{t:.1f} °C' if t is not None else '? °C'} · {fmt_freq(s)} · "
+            f"{s['governor'] or '?'}",
+            f"Fan          : {fmt_fan(s)}",
+            f"Power        : {s['throttled'] or '?'}",
+            f"Plan         : {s['plan'] or 'none'}"]
+    return "\n".join(out)
+
+
+def monitor(interval):
+    bat = Battery()
+    tty = sys.stdout.isatty()
+    try:
+        while True:
+            report = monitor_report(bat)
+            print(("\033[H\033[2J" if tty else "") + report + "\n", flush=True)
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        pass
 
 
 def main():
@@ -2850,6 +3121,10 @@ def main():
                     help="show why the battery is or isn't charging")
     ap.add_argument("--battery", action="store_true",
                     help="live battery readout in the terminal (every 3 s)")
+    ap.add_argument("--monitor", nargs="?", type=float, const=3, metavar="SECONDS",
+                    help="full UPS and Pi report in the terminal, refreshed every 3 s")
+    ap.add_argument("--charge-full", choices=("on", "off"),
+                    help="charge to 100 %% once, ignoring the limit until full (sudo)")
     ap.add_argument("--tray", action="store_true", help="run the panel battery icon")
     ap.add_argument("--install-tray", action="store_true",
                     help="add the battery icon to the panel and start it at login")
@@ -2859,6 +3134,12 @@ def main():
                     help="choose the CPU governor a plan uses (sudo)")
     ap.add_argument("--set-fan", nargs=2, metavar=("PLAN", "PROFILE"),
                     help=f"choose a plan's fan profile: {', '.join(FAN_PROFILES)} (sudo)")
+    ap.add_argument("--eeprom-setup", action="store_true",
+                    help="set Geekworm's bootloader settings: PSU_MAX_CURRENT=5000 and "
+                         "POWER_OFF_ON_HALT (from --usb-5v-when-off, default 1) (sudo)")
+    ap.add_argument("--usb-5v-when-off", choices=("on", "off"),
+                    help="keep the Pi's 5 V outputs (USB, GPIO 5 V) on when it is shut down, "
+                         "or turn them off to save battery (sets POWER_OFF_ON_HALT; sudo)")
     ap.add_argument("--update", action="store_true",
                     help="after replacing this file: refresh everything it installed, "
                          "without adding anything twice")
@@ -2890,6 +3171,9 @@ def main():
             sys.exit("Needs root: run with sudo")
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
         if args.battery_guard:
+            # never two guards driving the charge pin / scheduling shutdowns
+            if not single_instance("pi5-energyplan-guard"):
+                sys.exit("The battery guard is already running")
             battery_guard()
             return
         try:
@@ -2900,6 +3184,36 @@ def main():
 
     if args.battery:
         watch_battery()
+        return
+    if args.monitor is not None:
+        monitor(max(1.0, args.monitor))
+        return
+    if args.usb_5v_when_off:
+        if os.geteuid() != 0:
+            sys.exit("Needs root: run with sudo")
+        cfg = load_battery_cfg()
+        cfg["usb_5v_when_off"] = args.usb_5v_when_off == "on"
+        write_json_atomic(BATTERY_CFG, validate_battery_cfg(cfg))
+        try:
+            print(eeprom_setup(halt_only=True))
+        except (OSError, RuntimeError, subprocess.SubprocessError) as e:
+            sys.exit(f"Error: {e}")
+        return
+    if args.eeprom_setup:
+        if os.geteuid() != 0:
+            sys.exit("Needs root: run with sudo")
+        try:
+            print(eeprom_setup())
+        except (OSError, RuntimeError, subprocess.SubprocessError) as e:
+            sys.exit(f"Error: {e}")
+        return
+    if args.charge_full:
+        if os.geteuid() != 0:
+            sys.exit("Needs root: run with sudo")
+        try:
+            print(set_topup(args.charge_full == "on"))
+        except (OSError, RuntimeError) as e:
+            sys.exit(f"Error: {e}")
         return
     if args.charge_debug:
         charge_debug()
@@ -2938,6 +3252,8 @@ def main():
         # stop cleanly (and release the watchdog) on shutdown / systemctl stop
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
         if args.boot:
+            if not single_instance("pi5-energyplan-boot"):
+                sys.exit("The boot task is already running")
             boot_apply()
         elif args.uninstall_service:
             uninstall_service()

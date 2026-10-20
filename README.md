@@ -14,6 +14,12 @@ It gives you:
   runs stably, using one-time test boots so a bad setting can't stop the Pi from booting.
 
 It has a desktop window (GUI) and a full command line, so it also works over SSH.
+It also does everything Geekworm's example scripts for the X120x do (`bat.py`,
+`pld.py`, `merged.py`, `qtx120x.py` and their Trixie versions), without their bugs:
+see [Geekworm's scripts: what's included](#geekworms-scripts-whats-included-and-what-was-fixed).
+
+**Install without a terminal:** download the ZIP, double-click
+**Install Pi 5 Energy Plan**. See [Installation](#4-installation).
 
 ![The Energy Plan window](docs/gui.png)
 
@@ -31,8 +37,9 @@ so the numbers come from fake hardware.)*
 5. [Using it](#5-using-it)
 6. [Files it creates](#6-files-it-creates)
 7. [Updating and uninstalling](#7-updating-and-uninstalling)
-8. [Troubleshooting](#8-troubleshooting)
-9. [Testing](#testing)
+8. [Nothing is ever added twice](#8-nothing-is-ever-added-twice)
+9. [Troubleshooting](#9-troubleshooting)
+10. [Testing](#testing)
 
 ---
 
@@ -131,16 +138,19 @@ board. The script talks to it through:
   so the script works this out from how fast the % changes over the last 5 minutes. It
   also uses the MAX17048's own charge-rate register when the chip has one. It shows
   "estimating…" for the first 1–2 minutes.
-* The Pi's input voltage and total power use (from `vcgencmd pmic_read_adc`).
-* Warning banners when running on battery, when the battery is low, or when a shutdown
-  is counting down.
+* The Pi's input voltage, total power use, and CPU core voltage and current (from
+  `vcgencmd pmic_read_adc`).
+* Warning banners, with the same levels as Geekworm's `qtx120x.py`: on backup power
+  (above 50 %), approaching critical (50 % and below), critical (24 % and below), and a
+  countdown when a shutdown is coming.
 
 Three places show this:
 
 * the Energy Plan window,
 * the **panel icon** (`--install-tray`): a battery icon showing %, a level bar and ⚡
   while charging. Hover over it for details; click it to open the window.
-* the terminal: `--battery` prints a new line every 3 seconds.
+* the terminal: `--battery` prints one line every 3 seconds, and `--monitor` shows a
+  full UPS and Pi report that refreshes in place (like Geekworm's `qtx120xTerminal.py`).
 
 ### Battery guard (background service, root)
 
@@ -153,19 +163,51 @@ starts at every boot. Every 3 seconds it does the following:
 | **Charge limit** ("stop charging at X %") | Turns charging off at X % and back on 5 % below it. Keeping a Li-ion cell at 20–80 % gives it many more cycles. 100 % means no limit. |
 | **Charge-pin self-check** | Checks that charging really pauses and resumes. If the battery keeps rising while it should be paused, the script tries the opposite pin level once. If that also fails, it gives up and leaves charging to the board. It never leaves charging switched off by mistake. |
 | **Safe shutdown at Y %** | Only when **on battery**. It needs 3 readings in a row at or below Y % (or below 3.30 V per cell). Then it runs `shutdown -h +N` with a 1, 2 or 5-minute warning. **Plugging power back in cancels it.** |
-| **Shutdown after an outage** | Optional: shut down after the power has been out for 1, 5, 15, 30 or 60 minutes. |
+| **Shutdown after a power cut** | Optional: shut down when the power has been out for 15 seconds, or 1, 5, 15, 30 or 60 minutes. "15 seconds" is Geekworm's "shut down on power loss", with a short wait so a glitch doesn't turn the Pi off. If power comes back in time, nothing happens. |
+| **Charge to 100 % once** | A button in UPS settings (or `--charge-full on`): ignores the limit until the battery is full, for example before a trip, then the limit comes back. A reboot or 12 hours also end it. |
+| **If the fuel gauge stops answering** | GPIO 6 still shows whether the power is on. The power-cut timer keeps working, and on battery with no battery reading for 5 minutes the Pi shuts down safely instead of running until the power just cuts. On mains nothing happens. |
 | **Battery saver** | On battery, below Z % (or as soon as the power goes out if Z is 100 %), switches to **Underclock** or **Eco**. When power returns, it switches back to your saved plan. |
 | **Overcharge watch** | Warns in the window if a cell goes above 4.25 V. That means the board's charger isn't stopping. |
 | **Never a boot loop** | It never shuts down while the adapter is plugged in. When the guard stops, charging is always switched back on. |
+| **Only one guard** | A second copy (for example started by hand) refuses to start, so two programs never fight over the charge pin. |
 
-The script header also lists the problems in Geekworm's sample scripts
-(github.com/geekworm-com/x120x) that this version avoids. For example, `gpiochip4`
-no longer exists on newer kernels, and their scripts can shut down while charging or
-keep postponing a shutdown.
+### 5 V outputs after shutdown (bootloader setting)
 
-> **Use only one UPS program.** If one of Geekworm's scripts (`bat.py`, `pld.py`,
-> `merged.py`, `qtx120x.py`) runs at boot, remove it from cron, rc.local or autostart.
-> Two programs would fight over GPIO 16 and the shutdown.
+Geekworm's setup sets two bootloader (EEPROM) values. The installer does this for you,
+and **UPS settings…** has the choice for the first one:
+
+| Setting | What it does | Choice |
+|---|---|---|
+| `POWER_OFF_ON_HALT` | What happens to the Pi's **5 V outputs** (USB ports, GPIO 5 V pins) once it has shut down | **Turn off** (`1`, Geekworm's setting): saves battery. **Stay on** (`0`): USB devices stay powered from the battery. |
+| `PSU_MAX_CURRENT=5000` | Tells the firmware the X1202 can give 5 A. Without it, USB is limited to 600 mA on pogo-pin power. | always set |
+
+Changes take effect after a reboot. Only these two lines are changed; every other
+bootloader setting is kept, and the old settings are saved in
+`/var/lib/pi5-energyplan/eeprom-before.conf`. Your choice is remembered, so a reinstall
+or update never switches it back. From the terminal:
+`sudo pi5_energyplan.py --usb-5v-when-off on` (or `off`).
+
+### Geekworm's scripts: what's included and what was fixed
+
+Geekworm's [X120X Software](https://wiki.geekworm.com/X120X_Software) guide offers seven
+example scripts (source snapshot `6bbfaa7` from
+[suptronics/x120x](https://github.com/suptronics/x120x)). The guide itself warns that
+some of them shut the Pi down and others only print. Everything they do is built in here:
+
+| Geekworm script | What it does | Problems in the original | Here |
+|---|---|---|---|
+| `bat.py` | Battery voltage and %; shutdown below 3.20 V | Shuts down on **one** low reading, even on mains; `== 100` on a float | Battery card, `--status`, `--battery`. Shutdown below 3.30 V only **on battery**, after 3 readings in a row, with a warning |
+| `pld.py`, `pld-trixie.py` | Power-loss detection (GPIO 6) | v1 opens `gpiochip4` (gone on newer kernels); v2 hard-codes `gpiochip0`; shutdown is commented out | GPIO 6 read with `pinctrl` (any kernel), gpiod v1/v2 fallback that finds the right chip. Optional shutdown 15 s to 1 h after a power cut |
+| `merged.py` | Status, and shutdown below 20 %, below 3.20 V or after a power cut | Shuts down below 20 % **even while charging** (boot loop after an outage); exits after one good check (`Loop=False`); always shuts down after a ~2 min cut | Safe shutdown at your % only on battery; power-cut timer is a setting; runs as a service that restarts by itself |
+| `merged-trixie.py` | Same, for libgpiod v2 | Shutdown commented out (it only prints); I2C errors become "0 %"; `except: pass` hides crashes; stale `/tmp` pid file can block it | Errors are shown as errors; a silent fuel gauge is handled (see the guard table); single instance without pid files |
+| `qtx120x.py` | Desktop window: UPS and Pi stats, warnings, charging off at 90 %, shutdown at 15 % | Geekworm's copy re-runs `shutdown +5` every 30 s, so it never happens; charging switches at a fixed 90 % with no gap; a new GPIO device every update; needs PyQt5 | The Energy Plan window and panel icon: same stats (plus CPU core V/A), same warning levels, your own charge limit with a 5 % gap and a pin check, one shutdown with a countdown, cancelled when power returns |
+| `qtx120xTerminal.py` | The same in a terminal | Same charging issues | `--monitor` (read-only: it never changes charging or shuts down; the guard does that) |
+| Wiki: "Configure EEPROM" | `POWER_OFF_ON_HALT=1`, `PSU_MAX_CURRENT=5000` | Manual editing in nano | Set by the installer; 5 V choice in UPS settings |
+| Wiki: "Charging control" | `pinctrl set 16 op dh` = off, `op dl` = on | Manual | Charge limit, "Charge to 100 % once", with a check that charging really pauses and resumes |
+
+> **Use only one UPS program.** If one of Geekworm's scripts runs at boot, remove it from
+> cron, rc.local or autostart. Two programs would fight over GPIO 16 and the shutdown.
+> The installer warns you if it finds one running.
 
 ---
 
@@ -213,51 +255,79 @@ Made for **Raspberry Pi OS Trixie (Debian 13, 64-bit, desktop)**. It also works 
 | GPIO | `pinctrl`, with a libgpiod **v2** fallback | `pinctrl`, with a libgpiod v1 or v2 fallback |
 | Desktop | labwc (Wayland) + wf-panel-pi | labwc or Wayfire (Wayland) + wf-panel-pi |
 
-### Quick install (recommended)
+### One-click install (no terminal)
 
-On the Pi, in a terminal, as your normal desktop user:
+![The installer](docs/installer.png)
+
+1. On the Pi, open this project's GitHub page in the browser, click **Code → Download
+   ZIP**, then open the ZIP in the file manager and **Extract** it.
+2. In the extracted folder, double-click **Install Pi 5 Energy Plan**. The file manager
+   asks *"Do you want to execute it?"*: click **Execute**.
+3. Choose the options (all on by default) and click **Install**. Enter your password
+   in the password window. The window shows the progress.
+4. When it says **Installed**, click **Reboot now** (needed the first time, for I2C
+   and the bootloader settings), or **Open Energy Plan**.
+
+The options are:
+
+* **Battery protection with the recommended settings**: charge to 80 %, safe shutdown
+  at 20 %, battery saver below 50 %. Only on a first install: if you already saved UPS
+  settings, they're kept.
+* **Geekworm's bootloader settings**: `PSU_MAX_CURRENT=5000` and `POWER_OFF_ON_HALT`
+  (see [5 V outputs after shutdown](#5-v-outputs-after-shutdown-bootloader-setting)).
+* **Menu entry and battery icon in the panel.**
+
+Run the same installer again to **update** (it says *Install again*) or to
+**Uninstall**. If the launcher doesn't start, double-click `install_gui.py` instead and
+click **Execute**.
+
+### Install from a terminal
 
 ```bash
 git clone https://github.com/luis199421/x1202.git
 cd x1202
-sudo sh install.sh
-sudo reboot          # only needed the first time, so I2C turns on
+sudo sh install.sh --ups-recommended
+sudo reboot          # only needed the first time, for I2C and the bootloader settings
 ```
 
-`install.sh` installs everything the script needs and can be run again at any time;
-it never adds anything twice. It:
+Options: `--ups-recommended` (as above), `--no-eeprom` (leave the bootloader alone),
+`--uninstall`.
 
-1. **Installs the packages** with apt. For each one it uses the Trixie package name,
-   or the Bookworm name if that's the one apt knows:
+### What the installer does
+
+Both ways run `install.sh`. It can be run again at any time and
+[never adds anything twice](#8-nothing-is-ever-added-twice). It:
+
+1. **Installs the packages** with apt (waiting if another apt is running). This is
+   Geekworm's list plus what the window and panel icon need. For each one it uses the
+   Trixie name, or the Bookworm name if that's the one apt knows:
 
    | Package | Needed for |
    |---|---|
    | `python3-tk` | The window (GUI) |
-   | `python3-smbus` (or `python3-smbus2`) | Reading the X1202 battery over I2C |
+   | `python3-smbus2` (or `python3-smbus`) | Reading the X1202 battery over I2C |
    | `raspi-utils` (or `libraspberrypi-bin`) | `pinctrl` (power-loss and charge pins) and `vcgencmd` |
+   | `python3-libgpiod`, `gpiod` | GPIO fallback if `pinctrl` is missing, and `gpiodetect` |
+   | `rpi-eeprom` | `rpi-eeprom-config`, for the bootloader settings |
    | `python3-gi`, `gir1.2-gdkpixbuf-2.0`, `librsvg2-common` | The battery icon in the panel |
-   | `pkexec` (or `policykit-1`) | The password prompt when the window changes settings |
+   | `pkexec` (or `policykit-1`) | The password window |
    | `i2c-tools` | `i2cdetect`, to check the UPS |
    | `stress-ng` | The sweet spot overclock test |
-   | `python3-libgpiod` | Fallback GPIO reading if `pinctrl` is missing (libgpiod v2 on Trixie) |
 
-2. **Turns on I2C** with `raspi-config` (the X1202's fuel gauge is on I2C), and tells
-   you if a reboot is needed.
-3. **Installs the script** as `/usr/local/bin/pi5_energyplan.py`. That folder is on
-   your PATH, so you can run `pi5_energyplan.py --status` from anywhere.
-4. **Adds the menu entry** (Menu → Preferences → *Pi 5 Energy Plan*) and the **panel
-   battery icon**, which starts at every login, for the user who ran `sudo`.
-5. When run again after an update, it **refreshes the background services** so they
-   run the new version.
-6. At the end it prints `--status`, so you can check that it works.
+2. **Turns on I2C** with `raspi-config` (the X1202's fuel gauge is on I2C).
+3. **Installs the program** as `/usr/local/bin/pi5_energyplan.py`. That folder is on
+   your PATH, so `pi5_energyplan.py --status` works from anywhere. On a reinstall it
+   refreshes both background services so they run the new version.
+4. **Sets Geekworm's bootloader settings** (unless you opt out). It skips this when
+   they're already set.
+5. **Turns on battery protection** if you chose it.
+6. **Warns** if one of Geekworm's UPS scripts is running.
+7. **Adds the menu entry** (Menu → Preferences → *Pi 5 Energy Plan*) and the **panel
+   battery icon**, which starts at every login.
+8. Prints `--status`, and tells you if a reboot is needed.
 
-Before installing, it's a good idea to update the system and the bootloader:
-
-```bash
-sudo apt update && sudo apt full-upgrade -y
-sudo rpi-eeprom-update -a
-sudo reboot
-```
+It's a good idea to update the system and bootloader first:
+`sudo apt update && sudo apt full-upgrade -y && sudo rpi-eeprom-update -a`, then reboot.
 
 ### After installing: check the X1202 and set things up
 
@@ -280,8 +350,9 @@ Then:
 ### Manual install (without install.sh)
 
 ```bash
-sudo apt install -y python3-tk python3-smbus i2c-tools raspi-utils python3-gi \
-                    gir1.2-gdkpixbuf-2.0 librsvg2-common pkexec stress-ng
+sudo apt install -y python3-tk python3-smbus2 i2c-tools raspi-utils python3-libgpiod \
+                    gpiod rpi-eeprom python3-gi gir1.2-gdkpixbuf-2.0 librsvg2-common \
+                    pkexec stress-ng
 sudo raspi-config nonint do_i2c 0 && sudo reboot
 mkdir -p ~/pi5-energyplan && cp pi5_energyplan.py ~/pi5-energyplan/
 cd ~/pi5-energyplan
@@ -292,19 +363,6 @@ python3 pi5_energyplan.py --install-tray
 Applying a plan or saving UPS settings for the first time copies the script to
 `/usr/local/bin/pi5_energyplan.py`. The two background services run that copy.
 
-### Optional: let USB use the X1202's full 5 A
-
-The Pi 5 can only detect a 5 A supply through USB-C, so on pogo-pin power it may limit
-USB devices to 600 mA. If you use power-hungry USB devices (SSDs, for example), set
-the supply limit in the bootloader:
-
-```bash
-sudo rpi-eeprom-config --edit
-# add the line:  PSU_MAX_CURRENT=5000
-```
-
-Then reboot.
-
 ---
 
 ## 5. Using it
@@ -313,8 +371,10 @@ Then reboot.
 
 * **Plan buttons**: apply a plan. The plan in use is highlighted.
 * **Governor / Fan pickers** (▾): change the governor or fan profile a plan uses.
-* **UPS settings…**: charge limit, safe shutdown level, outage timer, warning time,
-  battery saver.
+* **UPS settings…**: charge limit, safe shutdown level, power-cut timer, warning time,
+  5 V outputs after shutdown, battery saver, and **Charge to 100 % once**.
+
+![UPS settings](docs/ups-settings.png)
 * **Battery in panel**: adds the panel icon.
 * **Find sweet spot…**: starts or cancels the overclock test.
 * When you run a newer copy of the script, the window offers to **update the
@@ -335,6 +395,10 @@ After `install.sh`, you can write `pi5_energyplan.py` instead of
 | `sudo python3 pi5_energyplan.py --set-governor Eco performance` | Change the governor a plan uses |
 | `sudo python3 pi5_energyplan.py --set-fan Eco Strong` | Change a plan's fan profile (Silent, Quiet, Default, Cool, Strong, Max) |
 | `python3 pi5_energyplan.py --battery` | Live battery readout every 3 s (Ctrl+C to stop) |
+| `python3 pi5_energyplan.py --monitor [SECONDS]` | Full UPS and Pi report, refreshed in place (Ctrl+C to stop) |
+| `sudo python3 pi5_energyplan.py --charge-full on` | Charge to 100 % once, then back to the limit (`off` cancels) |
+| `sudo python3 pi5_energyplan.py --usb-5v-when-off on` | Keep the 5 V outputs on after shutdown (`off` = turn them off) |
+| `sudo python3 pi5_energyplan.py --eeprom-setup` | Set Geekworm's bootloader settings |
 | `python3 pi5_energyplan.py --charge-debug` | Everything about charging: pins, guard state, last log lines |
 | `sudo python3 pi5_energyplan.py --ups-config '{"enabled":true,"max":80,"min":20}'` | Set the UPS settings without the window (see below) |
 | `python3 pi5_energyplan.py --install-launcher` | Add the menu entry |
@@ -346,18 +410,19 @@ After `install.sh`, you can write `pi5_energyplan.py` instead of
 | `sudo python3 pi5_energyplan.py --uninstall-service` | Stop restoring the plan at boot |
 | `sudo python3 pi5_energyplan.py --uninstall-guard` | Remove the battery guard service |
 
-`--ups-config` keys:
+`--ups-config` keys (keys you leave out keep their current value):
 
 | Key | Values | Default |
 |---|---|---|
 | `enabled` | `true` / `false`: charge limit and auto shutdown on/off | `false` |
 | `max` | 50–100: stop charging at this % | 80 |
 | `min` | 5–50: safe shutdown at this % (at least 20 below `max`) | 20 |
-| `outage_minutes` | 0 (never), 1, 5, 15, 30, 60 | 0 |
+| `outage_minutes` | 0 (never), 0.25 (15 s), 1, 5, 15, 30, 60 | 0 |
 | `warn_minutes` | 1, 2, 5 | 1 |
 | `saver_enabled` | `true` / `false` | `false` |
 | `saver_below` | 15–100 (100 = as soon as power goes out) | 50 |
 | `saver_plan` | `"Underclock"` or `"Eco"` | `"Underclock"` |
+| `usb_5v_when_off` | `true` = 5 V outputs stay on after shutdown (`POWER_OFF_ON_HALT=0`) | `false` |
 
 ---
 
@@ -376,7 +441,10 @@ After `install.sh`, you can write `pi5_energyplan.py` instead of
 | `/etc/pi5-energyplan/custom.json` | The "Sweet Spot" plan |
 | `/etc/pi5-energyplan/charge_pin_v2.json` | What the charge-pin self-check learned |
 | `/var/lib/pi5-energyplan/autotest.json`, `autotest.log` | Sweet spot test state and log |
+| `/var/lib/pi5-energyplan/eeprom-before.conf` | Your bootloader settings before the first change (made once) |
+| Bootloader (EEPROM) | `POWER_OFF_ON_HALT` and `PSU_MAX_CURRENT` |
 | `/run/pi5-energyplan/battery-guard.json` | Live guard status, read by the window and the icon |
+| `/run/pi5-energyplan/charge-full-once` | Only while "Charge to 100 % once" is on |
 | `~/.local/share/applications/pi5-energyplan.desktop` | Menu entry |
 | `~/.config/autostart/pi5-battery-tray.desktop` | Starts the panel icon at login |
 
@@ -384,8 +452,8 @@ After `install.sh`, you can write `pi5_energyplan.py` instead of
 
 ## 7. Updating and uninstalling
 
-**Update:** get the new version (`git pull`, or copy the new `pi5_energyplan.py` into
-the folder), then run the installer again:
+**Update:** download the new ZIP and double-click **Install Pi 5 Energy Plan** again
+(it says *Install again (update)*), or in a terminal:
 
 ```bash
 cd x1202 && git pull
@@ -397,7 +465,7 @@ the menu entry and the panel icon, and never adds anything twice. If you install
 manually, run `python3 pi5_energyplan.py --update` instead. The window also offers to
 update when it notices a newer version.
 
-**Uninstall:**
+**Uninstall:** double-click **Install Pi 5 Energy Plan** and click **Uninstall**, or:
 
 ```bash
 sudo pi5_energyplan.py --apply Balanced   # optional: put the Pi defaults back in config.txt
@@ -405,8 +473,8 @@ sudo sh install.sh --uninstall
 ```
 
 This stops and removes both services (charging is switched back on), the system copy,
-the menu entry and the panel icon. It keeps your settings in `/etc/pi5-energyplan`
-and the installed apt packages.
+the menu entry and the panel icon. It keeps your settings in `/etc/pi5-energyplan`,
+the bootloader settings, and the installed apt packages.
 
 To remove the managed block completely, delete the lines from
 `# >>> pi5-energyplan` to `# <<< pi5-energyplan <<<` at the end of
@@ -415,14 +483,38 @@ delete `/etc/pi5-energyplan` and `/var/lib/pi5-energyplan`.
 
 ---
 
-## 8. Troubleshooting
+## 8. Nothing is ever added twice
+
+Installing again, updating, applying the same plan again or rebooting never adds a
+second copy of anything:
+
+| What | How |
+|---|---|
+| `config.txt` | One managed block between markers, replaced as a whole. Old lines are commented out once. The backup is made only the first time. |
+| Bootloader | Each setting is replaced in place, never added again, and only written when it's different. Your 5 V choice is kept. |
+| Services | The two unit files are rewritten in place; `systemctl enable` is the same every time. |
+| Menu entry, panel icon | Always the same two files. Starting the icon stops the old one first; a second icon, window, battery guard or boot task refuses to start. |
+| UPS settings | `--ups-recommended` only applies on a first install. |
+| Boot | The boot task only re-applies the governor and max speed; it writes no files. |
+| Old manual install | Running from `~/pi5-energyplan` first and then the installer leaves one menu entry and one panel icon, both pointing at `/usr/local/bin`. |
+
+The tests check this: they install, reinstall, update, re-apply and "boot" three times
+over, then compare every managed file byte for byte.
+
+---
+
+## 9. Troubleshooting
 
 | Problem | Fix |
 |---|---|
 | **The Pi won't boot after choosing an overclock plan** | Put the SD card or SSD in another computer. In the boot partition, open `config.txt`, delete the `pi5-energyplan` block (or copy `config.txt.energyplan.bak` over it), and boot again. |
 | Window says *"I2C is off"* | `sudo raspi-config nonint do_i2c 0`, then reboot |
-| *"Missing I2C library"* | `sudo apt install python3-smbus` |
-| *"UPS not answering on I2C 0x36"* | The X1202 isn't seated or its pogo pins don't touch the Pi. Check that `i2cdetect -y 1` shows `36`. |
+| *"Missing I2C library"* | `sudo apt install python3-smbus2` (or run the installer again) |
+| *"UPS not answering on I2C 0x36"* | The X1202 isn't seated or its pogo pins don't touch the Pi (I2C is on physical pins 3 and 5). Check that `i2cdetect -y 1` shows `36`. Turn the power off before adjusting the boards. |
+| The X1202 switches off within a few seconds | Geekworm: the X1202 turns itself off if it doesn't detect the Pi 5. Check the pogo-pin contact. |
+| Message about 5 A capability, or USB devices without power | The bootloader needs `PSU_MAX_CURRENT=5000`: run the installer again with the bootloader option on, then reboot. |
+| Under-voltage warnings | Check the adapter, cables, load and pogo-pin contact. `PSU_MAX_CURRENT` doesn't fix a weak supply. |
+| Installer warns about Geekworm scripts | Stop them and remove them from autostart, cron or rc.local. Only one program may control the UPS pins. |
 | Battery shows "Plugged in" but never "Charging" | Run `python3 pi5_energyplan.py --charge-debug`. If it says the adapter is too weak, use a stronger supply: the Pi and the charger share it. |
 | Charge limit "✗": board can't pause charging | Your board revision ignores GPIO 16. The guard leaves charging to the board, which stops by itself at full (4.2 V). |
 | A shutdown is counting down and you want to stop it | Plug the adapter back in, or run `sudo shutdown -c`. |
@@ -442,8 +534,9 @@ with Active Cooler and X1202 and runs the real script against it:
 * fake sysfs (cpufreq, thermal trip points, fan) and a stock Raspberry Pi OS `config.txt`,
   in a private mount namespace,
 * a fake MAX17048 fuel gauge (`tests/fakes/py/smbus2.py`),
-* fake `pinctrl`, `vcgencmd`, `systemctl`, `shutdown` and `reboot`. These only record
-  how they were called, so nothing on the test machine is changed or rebooted.
+* fake `pinctrl`, `vcgencmd`, `systemctl`, `shutdown`, `reboot`, `apt-get`,
+  `raspi-config`, `rpi-eeprom-config` and `pkexec`. These only record how they were
+  called, so nothing on the test machine is changed or rebooted.
 
 Run it on a Linux development machine, **not on the Pi**:
 
@@ -454,9 +547,10 @@ sudo xvfb-run -a sh tests/run_sim_tests.sh          # also the GUI and the panel
 ```
 
 The installer test for the menu entry and panel icon needs a throwaway user:
-`sudo INSTALL_TEST_USER=someuser sh tests/run_sim_tests.sh`.
+`sudo INSTALL_TEST_USER=someuser sh tests/run_sim_tests.sh`. To run some tests only:
+`sudo TESTS="TestUps TestNothingTwice" sh tests/run_sim_tests.sh`.
 
-The 39 tests cover:
+The 59 tests cover:
 
 * **Plans:** applying each kind of plan, the live sysfs changes and governor fallback,
   `config.txt` editing (backup, commenting out conflicting lines, only `[all]`/`[pi5]`
@@ -471,8 +565,18 @@ The 39 tests cover:
 * **Sweet spot test:** a full run (pass, unstable, no boot → Sweet Spot saved, tryboot
   removed, `config.txt` untouched until the end), a crash during stress,
   old-bootloader detection, and cancel.
-* **Installer:** Trixie and Bookworm package names, I2C switch-on, menu entry and
-  panel icon for the sudo user, re-run as an update, `--uninstall`.
+* **Installer:** Trixie and Bookworm package names, I2C switch-on, bootloader
+  settings (and skipping them), recommended UPS settings only on a first install, the
+  warning about running Geekworm scripts, menu entry and panel icon for the sudo user,
+  re-run as an update, `--uninstall`.
+* **One-click install:** the double-click launcher run the way PCManFM runs it (from a
+  folder with a space in its name), and the installer window doing a full install
+  (one password prompt) and uninstall.
+* **Geekworm functions:** shutdown 15 s after a power cut (and not on a short glitch),
+  fuel gauge lost on battery or on mains, charge to 100 % once, `--monitor`, CPU core
+  V/A, bootloader edits, and the 5 V choice surviving a reinstall.
+* **Nothing twice:** the install / update / boot cycle above, an old manual install,
+  and only one battery guard and one boot task at a time.
 * **GUI and panel icon:** the window builds and shows live values; the panel icon
   registers on D-Bus and serves a 64×64 icon and its tooltip.
 * **Uninstall:** `--uninstall-service` and `--uninstall-guard`.

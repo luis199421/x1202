@@ -1,0 +1,16 @@
+#!/usr/bin/python3
+"""Fake rpi-eeprom-config: prints / applies the bootloader config in hw.json."""
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import _common as c
+
+hw = c.load()
+if sys.argv[1:2] == ["--apply"]:
+    c.log_call("rpi-eeprom-config")
+    with open(sys.argv[2]) as f:
+        hw["eeprom"] = f.read()
+    c.save(hw)
+else:
+    print(hw.get("eeprom", "[all]\nBOOT_UART=1\nPOWER_OFF_ON_HALT=0\nBOOT_ORDER=0xf41\n"),
+          end="")

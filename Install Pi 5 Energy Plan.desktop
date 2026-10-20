@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Install Pi 5 Energy Plan
+Comment=Installs Pi 5 Energy Plan and everything it needs (Geekworm X1202 UPS)
+Exec=sh -c 'cd "$*" && exec python3 ./install_gui.py' sh %k
+Icon=system-software-install
+Terminal=false
