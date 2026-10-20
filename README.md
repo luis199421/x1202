@@ -21,6 +21,31 @@ see [Geekworm's scripts: what's included](#geekworms-scripts-whats-included-and-
 **Install without a terminal:** download the ZIP, double-click
 **Install Pi 5 Energy Plan**. See [Installation](#4-installation).
 
+### Other Raspberry Pi models, and without the UPS
+
+It detects the board and only offers what that board has:
+
+| Board | Plans (top speed) | Overclock plans | Fan curves | GPU clock | UPS features, sweet spot test |
+|---|---|---|---|---|---|
+| Pi 5, 500, CM5 | 1.5–2.4 GHz | 2.6 / 2.8 / 3.0 GHz | yes (fan connector) | yes | yes |
+| Pi 4 Rev 1.4+, 400 | 1.1–1.8 GHz | 2.0 GHz (`over_voltage=6`) | – | – | – |
+| Pi 4 older revisions, CM4 | 0.9–1.5 GHz | 1.8 GHz (`over_voltage=2`), 2.0 GHz | – | – | – |
+| Pi 3B+ / 3A+ / 3B | up to 1.4 / 1.2 GHz | none | – | – | – |
+| Zero 2 W | 0.6–1.0 GHz | none | – | – | – |
+| Zero, Zero W | 0.7–1.0 GHz | none | – | – | – |
+
+* Plans are worked out from the board's own top speed (Underclock ≈ 62 %, Eco 75 %,
+  Max Cool 83 %), never below its lowest speed. The Custom plan's range follows the
+  board too: no overclock on Pi 3 / Zero, which throttle without cooling.
+* The `config.txt` block goes under the board's own section (`[pi5]`, `[pi4]`,
+  `[pi3]`, `[pi02]`, `[pi0]`). If the SD card is moved to another model, it isn't used
+  there: that Pi starts with its defaults (and Performance), not with another
+  board's overclock.
+* **Without the X1202** (or on any other board): no battery card, panel icon, UPS
+  settings or bootloader settings (`PSU_MAX_CURRENT=5000` would be wrong on a normal
+  3 A supply), and the battery guard never touches GPIO 6 / 16 or shuts down for UPS
+  reasons. On a Pi 5 the window says why no UPS was found (for example "I2C is off").
+
 ![The Energy Plan window](docs/gui.png)
 
 ---
@@ -113,28 +138,33 @@ speed)*:
 | **After a reboot** | Full fan curve (temperatures **and** speeds), `arm_freq`, `over_voltage_delta`, `gpu_freq` | a managed block at the end of `/boot/firmware/config.txt` |
 | **At every boot** | Governor and max frequency again. The Raspberry Pi kernel always starts in `powersave` (1.5 GHz); with no saved plan, **Performance** is used instead. If the battery saver is on (on battery), it's left on. | `pi5-energyplan.service`, installed with the program |
 
-The block in `config.txt` looks like this. The script only ever changes the text between
-the two markers:
+The block in `config.txt` looks like this on a Pi 5. The script only ever changes the
+text between the two markers:
 
 ```ini
 # >>> pi5-energyplan (managed by pi5_energyplan.py) >>>
 # plan: Cool
-[all]
+[pi5]
 dtparam=fan_temp0=40000
 dtparam=fan_temp0_hyst=3000
 dtparam=fan_temp0_speed=100
 ...
 arm_freq=2400
+[all]
 # <<< pi5-energyplan <<<
 ```
+
+`[pi5]` makes it apply only to this model; the `[all]` at the end makes anything added
+after the block apply to every model again.
 
 Safety details:
 
 * The first time it edits `config.txt`, it saves the original as
   `config.txt.energyplan.bak`.
-* Other `arm_freq`, `over_voltage`, `gpu_freq` or `dtparam=fan_temp…` lines in the
-  `[all]` or `[pi5]` sections are commented out with `#energyplan-disabled#` so they
-  can't override the plan. Lines under other sections such as `[pi4]` are left alone.
+* Other `arm_freq`, `over_voltage`, `gpu_freq`, `v3d_freq` or `dtparam=fan_temp…`
+  lines in `[all]` or this board's section are commented out with
+  `#energyplan-disabled#` so they can't override the plan. Lines for other models'
+  sections are left alone.
 * Running the same plan again never adds a second block.
 * Speeds above what the current boot allows (for example 2.8 GHz when the Pi booted
   at 2.4 GHz) are noted as "unlocks after reboot".
@@ -146,7 +176,29 @@ window), fan level, PWM and RPM, CPU speed, GPU clock, power warnings from
 `vcgencmd get_throttled` (under-voltage, throttling), the saved plan, and the
 governor **with who set it**: for example `performance (Performance, set at boot)`,
 `powersave (Underclock, battery saver on)`, or `powersave (not set by Pi 5 Energy Plan
-since boot …)`, which means the boot service didn't run.
+since boot …)`, which means the boot service didn't run. `--status` also shows the
+board, and the storage.
+
+### Slow storage: more in RAM (only with RAM to spare)
+
+If the system runs from a **slow disk** (an SD card, or a USB 2 drive) and the board
+has **2 GB of RAM or more**, the installer keeps more in RAM so the Pi waits less on
+the disk:
+
+| What | Change | When |
+|---|---|---|
+| File cache | kept in RAM longer (`vm.vfs_cache_pressure = 50`) | always, when tuned |
+| Swap | used only when really needed (`vm.swappiness = 10`) | only if swap is a file / partition on the disk. Trixie's swap starts in RAM (zram), so it's left alone |
+| `/tmp` | in RAM (after a reboot) | only if it isn't already (Trixie already has it; Bookworm doesn't) |
+
+* With **less than 2 GB** (Zero, Zero 2 W, Pi 3, 1 GB boards) nothing is changed:
+  using RAM for this would make them slower.
+* NVMe, eMMC and USB 3 drives are fast enough: nothing is changed.
+* The changes are one file each (`/etc/sysctl.d/90-pi5-energyplan.conf`, and
+  `/etc/systemd/system/tmp.mount` if `/tmp` wasn't in RAM). A `tmp.mount` of your
+  own is never replaced.
+* `sudo pi5_energyplan.py --storage-tune off` undoes it, and updates then leave it off;
+  `--storage-tune on` turns it back on. Uninstalling undoes it too.
 
 ---
 
@@ -459,6 +511,7 @@ After `install.sh`, you can write `pi5_energyplan.py` instead of
 | `python3 pi5_energyplan.py --autotest-status` | Test progress and log |
 | `sudo python3 pi5_energyplan.py --autotest-cancel` | Stop the test |
 | `python3 pi5_energyplan.py --update` | After replacing the script: refresh everything it installed |
+| `sudo python3 pi5_energyplan.py --storage-tune on\|off` | Keep more in RAM on slow storage (see [Slow storage](#slow-storage-more-in-ram-only-with-ram-to-spare)); `off` undoes it |
 | `sudo python3 pi5_energyplan.py --install-service` | Set the saved plan (or Performance) at every boot; the installer does this |
 | `sudo python3 pi5_energyplan.py --uninstall-service` | Stop restoring the plan at boot (updates then don't add it back) |
 | `sudo python3 pi5_energyplan.py --uninstall-guard` | Remove the battery guard service |
@@ -496,6 +549,7 @@ After `install.sh`, you can write `pi5_energyplan.py` instead of
 | `/etc/pi5-energyplan/battery.json` | UPS settings |
 | `/etc/pi5-energyplan/governors.json`, `fans.json` | Your per-plan governor and fan choices |
 | `/etc/pi5-energyplan/custom.json` | The "Sweet Spot" and "Custom" plans |
+| `/etc/sysctl.d/90-pi5-energyplan.conf`, `/etc/systemd/system/tmp.mount` | Only with slow storage and 2 GB+ RAM (see Slow storage) |
 | `/etc/pi5-energyplan/charge_pin_v3.json` | What the charge-pin self-check learned |
 | `/var/lib/pi5-energyplan/autotest.json`, `autotest.log` | Sweet spot test state and log |
 | `/var/lib/pi5-energyplan/eeprom-before.conf` | Your bootloader settings before the first change (made once) |
@@ -651,7 +705,7 @@ The installer test for the menu entry and panel icon needs a throwaway user:
 `sudo INSTALL_TEST_USER=someuser sh tests/run_sim_tests.sh`. To run some tests only:
 `sudo TESTS="TestUps TestNothingTwice" sh tests/run_sim_tests.sh`.
 
-The 91 tests cover:
+The 109 tests cover:
 
 * **Plans:** applying each kind of plan, the live sysfs changes and governor fallback,
   `config.txt` editing (backup, commenting out conflicting lines, only `[all]`/`[pi5]`
@@ -690,6 +744,15 @@ The 91 tests cover:
   is not mistaken for "pause not working"; `--charge-test` tells a board that keeps
   charging from one that stops, always switches charging back on (also when the
   adapter is unplugged mid-test) and restarts the guard.
+* **Other boards:** Pi 4 (both speeds), Zero 2 W and Zero W get their own plans,
+  overclocks (or none), Custom range and `config.txt` section, no fan / GPU / UPS
+  settings, and the right window and installer options; an SD card moved from a Pi 5
+  to a Pi 4 doesn't carry the Pi 5 overclock; the battery guard stays idle on other
+  boards, and on a Pi 5 without the X1202 it never touches GPIO 16 or shuts down.
+* **Slow storage:** SD card and USB 2 are slow, NVMe / eMMC / USB 3 aren't; with RAM
+  to spare the file cache, swap and `/tmp` settings are applied once; zram and an
+  existing `/tmp` in RAM or a `tmp.mount` of your own are left alone; a 512 MB board
+  isn't touched; `off` undoes it and is remembered.
 * **Boot governor:** the kernel's boot-time `powersave` is replaced by the saved plan,
   or Performance without one; the battery saver is left on at boot and when editing a
   plan; the saver ignores a single glitch; `--status` says who set the governor; the

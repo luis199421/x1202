@@ -21,7 +21,7 @@ exec unshare -m sh -ec '
   done
   for d in /etc/pi5-energyplan /var/lib/pi5-energyplan /run/pi5-energyplan /sys/firmware \
            /usr/share/pi5-energyplan /usr/share/doc/pi5-energyplan /usr/share/keyrings \
-           /etc/apt/sources.list.d /var/cache/pi5-energyplan; do
+           /etc/apt/sources.list.d /var/cache/pi5-energyplan /sys/block /etc/sysctl.d; do
     mkdir -p "$d"; mount -t tmpfs tmpfs "$d"
   done
   [ -e /dev/i2c-1 ] || { touch /dev/i2c-1; trap "rm -f /dev/i2c-1" EXIT; }

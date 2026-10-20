@@ -32,6 +32,21 @@ def version(path):
     return m.group(1) if m else "0"
 
 
+def detect_board():
+    """What the board has, asked from the pi5_energyplan.py in this download."""
+    try:
+        out = subprocess.run([sys.executable, os.path.join(HERE, "pi5_energyplan.py"),
+                              "--detect-sh"], capture_output=True, text=True,
+                             timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    info = {"BOARD_MODEL": "", "UPS_POSSIBLE": "1"}
+    for line in out.splitlines():
+        k, _, v = line.partition("=")
+        info[k] = v.strip("'")
+    return info
+
+
 def newer(a, b):
     return tuple(map(int, a.split("."))) > tuple(map(int, b.split(".")))
 
@@ -80,6 +95,7 @@ class Installer:
         self.opt_ups = tk.BooleanVar(value=not os.path.exists(
             "/etc/pi5-energyplan/battery.json"))
         self.opt_eeprom = tk.BooleanVar(value=True)
+        self.board = detect_board()
         self.opt_desktop = tk.BooleanVar(value=True)
         self._build()
 
@@ -125,17 +141,25 @@ class Installer:
 
         box = tk.Frame(r, bg=CARD, padx=10, pady=8)
         box.pack(fill="x")
-        self.label(box, "This installs the packages it needs, turns on I2C and puts the "
-                        "program in /usr/local/bin. You'll be asked for your password once.",
-                   9, MUTED, wraplength=510).pack(anchor="w", pady=(0, 4))
-        self.check(box, "Battery protection with the recommended settings: charge to 80 %, "
-                        "safe shutdown at 20 %, battery saver below 50 % "
-                        "(change them later in UPS settings)", self.opt_ups).pack(fill="x")
-        self.check(box, "Geekworm's bootloader settings: PSU_MAX_CURRENT=5000 (full 5 A "
-                        "for USB) and POWER_OFF_ON_HALT=1 (5 V outputs off after shutdown, "
-                        "saves battery; changeable in UPS settings). Reboot needed.",
-                   self.opt_eeprom).pack(fill="x")
-        self.check(box, "Menu entry and battery icon in the panel",
+        ups = self.board.get("UPS_POSSIBLE") == "1"
+        self.label(box, (f"Board: {self.board['BOARD_MODEL']}. " if self.board.get("BOARD_MODEL")
+                         else "") +
+                   "This installs the packages it needs" + (", turns on I2C" if ups else "") +
+                   " and puts the program in /usr/local/bin. You'll be asked for your password "
+                   "once.", 9, MUTED, wraplength=510).pack(anchor="w", pady=(0, 4))
+        if ups:   # the X120x UPS fits only the Raspberry Pi 5
+            self.check(box, "Battery protection with the recommended settings: charge to "
+                            "80 %, safe shutdown at 20 %, battery saver below 50 % (only if "
+                            "the X120x UPS is found; change them later in UPS settings)",
+                       self.opt_ups).pack(fill="x")
+            self.check(box, "Geekworm's bootloader settings: PSU_MAX_CURRENT=5000 (full 5 A "
+                            "for USB) and POWER_OFF_ON_HALT=1 (5 V outputs off after "
+                            "shutdown, saves battery). Only with the UPS. Reboot needed.",
+                       self.opt_eeprom).pack(fill="x")
+        else:
+            self.opt_ups.set(False)
+            self.opt_eeprom.set(False)
+        self.check(box, "Menu entry" + (" and battery icon in the panel" if ups else ""),
                    self.opt_desktop).pack(fill="x")
 
         logf = tk.Frame(r, bg=BG)

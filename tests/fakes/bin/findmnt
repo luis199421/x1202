@@ -1,0 +1,12 @@
+#!/usr/bin/python3
+"""Fake `findmnt -n -o FIELD TARGET`, answering from hw.json "mounts", e.g.
+{"/": {"SOURCE": "/dev/mmcblk0p2"}, "/tmp": {"FSTYPE": "ext4"}}."""
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import _common as c
+
+field, target = sys.argv[-2], sys.argv[-1]
+defaults = {"/": {"SOURCE": "overlay", "FSTYPE": "overlay"}, "/tmp": {"FSTYPE": "tmpfs"}}
+mounts = c.load().get("mounts", {})
+print(mounts.get(target, {}).get(field, defaults.get(target, {}).get(field, "")))

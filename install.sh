@@ -114,6 +114,7 @@ uninstall() {
     else
         if [ -f "$DEST" ]; then
             say "Removing the background services"
+            python3 "$DEST" --storage-tune undo || true
             python3 "$DEST" --uninstall-service || true   # keeps the copy while the guard needs it
             [ -f "$DEST" ] && { python3 "$DEST" --uninstall-guard || true; }
         fi
@@ -171,18 +172,24 @@ fi
 # ----------------------------------------------------------------------------
 system_part() {
     mkdir -p "$(dirname "$REBOOT_MARK")"
+    # what this board has (model, fan control, UPS)
+    eval "$(python3 "$SRC" --detect-sh)"
+    say "Board: $BOARD_MODEL"
 
-    # I2C for the X1202 fuel gauge
-    say "Turning on I2C"
-    if command -v raspi-config >/dev/null 2>&1; then
-        if [ "$(raspi-config nonint get_i2c)" != "0" ]; then
-            raspi-config nonint do_i2c 0
-            touch "$REBOOT_MARK"
-        else
-            echo "  already on"
+    # I2C for the X1202 fuel gauge: only the Raspberry Pi 5 can have one (elsewhere it
+    # would only take GPIO 2 / 3 away from other uses)
+    if [ "$UPS_POSSIBLE" = 1 ]; then
+        say "Turning on I2C (for the X120x UPS)"
+        if command -v raspi-config >/dev/null 2>&1; then
+            if [ "$(raspi-config nonint get_i2c)" != "0" ]; then
+                raspi-config nonint do_i2c 0
+                touch "$REBOOT_MARK"
+            else
+                echo "  already on"
+            fi
+        elif ! grep -q "^dtparam=i2c_arm=on" "$CONFIG" 2>/dev/null; then
+            echo "  raspi-config not found: add 'dtparam=i2c_arm=on' to $CONFIG and reboot"
         fi
-    elif ! grep -q "^dtparam=i2c_arm=on" "$CONFIG" 2>/dev/null; then
-        echo "  raspi-config not found: add 'dtparam=i2c_arm=on' to $CONFIG and reboot"
     fi
 
     # the program (the replaced version is kept, for going back)
@@ -214,6 +221,10 @@ system_part() {
         echo "  refreshing the menu entry / panel icon of $u"
         as_user "$u" python3 "$DEST" --refresh-desktop || true
     done
+
+    # slow storage (SD card, USB 2) and RAM to spare: keep more in RAM
+    say "Storage"
+    python3 "$DEST" --storage-tune auto | sed 's/^/  /'
 
     # only one program may drive the UPS pins
     others=$(pgrep -af 'x120x|qtx120x|merged(-trixie)?\.py|pld(-trixie)?\.py|[^a-z_]bat\.py' \
@@ -256,8 +267,14 @@ DEBIAN_FRONTEND=noninteractive apt-get $APT_WAIT install -y --reinstall $DOWNGRA
 NEED_REBOOT=""
 [ -f "$REBOOT_MARK" ] && NEED_REBOOT=1
 
-# 2) Geekworm's bootloader settings
-if [ -n "$EEPROM" ]; then
+eval "$(python3 "$DEST" --detect-sh)"
+
+# 2) Geekworm's bootloader settings: only with the UPS (PSU_MAX_CURRENT=5000 would be
+#    wrong on a normal 3 A supply)
+if [ -n "$EEPROM" ] && [ "$HAS_UPS" != 1 ]; then
+    [ "$UPS_POSSIBLE" = 1 ] && echo && echo "No X120x UPS found: bootloader settings" \
+        "skipped. If you have one, reboot and run: sudo pi5_energyplan.py --eeprom-setup"
+elif [ -n "$EEPROM" ]; then
     say "Bootloader settings for the UPS (PSU_MAX_CURRENT, POWER_OFF_ON_HALT)"
     if out=$(python3 "$DEST" --eeprom-setup 2>&1); then
         echo "  $out"
@@ -268,7 +285,9 @@ if [ -n "$EEPROM" ]; then
 fi
 
 # 3) battery protection with the recommended settings (only on a first install)
-if [ -n "$UPS" ]; then
+if [ -n "$UPS" ] && [ "$HAS_UPS" != 1 ]; then
+    echo "No X120x UPS found: battery protection not turned on"
+elif [ -n "$UPS" ]; then
     say "Battery protection"
     if [ -f /etc/pi5-energyplan/battery.json ]; then
         echo "  UPS settings already saved, left as they are"
@@ -294,7 +313,11 @@ say "Done"
 python3 "$DEST" --status || true
 echo
 echo "Open 'Pi 5 Energy Plan' from the menu (Preferences), or run: python3 $DEST"
-echo "Then pick a plan and set 'UPS settings…'."
+if [ "$HAS_UPS" = 1 ]; then
+    echo "Then pick a plan and set 'UPS settings…'."
+else
+    echo "Then pick a plan."
+fi
 if [ -f /etc/apt/sources.list.d/pi5-energyplan.sources ]; then
     echo "New versions will show up in the Pi's updater (and in: sudo apt upgrade)."
 fi

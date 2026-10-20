@@ -86,85 +86,137 @@ def fan_profile_of(curve):
     return next((n for n, c in FAN_PROFILES.items() if c == curve), "Custom")
 
 
-PLANS = {
-    "Underclock": {
-        "desc": "Coolest & quietest. Max 1.5 GHz.",
-        "governor": "powersave",
-        "max_freq_mhz": 1500,
-        "fan": list(FAN_PROFILES["Silent"]),
-        "color": "#78909c",
-    },
-    "Eco": {
-        "desc": "Quiet & low power. Max 1.8 GHz.",
-        "governor": "conservative",
-        "max_freq_mhz": 1800,
-        "fan": list(FAN_PROFILES["Quiet"]),
-        "color": "#26a69a",
-    },
-    "Balanced": {
-        "desc": "Raspberry Pi defaults. 2.4 GHz.",
-        "governor": "ondemand",
-        "max_freq_mhz": 2400,
-        "fan": list(FAN_PROFILES["Default"]),
-        "color": "#42a5f5",
-    },
-    "Cool": {
-        "desc": "Full 2.4 GHz, kept cool.",
-        "governor": "schedutil",
-        "max_freq_mhz": 2400,
-        "fan": list(FAN_PROFILES["Cool"]),
-        "color": "#29b6f6",
-    },
-    "Max Cool": {
-        "desc": "Coolest at speed. Max 2.0 GHz.",
-        "governor": "conservative",
-        "max_freq_mhz": 2000,
-        "fan": list(FAN_PROFILES["Max"]),
-        "color": "#ab47bc",
-    },
-    "Performance": {
-        "desc": "Full 2.4 GHz, always top speed.",
-        "governor": "performance",
-        "max_freq_mhz": 2400,
-        "fan": list(FAN_PROFILES["Cool"]),
-        "color": "#ff7043",
-    },
-    # ---- Overclock: need a good power supply (official 27 W) and the Active Cooler.
-    # over_voltage_delta is extra CPU voltage in microvolts (50000 = +0.05 V).
-    # v3d_freq is the 3D GPU clock (Pi 5 default 960 MHz). Only the 3D block is
-    # raised, as the Raspberry Pi docs recommend: gpu_freq would also overclock the
-    # core / ISP / video clocks, and gpu_freq=1000 at 3.0 GHz freezes some Pi 5s.
-    "OC 2.6 GHz": {
-        "desc": "Mild overclock + GPU 1.0 GHz, works on most Pi 5s.",
-        "governor": "ondemand",
-        "max_freq_mhz": 2600,
-        "over_voltage_delta": 25000,
-        "v3d_freq": 1000,
-        "fan": list(FAN_PROFILES["Strong"]),
-        "color": "#ffca28",
-        "warn": True,
-    },
-    "OC 2.8 GHz": {
-        "desc": "Medium overclock, +0.05 V, GPU 1.05 GHz.",
-        "governor": "ondemand",
-        "max_freq_mhz": 2800,
-        "over_voltage_delta": 50000,
-        "v3d_freq": 1050,
-        "fan": list(FAN_PROFILES["Strong"]),
-        "color": "#ffa000",
-        "warn": True,
-    },
-    "OC 3.0 GHz": {
-        "desc": "Max overclock + GPU 1.1 GHz. Not every chip is stable.",
-        "governor": "ondemand",
-        "max_freq_mhz": 3000,
-        "over_voltage_delta": 50000,
-        "v3d_freq": 1100,
-        "fan": list(FAN_PROFILES["Max"]),
-        "color": "#e53935",
-        "warn": True,
-    },
-}
+# --------------------------------------------------------------------------- #
+#  Which Raspberry Pi is this? Plans, fan control, overclocks and the UPS adapt.
+# --------------------------------------------------------------------------- #
+def _first_line(*paths):
+    for path in paths:
+        try:
+            with open(path) as f:
+                v = f.read().replace("\x00", "").strip()
+        except OSError:
+            continue
+        if v:
+            return v
+    return ""
+
+
+def detect_board():
+    """Model, normal top CPU speed, lowest speed, config.txt filter and what the
+    board supports. Only the Pi 5 family has the fan connector, the X120x UPS (it
+    fits only the Pi 5), the V3D GPU clock setting and the tryboot overclock test."""
+    model = _first_line("/proc/device-tree/model", "/sys/firmware/devicetree/base/model")
+
+    def khz(name):
+        v = _first_line(f"/sys/devices/system/cpu/cpu0/cpufreq/{name}")
+        return int(v) // 1000 if v.isdigit() else None
+    fam, top, low = "other", None, None
+    if any(m in model for m in ("Raspberry Pi 5", "Raspberry Pi 500", "Compute Module 5")):
+        fam, top, low = "pi5", 2400, 1500
+    elif any(m in model for m in ("Raspberry Pi 4", "Raspberry Pi 400", "Compute Module 4")):
+        fast = "Raspberry Pi 400" in model or any(r in model for r in ("Rev 1.4", "Rev 1.5"))
+        fam, top, low = "pi4", 1800 if fast else 1500, 600
+    elif "Zero 2" in model:
+        fam, top, low = "pi02", 1000, 600
+    elif "Zero" in model:
+        fam, top, low = "pi0", 1000, 700
+    elif "Raspberry Pi 3" in model or "Compute Module 3" in model:
+        plus = "Plus" in model and "Compute Module" not in model
+        fam, top, low = "pi3", 1400 if plus else 1200, 600
+    elif "Raspberry Pi 2" in model:
+        fam, top, low = "pi2", 900, 600
+    elif "Raspberry Pi" in model or "Compute Module" in model:
+        fam, top, low = "pi1", 700, 700
+    top = top or khz("cpuinfo_max_freq") or 1000
+    low = low or khz("cpuinfo_min_freq") or min(600, top)
+    pi5 = fam == "pi5"
+    return {"model": model or "unknown (not a Raspberry Pi?)", "family": fam,
+            "filter": None if fam == "other" else fam, "top": top, "low": low,
+            "fan": pi5, "gpu": pi5, "ups": pi5, "autotest": pi5,
+            # extra CPU voltage the Custom plan may use
+            "volt_key": "over_voltage_delta" if pi5 else "over_voltage" if fam == "pi4" else None,
+            "volts": ([(0, "None"), (25000, "+0.025 V"), (50000, "+0.05 V")] if pi5 else
+                      [(0, "None"), (2, "+0.05 V"), (4, "+0.1 V"), (6, "+0.15 V")]
+                      if fam == "pi4" else [(0, "None")]),
+            # highest CPU speed the Custom plan allows (no overclock on Pi 3 / Zero / older)
+            "oc_top": 3000 if pi5 else 2000 if fam == "pi4" else top}
+
+
+BOARD = detect_board()
+
+
+def _mhz(x):
+    return int(round(x / 100.0)) * 100
+
+
+def _speed(m):
+    return f"{m / 1000:.1f} GHz" if m >= 1000 else f"{m} MHz"
+
+
+def make_plans(b):
+    """The built-in plans for this board, from its normal top speed."""
+    top, low = b["top"], b["low"]
+    under = max(low, _mhz(top * 0.625))
+    eco = max(low, _mhz(top * 0.75))
+    maxcool = max(low, _mhz(top * 0.833))
+    kept_cool = "kept cool" if b["fan"] else "efficient"
+    plans = {
+        "Underclock": {"desc": f"Coolest & quietest. Max {_speed(under)}.",
+                       "governor": "powersave", "max_freq_mhz": under,
+                       "fan": list(FAN_PROFILES["Silent"]), "color": "#78909c"},
+        "Eco": {"desc": f"Quiet & low power. Max {_speed(eco)}.", "governor": "conservative",
+                "max_freq_mhz": eco, "fan": list(FAN_PROFILES["Quiet"]), "color": "#26a69a"},
+        "Balanced": {"desc": f"Raspberry Pi defaults. {_speed(top)}.", "governor": "ondemand",
+                     "max_freq_mhz": top, "fan": list(FAN_PROFILES["Default"]),
+                     "color": "#42a5f5"},
+        "Cool": {"desc": f"Full {_speed(top)}, {kept_cool}.", "governor": "schedutil",
+                 "max_freq_mhz": top, "fan": list(FAN_PROFILES["Cool"]), "color": "#29b6f6"},
+        "Max Cool": {"desc": f"Coolest at speed. Max {_speed(maxcool)}.",
+                     "governor": "conservative", "max_freq_mhz": maxcool,
+                     "fan": list(FAN_PROFILES["Max"]), "color": "#ab47bc"},
+        "Performance": {"desc": f"Full {_speed(top)}, always top speed.",
+                        "governor": "performance", "max_freq_mhz": top,
+                        "fan": list(FAN_PROFILES["Cool"]), "color": "#ff7043"},
+    }
+    # ---- Overclock: need a good power supply and cooling.
+    if b["family"] == "pi5":
+        # over_voltage_delta is extra CPU voltage in microvolts (50000 = +0.05 V).
+        # v3d_freq is the 3D GPU clock (Pi 5 default 960 MHz). Only the 3D block is
+        # raised, as the Raspberry Pi docs recommend: gpu_freq would also overclock the
+        # core / ISP / video clocks, and gpu_freq=1000 at 3.0 GHz freezes some Pi 5s.
+        plans["OC 2.6 GHz"] = {"desc": "Mild overclock + GPU 1.0 GHz, works on most Pi 5s.",
+                               "governor": "ondemand", "max_freq_mhz": 2600,
+                               "over_voltage_delta": 25000, "v3d_freq": 1000,
+                               "fan": list(FAN_PROFILES["Strong"]), "color": "#ffca28",
+                               "warn": True}
+        plans["OC 2.8 GHz"] = {"desc": "Medium overclock, +0.05 V, GPU 1.05 GHz.",
+                               "governor": "ondemand", "max_freq_mhz": 2800,
+                               "over_voltage_delta": 50000, "v3d_freq": 1050,
+                               "fan": list(FAN_PROFILES["Strong"]), "color": "#ffa000",
+                               "warn": True}
+        plans["OC 3.0 GHz"] = {"desc": "Max overclock + GPU 1.1 GHz. Not every chip is stable.",
+                               "governor": "ondemand", "max_freq_mhz": 3000,
+                               "over_voltage_delta": 50000, "v3d_freq": 1100,
+                               "fan": list(FAN_PROFILES["Max"]), "color": "#e53935",
+                               "warn": True}
+    elif b["family"] == "pi4":
+        # the usual Pi 4 / 400 overclocks: over_voltage in 0.025 V steps (6 = +0.15 V);
+        # needs a heatsink and fan
+        if top < 1800:
+            plans["OC 1.8 GHz"] = {"desc": "Mild overclock, +0.05 V.", "governor": "ondemand",
+                                   "max_freq_mhz": 1800, "over_voltage": 2,
+                                   "fan": list(FAN_PROFILES["Strong"]), "color": "#ffca28",
+                                   "warn": True}
+        plans["OC 2.0 GHz"] = {"desc": "Overclock, +0.15 V. Needs a fan.",
+                               "governor": "ondemand", "max_freq_mhz": 2000,
+                               "over_voltage": 6, "fan": list(FAN_PROFILES["Strong"]),
+                               "color": "#ffa000", "warn": True}
+    # Pi 3, Zero, Zero 2 W and older: no overclock plans (they throttle without
+    # cooling, and the small boards can't power much more)
+    return plans
+
+
+PLANS = make_plans(BOARD)
 
 # Raise on every release. An older copy never replaces a newer installed one
 # (copies without this line, like the first versions, count as version 0).
@@ -223,14 +275,18 @@ AUTOTEST_STEPS = [(2600, 0), (2600, 25000), (2800, 25000), (2800, 50000), (3000,
 # --set-custom. Until then it's empty and can't be applied.
 CUSTOM = "Custom"
 CUSTOM_COLOR = "#8d6e63"
-CUSTOM_VOLTAGES = [(0, "None"), (25000, "+0.025 V"), (50000, "+0.05 V")]
+CUSTOM_VOLTAGES = BOARD["volts"]       # extra CPU voltage choices on this board
+VOLT_KEY = BOARD["volt_key"]           # over_voltage_delta (Pi 5) / over_voltage (Pi 4)
 V3D_DEFAULT = 960          # Pi 5 3D GPU clock, MHz
-CPU_RANGE, GPU_RANGE = (1500, 3000, 100), (600, 1100, 10)   # min, max, step (MHz)
+CPU_RANGE = (BOARD["low"], BOARD["oc_top"], 100)    # min, max, step (MHz)
+GPU_RANGE = (600, 1100, 10)                          # Pi 5 3D GPU
 
 
 def custom_empty():
-    return {"desc": "Empty: click to choose CPU and GPU speed, fan and governor.",
-            "governor": "ondemand", "max_freq_mhz": 2400, "color": CUSTOM_COLOR,
+    what = ", ".join(x for x, ok in (("CPU speed", True), ("GPU speed", BOARD["gpu"]),
+                                      ("fan", BOARD["fan"])) if ok)
+    return {"desc": f"Empty: click to choose {what} and governor.",
+            "governor": "ondemand", "max_freq_mhz": BOARD["top"], "color": CUSTOM_COLOR,
             "fan": list(FAN_PROFILES["Default"]), "empty": True}
 
 
@@ -702,6 +758,15 @@ class Battery:
         return {"state": state, "eta": eta, "charging": charging, "on_battery": on_battery}
 
 
+def ups_status():
+    """(found, why): is an X120x UPS here? It fits only the Raspberry Pi 5; its fuel
+    gauge must answer on I2C."""
+    if not BOARD["ups"]:
+        return False, "no X120x UPS: it fits only the Raspberry Pi 5"
+    b = Battery().read()
+    return (True, "") if b["ok"] else (False, b["error"])
+
+
 def battery_line(b):
     if not b["ok"]:
         return b["error"]
@@ -802,6 +867,9 @@ def set_plan_fan(name, profile):
     plan = find_plan(name)
     if not plan:
         raise ValueError(f"Unknown plan '{name}'")
+    if not BOARD["fan"]:
+        raise ValueError("This Raspberry Pi has no fan control (only the Pi 5 has the fan "
+                         "connector)")
     if profile not in FAN_PROFILES:
         raise ValueError(f"Unknown fan profile '{profile}'. Options: {', '.join(FAN_PROFILES)}")
     try:
@@ -860,9 +928,13 @@ def file_sha(path):
         return None
 
 
-def custom_desc(cpu, ovd, gpu):
-    return (f"Yours: CPU {cpu / 1000:.1f} GHz" + (f" +{ovd / 1e6:.3g} V" if ovd else "")
-            + f", GPU {gpu} MHz" + (" (default)" if gpu == V3D_DEFAULT else "") + ".")
+def custom_desc(cpu, volt, gpu):
+    text = f"Yours: CPU {_speed(cpu)}"
+    if volt:
+        text += " " + dict(CUSTOM_VOLTAGES)[volt]
+    if BOARD["gpu"]:
+        text += f", GPU {gpu} MHz" + (" (default)" if gpu == V3D_DEFAULT else "")
+    return text + "."
 
 
 def validate_custom(c):
@@ -877,30 +949,40 @@ def validate_custom(c):
         if not lo <= v <= hi or (v - lo) % step:
             raise ValueError(f"{what}: {lo}-{hi} MHz in steps of {step}")
         return v
-    cpu = num("max_freq_mhz", 2400, *CPU_RANGE, "CPU speed")
-    gpu = num("v3d_freq", V3D_DEFAULT, *GPU_RANGE, "GPU speed")
-    ovd = c.get("over_voltage_delta", 0)
-    if ovd not in [v for v, _ in CUSTOM_VOLTAGES]:
-        raise ValueError("Extra voltage: 0, 25000 or 50000 (µV)")
+    cpu = num("max_freq_mhz", BOARD["top"], *CPU_RANGE, "CPU speed")
+    if BOARD["gpu"]:
+        gpu = num("v3d_freq", V3D_DEFAULT, *GPU_RANGE, "GPU speed")
+    elif c.get("v3d_freq", V3D_DEFAULT) != V3D_DEFAULT:
+        raise ValueError("GPU speed: only the Raspberry Pi 5 has this setting")
+    else:
+        gpu = V3D_DEFAULT
+    other = {"over_voltage_delta", "over_voltage"} - {VOLT_KEY}
+    if any(c.get(k) for k in other):
+        raise ValueError(f"Extra voltage: on this Raspberry Pi use {VOLT_KEY or 'nothing'}")
+    volt = c.get(VOLT_KEY, 0) if VOLT_KEY else 0
+    if volt not in [v for v, _ in CUSTOM_VOLTAGES]:
+        raise ValueError("Extra voltage: one of " +
+                         ", ".join(str(v) for v, _ in CUSTOM_VOLTAGES) + f" ({VOLT_KEY})")
     fan = c.get("fan_profile", "Default")
     if fan not in FAN_PROFILES:
         raise ValueError(f"Fan profile: one of {', '.join(FAN_PROFILES)}")
     gov = c.get("governor", "ondemand")
     if gov not in GOV_INFO:
         raise ValueError(f"Governor: one of {', '.join(GOV_INFO)}")
-    return {"max_freq_mhz": cpu, "v3d_freq": gpu, "over_voltage_delta": ovd,
+    return {"max_freq_mhz": cpu, "v3d_freq": gpu, "volt": volt,
             "fan_profile": fan, "governor": gov}
 
 
 def set_custom(c, reapply=True):
     """Save the Custom plan (root). If it's the plan in use, apply it again."""
     c = validate_custom(c)
-    cpu, gpu, ovd = c["max_freq_mhz"], c["v3d_freq"], c["over_voltage_delta"]
-    plan = {"desc": custom_desc(cpu, ovd, gpu), "governor": c["governor"],
+    cpu, gpu, volt = c["max_freq_mhz"], c["v3d_freq"], c["volt"]
+    plan = {"desc": custom_desc(cpu, volt, gpu), "governor": c["governor"],
             "max_freq_mhz": cpu, "fan": FAN_PROFILES[c["fan_profile"]],
-            "color": CUSTOM_COLOR, "warn": cpu > 2400 or ovd > 0 or gpu > V3D_DEFAULT}
-    if ovd:
-        plan["over_voltage_delta"] = ovd
+            "color": CUSTOM_COLOR,
+            "warn": cpu > BOARD["top"] or volt > 0 or gpu > V3D_DEFAULT}
+    if volt:
+        plan[VOLT_KEY] = volt
     if gpu != V3D_DEFAULT:          # the default writes no line at all
         plan["v3d_freq"] = gpu
     try:
@@ -920,8 +1002,10 @@ def set_custom(c, reapply=True):
             write_json_atomic(path, over)
     reload_plan_settings()
     msgs = [f"Custom plan saved: CPU {cpu} MHz"
-            + (f" +{ovd // 1000} mV" if ovd else "") + f", GPU {gpu} MHz, "
-            f"{c['fan_profile']} fan, {c['governor']} governor"]
+            + (" " + dict(CUSTOM_VOLTAGES)[volt] if volt else "")
+            + (f", GPU {gpu} MHz" if BOARD["gpu"] else "")
+            + (f", {c['fan_profile']} fan" if BOARD["fan"] else "")
+            + f", {c['governor']} governor"]
     if reapply and find_plan(saved_plan() or "") == CUSTOM:
         if saver_active():
             write_config(CUSTOM)
@@ -1165,6 +1249,7 @@ def battery_guard():
     bat = Battery()
     charging, low_count, pending, outage_since = None, 0, None, None
     blind_since, gauge_ok, ac = None, True, None
+    ups_seen = False  # pins and UPS shutdowns only once the fuel gauge has answered
     saver = None  # name of the saver plan while it's active
     saver_count = 0   # readings in a row that want the saver (a glitch isn't enough)
     volt_high = False
@@ -1175,7 +1260,11 @@ def battery_guard():
             log(f"Removed charge-pin data learned by an older version: {old}")
         except OSError:
             pass
-    set_charging(True)  # start from a charging state; the limit logic decides next
+    if not BOARD["ups"]:
+        log(f"Battery guard: {BOARD['model']} has no X120x UPS (it fits only the "
+            "Raspberry Pi 5): nothing to do")
+        while True:              # stay idle instead of being restarted over and over
+            time.sleep(3600)
     if os.path.exists("/run/systemd/shutdown/scheduled"):  # survived a restart
         pending = {"reason": "shutdown already scheduled", "at": None}
 
@@ -1192,6 +1281,10 @@ def battery_guard():
             cfg = load_battery_cfg()
             b = bat.read()
             now = time.time()
+            if b["ok"] and not ups_seen:
+                ups_seen = True
+                set_charging(True)   # start charging; the limit logic decides next
+                log("UPS found")
 
             # Battery saver: switch to a low-power plan on battery below the limit;
             # stay in it until the power comes back (no flip-flopping).
@@ -1227,8 +1320,9 @@ def battery_guard():
                 topup = None
             limit = 100 if topup is not None else cfg["max"]
 
-            # GPIO 6 still works when the fuel gauge doesn't answer on I2C
-            ac = b["ac"] if b["ok"] else read_pld()
+            # GPIO 6 still works when the fuel gauge doesn't answer on I2C. Without a
+            # UPS seen at all, GPIO 6 means nothing (it may just read low): ignore it.
+            ac = b["ac"] if b["ok"] else (read_pld() if ups_seen else None)
             soc, volt = (b["soc"], b["volt"]) if b["ok"] else (None, None)
             if b["ok"] != gauge_ok:
                 log("UPS fuel gauge answering again" if b["ok"] else
@@ -1237,7 +1331,8 @@ def battery_guard():
 
             if not cfg["enabled"]:
                 tick += 1
-                if (charging is not True or tick % 10 == 0) and set_charging(True):
+                if ups_seen and (charging is not True or tick % 10 == 0) and \
+                        set_charging(True):
                     if charging is False:
                         log("Protection off: charging allowed again")
                     charging = True
@@ -1312,7 +1407,8 @@ def battery_guard():
             time.sleep(REFRESH_MS / 1000)
     finally:
         _charge_check.probe = None
-        set_charging(True)  # never leave charging switched off when the guard stops
+        if ups_seen:
+            set_charging(True)  # never leave charging switched off when the guard stops
         if saver:
             restore_plan()
 
@@ -1333,6 +1429,9 @@ WantedBy=multi-user.target
 
 
 def apply_ups_config(new):
+    found, why = ups_status()
+    if not found:
+        raise RuntimeError(f"No X120x UPS found ({why}). Battery features need it.")
     old = load_battery_cfg()
     cfg = validate_battery_cfg({**old, **new})   # keys left out keep their value
     write_json_atomic(BATTERY_CFG, cfg)
@@ -1432,6 +1531,11 @@ def eeprom_setup(halt_only=False):
     Writes nothing when they are already set."""
     if not is_pi5():
         raise RuntimeError("these bootloader settings are for the Raspberry Pi 5")
+    if not halt_only:
+        found, why = ups_status()
+        if not found:   # PSU_MAX_CURRENT=5000 on a 3 A supply would let USB draw too much
+            raise RuntimeError(f"no X120x UPS found ({why}): PSU_MAX_CURRENT=5000 is only "
+                               "for a 5 A supply like the UPS, so nothing was changed")
     if not shutil.which("rpi-eeprom-config"):
         raise RuntimeError("rpi-eeprom-config not found: sudo apt install rpi-eeprom")
     cur = subprocess.run(["rpi-eeprom-config"], capture_output=True, text=True,
@@ -1655,20 +1759,28 @@ def restart_tray():
 #  Applying a plan (root needed)
 # --------------------------------------------------------------------------- #
 def build_block(name, p=None):
+    """The plan's lines for config.txt, under this board's own filter (e.g. [pi4]), so
+    if the SD card goes into another Raspberry Pi model they're not used there."""
     p = p or PLANS[name]
-    lines = [BLOCK_START, f"# plan: {name}", "[all]"]
-    for i, (temp, hyst, speed) in enumerate(p["fan"]):
-        lines += [
-            f"dtparam=fan_temp{i}={int(temp * 1000)}",
-            f"dtparam=fan_temp{i}_hyst={int(hyst * 1000)}",
-            f"dtparam=fan_temp{i}_speed={int(speed)}",
-        ]
+    flt = BOARD["filter"]
+    lines = [BLOCK_START, f"# plan: {name}", f"[{flt or 'all'}]"]
+    if BOARD["fan"]:                        # the Pi 5 fan connector's curve
+        for i, (temp, hyst, speed) in enumerate(p["fan"]):
+            lines += [
+                f"dtparam=fan_temp{i}={int(temp * 1000)}",
+                f"dtparam=fan_temp{i}_hyst={int(hyst * 1000)}",
+                f"dtparam=fan_temp{i}_speed={int(speed)}",
+            ]
     lines.append(f"arm_freq={p['max_freq_mhz']}")
-    if p.get("over_voltage_delta"):
-        lines.append(f"over_voltage_delta={int(p['over_voltage_delta'])}")
-    for key in ("gpu_freq", "v3d_freq"):   # gpu_freq: older custom plans may use it
+    for key in ("over_voltage_delta", "over_voltage"):
         if p.get(key):
             lines.append(f"{key}={int(p[key])}")
+    if BOARD["gpu"]:
+        for key in ("gpu_freq", "v3d_freq"):   # gpu_freq: older custom plans may use it
+            if p.get(key):
+                lines.append(f"{key}={int(p[key])}")
+    if flt:
+        lines.append("[all]")               # what comes after applies to every model
     lines.append(BLOCK_END)
     return "\n".join(lines) + "\n"
 
@@ -1698,13 +1810,13 @@ def write_config(name, p=None, target=None):
     if target == path:
         text = repair_moved_lines(text, read(backup, "") or "", path)
 
-    # Comment out fan/arm_freq lines elsewhere in [all]/[pi5] so ours win cleanly
+    # Comment out fan/arm_freq lines elsewhere in [all] / this model's section so ours win
     out, section, seen_disabled = [], "all", set()
     for line in text.splitlines():
         s = line.strip()
         if s.startswith("[") and s.endswith("]"):
             section = s[1:-1].strip().lower()
-        if CONFLICT_RE.match(line) and section in ("all", "pi5"):
+        if CONFLICT_RE.match(line) and section in ("all", BOARD["filter"]):
             line = "#energyplan-disabled# " + line.strip()
         if line.startswith("#energyplan-disabled#"):
             if (section, line) in seen_disabled:   # same old line twice: keep one
@@ -1755,7 +1867,7 @@ def repair_moved_lines(text, backup, path):
     under [all]. Lines already there before the first change are never moved."""
     secs = sections(text.splitlines())
     header, body = secs[-1]
-    if header in (None, "[all]", "[pi5]"):
+    if header in (None, "[all]", f"[{BOARD['filter']}]"):
         return text
 
     def content(lines):
@@ -1847,7 +1959,10 @@ def apply_live(name, by="plan"):
     except OSError:
         pass
 
-    if set_trip_points(p["fan"]):
+    if not BOARD["fan"]:
+        msgs.append("Fan: this Raspberry Pi has no fan control (only the Pi 5 has the fan "
+                    "connector)")
+    elif set_trip_points(p["fan"]):
         msgs.append("Fan temps: applied now (new speeds after reboot)")
     else:
         msgs.append("Fan temps: kernel doesn't allow live change, applies after reboot")
@@ -2513,6 +2628,7 @@ class App:
         self.result = None
         self.save_var = tk.BooleanVar(value=True)
         self.battery = Battery()
+        self.ups_found, self.ups_why = ups_status()
         self.root.report_callback_exception = self._show_error
         self._build()
         self.refresh()
@@ -2608,9 +2724,16 @@ class App:
         return tk.Label(parent, text=text, bg=parent["bg"], fg=color, font=font, **kw)
 
     def _build(self):
-        pad = {"padx": 14, "pady": 6}
         body, foot = make_scrollable(self.root, footer=True)
-        self._label(body, "Pi 5 Energy Plan", 15, bold=True).pack(anchor="w", **pad)
+        self._label(body, "Pi 5 Energy Plan", 15, bold=True).pack(anchor="w", padx=14,
+                                                                   pady=(6, 0))
+        about = [BOARD["model"]]
+        if not BOARD["fan"]:
+            about.append("no fan control")
+        if not BOARD["ups"]:
+            about.append("no UPS")
+        self._label(body, "  ·  ".join(about), 8, MUTED, wraplength=440,
+                    justify="left").pack(anchor="w", padx=14, pady=(0, 6))
 
         # Live stats card
         card = tk.Frame(body, bg=CARD, padx=12, pady=10)
@@ -2619,14 +2742,28 @@ class App:
         self.temp_lbl.grid(row=0, column=0, rowspan=6, sticky="w", padx=(0, 18))
 
         self.stat = {}
-        for r, key in enumerate(("Fan", "CPU", "Governor", "Power", "Saved plan",
-                                 "Sweet spot")):
+        rows = (("Fan",) if BOARD["fan"] else ()) + \
+            ("CPU", "Governor", "Power", "Saved plan") + \
+            (("Sweet spot",) if BOARD["autotest"] else ())
+        for r, key in enumerate(rows):
             self._label(card, key, 9, MUTED).grid(row=r, column=1, sticky="w")
             v = self._label(card, "…", 10)
             v.grid(row=r, column=2, sticky="w", padx=(8, 0))
             self.stat[key] = v
 
-        # Battery card (Geekworm X120x UPS)
+        # Battery card (Geekworm X120x UPS): only with the UPS; on a Pi 5 without it,
+        # one line saying why (e.g. I2C is off)
+        if not self.ups_found:
+            if BOARD["ups"]:
+                note = tk.Frame(body, bg=CARD, padx=12, pady=6)
+                note.pack(fill="x", padx=14, pady=(6, 0))
+                self._label(note, f"No X120x UPS found: {self.ups_why}", 9, MUTED,
+                            wraplength=420, justify="left").pack(anchor="w")
+        else:
+            self._build_battery_card(body)
+        self._build_rest(body, foot)
+
+    def _build_battery_card(self, body):
         bcard = tk.Frame(body, bg=CARD, padx=12, pady=8)
         bcard.pack(fill="x", padx=14, pady=(6, 0))
         self.bat_pct = self._label(bcard, "--%", 22, bold=True)
@@ -2650,6 +2787,7 @@ class App:
         self.bat_banner.grid(row=4, column=0, columnspan=3, sticky="we", pady=(6, 0))
         self.bat_banner.grid_remove()
 
+    def _build_rest(self, body, foot):
         self.canvas = tk.Canvas(body, width=440, height=70, bg=CARD,
                                 highlightthickness=0)
         self.canvas.pack(padx=14, pady=(6, 4))
@@ -2657,7 +2795,7 @@ class App:
         # Plan buttons
         plans = tk.Frame(body, bg=BG)
         plans.pack(fill="x", padx=14, pady=4)
-        for c, head in enumerate(("Plan", "Governor", "Fan", "")):
+        for c, head in enumerate(("Plan", "Governor", "Fan" if BOARD["fan"] else "", "")):
             self._label(plans, head, 8, MUTED).grid(row=0, column=c, sticky="w",
                                                     padx=(0 if c == 0 else 8, 0))
         self.gov_vars, self.fan_vars, self.desc_labels = {}, {}, {}
@@ -2679,13 +2817,15 @@ class App:
                 current=PLANS[n]["governor"])).grid(row=r, column=1, sticky="w", padx=8)
             self.gov_vars[name] = var
 
-            fvar = tk.StringVar(value=fan_profile_of(p["fan"]))
-            self.picker_button(plans, fvar, 8, lambda btn, n=name: self.choose(
-                f"{n}: fan profile",
-                [(f, f"{f}  ·  {fan_profile_info(f)}") for f in FAN_PROFILES],
-                lambda f, n=n: self.on_fan(n, f), anchor=btn,
-                current=fan_profile_of(PLANS[n]["fan"]))).grid(row=r, column=2, sticky="w")
-            self.fan_vars[name] = fvar
+            if BOARD["fan"]:
+                fvar = tk.StringVar(value=fan_profile_of(p["fan"]))
+                self.picker_button(plans, fvar, 8, lambda btn, n=name: self.choose(
+                    f"{n}: fan profile",
+                    [(f, f"{f}  ·  {fan_profile_info(f)}") for f in FAN_PROFILES],
+                    lambda f, n=n: self.on_fan(n, f), anchor=btn,
+                    current=fan_profile_of(PLANS[n]["fan"]))).grid(row=r, column=2,
+                                                                   sticky="w")
+                self.fan_vars[name] = fvar
 
             cell = tk.Frame(plans, bg=BG)
             cell.grid(row=r, column=3, sticky="w", padx=(8, 0))
@@ -2709,9 +2849,12 @@ class App:
 
         bottom = tk.Frame(foot, bg=BG)
         bottom.pack(fill="x", padx=14, pady=(0, 12))
-        for text, cmd in (("Quit", self.root.destroy), ("Reboot now", self.on_reboot),
-                          ("Find sweet spot…", self.on_autotest),
-                          ("Battery in panel", self.on_tray)):
+        actions = [("Quit", self.root.destroy), ("Reboot now", self.on_reboot)]
+        if BOARD["autotest"]:
+            actions.append(("Find sweet spot…", self.on_autotest))
+        if self.ups_found:
+            actions.append(("Battery in panel", self.on_tray))
+        for text, cmd in actions:
             tk.Button(bottom, text=text, command=cmd, relief="flat", bg=CARD, fg=FG,
                       activebackground="#444", activeforeground=FG,
                       font=("DejaVu Sans", 9)).pack(side="right", padx=(6, 0), ipadx=6)
@@ -2722,7 +2865,8 @@ class App:
         t = s["temp"]
         self.temp_lbl.config(text=f"{t:.1f} °C" if t is not None else "--.- °C",
                              fg=temp_color(t))
-        self.stat["Fan"].config(text=fmt_fan(s))
+        if "Fan" in self.stat:
+            self.stat["Fan"].config(text=fmt_fan(s))
         self.stat["CPU"].config(text=fmt_freq(s))
         gov = s["governor"] or "?"
         src = governor_source(gov)
@@ -2733,9 +2877,10 @@ class App:
         thr = s["throttled"] or "?"
         self.stat["Power"].config(text=thr, fg="#ef5350" if thr.startswith("NOW") else FG)
         self.stat["Saved plan"].config(text=s["plan"] or f"none ({DEFAULT_PLAN} at boot)")
-        sweet = autotest_summary()
-        self.stat["Sweet spot"].config(text=sweet, fg="#ffa726" if sweet.startswith(
-            "TESTING") else "#ef5350" if sweet.startswith("error") else FG)
+        sweet = autotest_summary() if "Sweet spot" in self.stat else ""
+        if sweet:
+            self.stat["Sweet spot"].config(text=sweet, fg="#ffa726" if sweet.startswith(
+                "TESTING") else "#ef5350" if sweet.startswith("error") else FG)
         if sweet.startswith("TESTING") and not getattr(self, "stuck_asked", False) \
                 and not self.busy and autotest_stuck():
             self.stuck_asked = True
@@ -2769,6 +2914,8 @@ class App:
         self.root.after(200, self.poll_result)
 
     def update_battery(self):
+        if not self.ups_found:
+            return
         b = self.battery.read()
         self.bat_bar.delete("all")
         if not b["ok"]:
@@ -3176,13 +3323,14 @@ class App:
         vcpu = tk.IntVar(value=p["max_freq_mhz"])
         vgpu = tk.IntVar(value=V3D_DEFAULT if empty else p.get("v3d_freq", V3D_DEFAULT))
         volt_lbl = dict(CUSTOM_VOLTAGES)
-        vvolt = tk.StringVar(value=volt_lbl.get(p.get("over_voltage_delta", 0), "None"))
+        vvolt = tk.StringVar(value=volt_lbl.get(p.get(VOLT_KEY, 0) if VOLT_KEY else 0,
+                                                "None"))
         vfan = tk.StringVar(value=fan_profile_of(p["fan"]) if not empty else "Default")
         vgov = tk.StringVar(value=p["governor"])
 
         self._label(win, "Custom plan", 13, bold=True).pack(anchor="w")
-        self._label(win, "Choose the speeds, fan and governor. Speeds and the GPU change after "
-                         "a reboot; governor and fan start right away.", 9, MUTED,
+        self._label(win, "Choose the speed and governor. Speeds change after a reboot; the "
+                         "governor (and fan) start right away.", 9, MUTED,
                     wraplength=380, justify="left").pack(anchor="w", pady=(2, 6))
 
         def slider(title, var, rng, fmt, hint):
@@ -3209,39 +3357,52 @@ class App:
                                lambda btn: self.choose(title, options, var.set, anchor=btn,
                                                        current=var.get())).pack(side="right")
 
-        show_cpu = slider("CPU max speed", vcpu, CPU_RANGE, lambda v: f"{v / 1000:.1f} GHz",
-                          "2.4 GHz = the Pi 5's normal top speed. Above it is an overclock.")
-        picker("Extra CPU voltage", vvolt, [(lbl, lbl) for _, lbl in CUSTOM_VOLTAGES])
-        show_gpu = slider("GPU (3D) speed", vgpu, GPU_RANGE,
-                          lambda v: f"{v} MHz" + (" · default" if v == V3D_DEFAULT else ""),
-                          "960 MHz = default. Lower saves power, higher is a GPU overclock.")
-        picker("Fan profile", vfan, [(f, f"{f}  ·  {fan_profile_info(f)}")
-                                     for f in FAN_PROFILES])
+        top_speed = _speed(BOARD["top"])
+        show_cpu = slider("CPU max speed", vcpu, CPU_RANGE, _speed,
+                          f"{top_speed} = this Pi's normal top speed." +
+                          (" Above it is an overclock." if BOARD["oc_top"] > BOARD["top"]
+                           else " This model isn't overclocked here."))
+        if len(CUSTOM_VOLTAGES) > 1:
+            picker("Extra CPU voltage", vvolt, [(lbl, lbl) for _, lbl in CUSTOM_VOLTAGES])
+        show_gpu = lambda: None   # noqa: E731
+        if BOARD["gpu"]:
+            show_gpu = slider("GPU (3D) speed", vgpu, GPU_RANGE,
+                              lambda v: f"{v} MHz" + (" · default" if v == V3D_DEFAULT else ""),
+                              "960 MHz = default. Lower saves power, higher is a GPU "
+                              "overclock.")
+        if BOARD["fan"]:
+            picker("Fan profile", vfan, [(f, f"{f}  ·  {fan_profile_info(f)}")
+                                         for f in FAN_PROFILES])
         picker("CPU governor", vgov, [(g, f"{g}  ·  {GOV_INFO[g]}")
                                       for g in available_governors()])
         note = self._label(win, "", 9, "#ffa726", wraplength=380, justify="left")
         note.pack(anchor="w", pady=(10, 0))
 
         def settings():
-            return {"max_freq_mhz": vcpu.get(), "v3d_freq": vgpu.get(),
-                    "over_voltage_delta": [v for v, lbl in CUSTOM_VOLTAGES
-                                           if lbl == vvolt.get()][0],
-                    "fan_profile": vfan.get(), "governor": vgov.get()}
+            c = {"max_freq_mhz": vcpu.get(), "v3d_freq": vgpu.get(),
+                 "fan_profile": vfan.get(), "governor": vgov.get()}
+            if VOLT_KEY:
+                c[VOLT_KEY] = [v for v, lbl in CUSTOM_VOLTAGES if lbl == vvolt.get()][0]
+            return c
+
+        def volt_of(c):
+            return c.get(VOLT_KEY, 0) if VOLT_KEY else 0
 
         def refresh(*_):
             show_cpu()
             show_gpu()
             c = settings()
             warn = []
-            if c["max_freq_mhz"] > 2400 or c["v3d_freq"] > V3D_DEFAULT or \
-                    c["over_voltage_delta"]:
-                warn.append("Overclock: use the official 27 W power supply and the Active "
-                            "Cooler. If it doesn't boot, remove the 'pi5-energyplan' block "
-                            "from config.txt on another computer.")
-            if c["max_freq_mhz"] >= 2800 and not c["over_voltage_delta"]:
-                warn.append("2.8 GHz and more usually need extra voltage.")
-            if c["over_voltage_delta"] and c["max_freq_mhz"] <= 2400:
-                warn.append("Extra voltage only makes the Pi warmer at 2.4 GHz or less.")
+            top = BOARD["top"]
+            if c["max_freq_mhz"] > top or c["v3d_freq"] > V3D_DEFAULT or volt_of(c):
+                warn.append("Overclock: use the official power supply and a fan. If it "
+                            "doesn't boot, remove the 'pi5-energyplan' block from config.txt "
+                            "on another computer.")
+            if c["max_freq_mhz"] >= top + 400 and not volt_of(c):
+                warn.append(f"{_speed(top + 400)} and more usually need extra voltage.")
+            if volt_of(c) and c["max_freq_mhz"] <= top:
+                warn.append(f"Extra voltage only makes the Pi warmer at {_speed(top)} or "
+                            "less.")
             note.config(text="\n".join(warn))
         for v in (vvolt, vfan, vgov):
             v.trace_add("write", refresh)
@@ -3249,8 +3410,8 @@ class App:
 
         def save(use):
             c = settings()
-            overclock = c["max_freq_mhz"] > 2400 or c["v3d_freq"] > V3D_DEFAULT or \
-                c["over_voltage_delta"]
+            overclock = c["max_freq_mhz"] > BOARD["top"] or c["v3d_freq"] > V3D_DEFAULT or \
+                volt_of(c)
             if self.blocked("the plan" if use else "the Custom plan",
                             lock_during_test=use):
                 return
@@ -3440,7 +3601,11 @@ def install_desktop():
     and panel icon pointing at this copy (each always the same single file)."""
     msgs = refresh_old_copies()
     install_launcher()
-    install_tray()
+    found, why = ups_status()
+    if found:
+        install_tray()
+    else:
+        msgs.append(f"Battery icon not added: {why}")
     return msgs
 
 
@@ -3650,20 +3815,197 @@ def charge_debug():
           or "(none, try with sudo)")
 
 
+# --------------------------------------------------------------------------- #
+#  Slow storage (SD card, USB 2): keep more in RAM, but only with RAM to spare,
+#  so a 512 MB / 1 GB board is never made slower.
+# --------------------------------------------------------------------------- #
+MEMINFO, SWAPS = "/proc/meminfo", "/proc/swaps"
+RAM_MIN_MB = 1500       # 2 GB boards report ~1.8-1.9 GB; 1 GB boards ~0.9 GB
+SYSCTL_FILE = "/etc/sysctl.d/90-pi5-energyplan.conf"
+TMP_MOUNT = "/etc/systemd/system/tmp.mount"
+NO_STORAGE_TUNE = "/etc/pi5-energyplan/no-storage-tuning"
+STORAGE_MARK = "# pi5-energyplan"
+TMP_MOUNT_UNIT = """# pi5-energyplan: /tmp in RAM (slow storage, RAM to spare). Undo with:
+#   sudo pi5_energyplan.py --storage-tune off
+[Unit]
+Description=Temporary Directory /tmp
+ConditionPathIsSymbolicLink=!/tmp
+DefaultDependencies=no
+Conflicts=umount.target
+Before=local-fs.target umount.target
+After=swap.target
+
+[Mount]
+What=tmpfs
+Where=/tmp
+Type=tmpfs
+Options=mode=1777,strictatime,nosuid,nodev,size=50%%,nr_inodes=1m
+
+[Install]
+WantedBy=local-fs.target
+"""
+
+
+def findmnt(target, field):
+    try:
+        return subprocess.run(["findmnt", "-n", "-o", field, target], capture_output=True,
+                              text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def root_storage():
+    """(what, slow) for the disk the system runs from."""
+    src = findmnt("/", "SOURCE")
+    dev = os.path.basename(os.path.realpath(src)) if src.startswith("/dev/") else ""
+    if not dev:
+        return (src or "unknown"), False
+    node = os.path.realpath(f"/sys/class/block/{dev}")
+    disk = os.path.basename(os.path.dirname(node)) \
+        if os.path.exists(f"/sys/class/block/{dev}/partition") else dev
+    if disk.startswith("mmcblk"):
+        if read(f"/sys/block/{disk}/device/type") == "MMC":
+            return "eMMC", False
+        return "SD card", True
+    if disk.startswith("nvme"):
+        return "NVMe SSD", False
+    if disk.startswith("sd"):
+        path = os.path.realpath(f"/sys/block/{disk}/device")
+        while path not in ("/", ""):
+            speed = as_int(read(path + "/speed"))
+            if speed:
+                return ("USB 2 drive", True) if speed <= 480 else ("USB 3 drive", False)
+            path = os.path.dirname(path)
+        return "USB / SATA drive", False
+    return disk, False
+
+
+def mem_total_mb():
+    m = re.search(r"MemTotal:\s+(\d+)", read(MEMINFO, "") or "")
+    return int(m.group(1)) // 1024 if m else 0
+
+
+def swap_kind():
+    """'zram' if swap starts in RAM (Trixie's rpi-swap), 'file' / 'partition' if
+    it's on the disk, 'none'."""
+    names = [line.split()[0] for line in (read(SWAPS, "") or "").splitlines()[1:]
+             if line.split()]
+    if any("zram" in n for n in names):
+        return "zram"
+    if names:
+        return "file" if not names[0].startswith("/dev/") else "partition"
+    return "none"
+
+
+def storage_plan():
+    what, slow = root_storage()
+    ram = mem_total_mb()
+    swap = swap_kind()
+    tmp_ram = findmnt("/tmp", "FSTYPE") == "tmpfs"
+    plan = {"what": what, "slow": slow, "ram": ram, "swap": swap, "tmp_ram": tmp_ram,
+            "tune": False, "sysctl": {}, "tmp": False, "why": ""}
+    if not slow:
+        plan["why"] = f"{what}: fast enough, nothing to change"
+    elif ram < RAM_MIN_MB:
+        plan["why"] = (f"{what} is slow, but with only {ram} MB of RAM keeping more in "
+                       "RAM would make it slower: nothing changed")
+    else:
+        plan["tune"] = True
+        plan["sysctl"]["vm.vfs_cache_pressure"] = 50     # keep the file cache longer
+        if swap in ("file", "partition"):                # zram is RAM already
+            plan["sysctl"]["vm.swappiness"] = 10
+        plan["tmp"] = not tmp_ram or STORAGE_MARK in (read(TMP_MOUNT, "") or "")
+    return plan
+
+
+def storage_line():
+    p = storage_plan()
+    tuned = os.path.exists(SYSCTL_FILE)
+    ram = f"{p['ram'] / 1024:.1f} GB RAM" if p["ram"] >= 1024 else f"{p['ram']} MB RAM"
+    text = f"{p['what']}{' (slow)' if p['slow'] else ''} · {ram} · swap: {p['swap']}"
+    if tuned:
+        kept = ["file cache"] + (["/tmp"] if p["tmp_ram"] or p["tmp"] else []) + \
+            (["swap only when needed"] if "vm.swappiness = 10" in
+             (read(SYSCTL_FILE, "") or "") else [])
+        return text + " · kept in RAM: " + ", ".join(kept)
+    if os.path.exists(NO_STORAGE_TUNE):
+        return text + " · tuning off"
+    return text + ("" if p["tune"] else " · not tuned")
+
+
+def storage_tune(mode="auto"):
+    """auto: tune if the storage is slow and there's RAM to spare (installs call this;
+    respects 'off'). on: same, and forget an earlier 'off'. off: undo and remember.
+    undo: undo only (uninstall)."""
+    msgs = []
+    if mode in ("off", "undo"):
+        changed = False
+        if os.path.exists(SYSCTL_FILE):
+            os.remove(SYSCTL_FILE)
+            subprocess.run(["sysctl", "--system"], capture_output=True)   # distro values
+            changed = True
+        if STORAGE_MARK in (read(TMP_MOUNT, "") or ""):
+            subprocess.run(["systemctl", "disable", "tmp.mount"], capture_output=True)
+            os.remove(TMP_MOUNT)
+            subprocess.run(["systemctl", "daemon-reload"], capture_output=True)
+            changed = True
+        if mode == "off":
+            os.makedirs(os.path.dirname(NO_STORAGE_TUNE), exist_ok=True)
+            write(NO_STORAGE_TUNE, "storage tuning turned off; --storage-tune on to use it\n")
+        return ["Storage tuning removed" + (" (/tmp back on disk after a reboot)"
+                                            if changed else ": nothing was tuned")]
+    if mode == "auto" and os.path.exists(NO_STORAGE_TUNE):
+        return ["Storage tuning is off (turn it on with: --storage-tune on)"]
+    if mode == "on" and os.path.exists(NO_STORAGE_TUNE):
+        os.remove(NO_STORAGE_TUNE)
+    p = storage_plan()
+    if not p["tune"]:
+        return [p["why"]] + (storage_tune("undo") if os.path.exists(SYSCTL_FILE) else [])
+    body = (f"{STORAGE_MARK}: the system runs from slow storage ({p['what']}) and has "
+            f"RAM to spare ({p['ram']} MB),\n# so keep more in RAM. Undo with: "
+            "sudo pi5_energyplan.py --storage-tune off\n" +
+            "".join(f"{k} = {v}\n" for k, v in p["sysctl"].items()))
+    if read(SYSCTL_FILE) != body.strip():
+        write(SYSCTL_FILE, body)
+        subprocess.run(["sysctl", "-p", SYSCTL_FILE], capture_output=True)
+    msgs.append(f"{p['what']} is slow and there are {p['ram']} MB of RAM: file cache kept "
+                "in RAM longer" + (", swap only when really needed"
+                                   if "vm.swappiness" in p["sysctl"] else
+                                   f" (swap is {p['swap']}: left as it is)"))
+    if p["tmp"] and read(TMP_MOUNT) != TMP_MOUNT_UNIT.strip():
+        if os.path.exists(TMP_MOUNT) and STORAGE_MARK not in (read(TMP_MOUNT, "") or ""):
+            msgs.append("/tmp: there's already a tmp.mount of your own, left as it is")
+        else:
+            write(TMP_MOUNT, TMP_MOUNT_UNIT)
+            subprocess.run(["systemctl", "daemon-reload"], capture_output=True)
+            subprocess.run(["systemctl", "enable", "tmp.mount"], capture_output=True)
+            msgs.append("/tmp in RAM from the next boot")
+    elif p["tmp_ram"]:
+        msgs.append("/tmp is already in RAM")
+    return msgs
+
+
 def print_status():
     s = get_status()
     t = s["temp"]
+    print(f"Board       : {BOARD['model']}" + ("" if BOARD["fan"] else " · no fan control")
+          + ("" if BOARD["ups"] else " · no UPS"))
     print(f"Temperature : {t:.1f} °C" if t is not None else "Temperature : ?")
-    print(f"Fan         : {fmt_fan(s)}")
+    print(f"Fan         : {fmt_fan(s) if BOARD['fan'] else 'no fan control on this model'}")
     print(f"CPU         : {fmt_freq(s)}")
     print(f"Governor    : {s['governor']} ({governor_source(s['governor'])})")
     gpu = gpu_clock_mhz()
-    print(f"GPU (3D)    : {f'{gpu} MHz' if gpu else '?'}")
+    if BOARD["gpu"]:
+        print(f"GPU (3D)    : {f'{gpu} MHz' if gpu else '?'}")
     print(f"Power       : {s['throttled']}")
     print(f"Saved plan  : {s['plan'] or f'none ({DEFAULT_PLAN} is used at boot)'}")
-    print(f"Sweet spot  : {autotest_summary()}")
-    print(f"Battery     : {battery_line(Battery().read())}")
-    print(f"Pi power    : {fmt_pmic(read_pmic())}")
+    if BOARD["autotest"]:
+        print(f"Sweet spot  : {autotest_summary()}")
+    found, why = ups_status()
+    print(f"Battery     : {battery_line(Battery().read()) if BOARD['ups'] else why}")
+    if BOARD["family"] == "pi5":
+        print(f"Pi power    : {fmt_pmic(read_pmic())}")
+    print(f"Storage     : {storage_line()}")
 
 
 def fmt_pmic(pm):
@@ -3781,6 +4123,10 @@ def main():
                     help="menu entry + panel icon, and update older copies they used")
     ap.add_argument("--refresh-desktop", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--version", action="store_true", help="print the version")
+    ap.add_argument("--storage-tune", choices=("auto", "on", "off", "undo"),
+                    help="slow storage (SD card, USB 2) + 2 GB RAM or more: keep more in "
+                         "RAM; off undoes it (sudo)")
+    ap.add_argument("--detect-sh", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--ups-config", metavar="JSON",
                     help='battery limits, e.g. \'{"enabled":true,"min":20,"max":80}\' (sudo)')
     ap.add_argument("--set-governor", nargs=2, metavar=("PLAN", "GOVERNOR"),
@@ -3912,6 +4258,19 @@ def main():
     if args.version:
         print(VERSION)
         return
+    if args.detect_sh:     # for install.sh: what this board has
+        import shlex
+        found, _ = ups_status()
+        for k, v in (("BOARD_MODEL", BOARD["model"]), ("BOARD_FAMILY", BOARD["family"]),
+                     ("HAS_FAN", int(BOARD["fan"])), ("HAS_UPS", int(found)),
+                     ("UPS_POSSIBLE", int(BOARD["ups"]))):
+            print(f"{k}={shlex.quote(str(v))}")
+        return
+    if args.storage_tune:
+        if os.geteuid() != 0:
+            sys.exit("Needs root: run with sudo")
+        print("\n".join(storage_tune(args.storage_tune)))
+        return
 
     if args.autotest_status:
         print(f"Sweet spot: {autotest_summary()}\n")
@@ -3973,7 +4332,8 @@ def main():
                 print(f"{name:12} (empty: fill it in the window, Custom → Edit…, or with "
                       "--set-custom)")
                 continue
-            print(f"{name:12} {p['governor']:12} fan {fan_profile_of(p['fan']):8} {p['desc']}")
+            fan = fan_profile_of(p["fan"]) if BOARD["fan"] else "-"
+            print(f"{name:12} {p['governor']:12} fan {fan:8} {p['desc']}")
         return
     if args.status:
         print_status()

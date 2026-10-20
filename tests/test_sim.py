@@ -141,6 +141,7 @@ def make_pi(governors="conservative ondemand userspace powersave performance sch
     for d in ("/sys/class", "/sys/devices/system/cpu", "/boot", "/etc/systemd/system",
               "/usr/local/bin", "/etc/pi5-energyplan", "/var/lib/pi5-energyplan",
               "/run/pi5-energyplan", "/sys/firmware", "/usr/share/pi5-energyplan",
+              "/sys/block", "/etc/sysctl.d",
               "/usr/share/doc/pi5-energyplan", "/usr/share/keyrings",
               "/etc/apt/sources.list.d", "/var/cache/pi5-energyplan", STATE):
         clear(d)
@@ -303,8 +304,8 @@ class TestPlans(Base):
         self.assertEqual(get("/boot/firmware/config.txt.energyplan.bak"),
                          STOCK_CONFIG.rstrip("\n"))
         block = cfg[cfg.index("# >>> pi5-energyplan"):]
-        self.assertIn("# plan: Cool\n[all]\ndtparam=fan_temp0=40000\n", block)
-        self.assertIn("dtparam=fan_temp3_speed=255\narm_freq=2400\n# <<<", block)
+        self.assertIn("# plan: Cool\n[pi5]\ndtparam=fan_temp0=40000\n", block)
+        self.assertIn("dtparam=fan_temp3_speed=255\narm_freq=2400\n[all]\n# <<<", block)
         # old values in [all]/[pi5] are commented out, [pi4] is left alone
         self.assertIn("#energyplan-disabled# arm_freq=2600", cfg)
         self.assertIn("#energyplan-disabled# dtparam=fan_temp0=45000", cfg)
@@ -642,7 +643,7 @@ class TestAutotest(Base):
         ep.start_autotest(1, 80)
         self.assertEqual(calls()[-1], "reboot 0 tryboot")
         self.assertEqual(self.config(), self.normal)     # config.txt never touched
-        self.assertIn("arm_freq=2600\n# <<<", self.tryboot())
+        self.assertIn("arm_freq=2600\n[all]\n# <<<", self.tryboot())
 
         self.results = [(True, "stable, ran at 2600 MHz", 61.0)]
         self.boot(True)                                   # 2600 +0 passes
@@ -796,12 +797,14 @@ class TestInstaller(Base):
         self.assertIn("WARNING: Geekworm UPS scripts are running", out)
         self.assertIn("merged-trixie.py", out)
 
-    def test_not_a_pi5_skips_bootloader(self):
+    def test_not_a_raspberry_pi(self):
         os.remove("/sys/firmware/devicetree/base/model")
         out = self.install()
         self.assertIn("doesn't look like a Raspberry Pi 5", out)
-        self.assertIn("skipped: Error: these bootloader settings are for the Raspberry Pi 5",
-                      out)
+        self.assertIn("Board: unknown (not a Raspberry Pi?)", out)
+        self.assertFalse(any(c.startswith(("rpi-eeprom-config", "raspi-config nonint do_i2c"))
+                             for c in calls()))
+        self.assertIn("Then pick a plan.", out)
 
     def test_rerun_updates_services(self):
         self.install()
@@ -833,13 +836,16 @@ class TestInstaller(Base):
     def test_desktop_user_part(self):
         user = os.environ["INSTALL_TEST_USER"]
         home = os.path.expanduser("~" + user)
-        self.install(user=user)
+        out = self.install(user=user)
         launcher = get(home + "/.local/share/applications/pi5-energyplan.desktop")
         self.assertIn("Exec=/usr/bin/python3 /usr/local/bin/pi5_energyplan.py", launcher)
-        tray = get(home + "/.config/autostart/pi5-battery-tray.desktop")
-        self.assertIn("/usr/local/bin/pi5_energyplan.py --tray", tray)
-        self.install("--uninstall", user=user)
+        # sudo drops the simulator's fake I2C library, so as that user no UPS is found:
+        # then there's no battery icon (on a Pi, the installed library finds the UPS)
+        self.assertIn("Battery icon not added: Missing I2C library", out)
         self.assertFalse(os.path.exists(home + "/.config/autostart/pi5-battery-tray.desktop"))
+        self.install("--uninstall", user=user)
+        self.assertFalse(os.path.exists(home + "/.local/share/applications/"
+                                        "pi5-energyplan.desktop"))
 
 
 class TestGeekwormFunctions(Base):
@@ -863,8 +869,8 @@ class TestGeekwormFunctions(Base):
         self.assertFalse(any(c.startswith("shutdown") for c in calls()))
 
     def test_gauge_lost_on_battery(self):
-        hw(ups=False, pld=0)          # fuel gauge silent, GPIO 6 says on battery
-        steps = [None] * 99 + [lambda: self.assertFalse(
+        hw(pld=0)                     # on battery; the gauge answers once, then goes silent
+        steps = [lambda: hw(ups=False)] + [None] * 99 + [lambda: self.assertFalse(
             any(c.startswith("shutdown -h") for c in calls()))] + [None]
         st = self.run_guard({"enabled": True}, steps)
         self.assertFalse(st["gauge_ok"])
@@ -874,11 +880,21 @@ class TestGeekwormFunctions(Base):
         self.assertIn("battery level can't be read", sd[0])
 
     def test_gauge_lost_outage_timer_still_works(self):
-        hw(ups=False, pld=0)
-        self.run_guard({"enabled": True, "outage_minutes": 1}, [None] * 21)
+        hw(pld=0)
+        self.run_guard({"enabled": True, "outage_minutes": 1},
+                       [lambda: hw(ups=False)] + [None] * 20)
         sd = [c for c in calls() if c.startswith("shutdown -h")]
         self.assertEqual(len(sd), 1)
         self.assertIn("power out for 1 minute", sd[0])
+
+    def test_pi5_without_the_ups_is_left_alone(self):
+        """No X1202: the gauge never answers and GPIO 6 may read low. The guard must
+        not shut down and must not touch GPIO 16."""
+        hw(ups=False, pld=0, pin16="op dl")       # GPIO 16 used by something else
+        self.run_guard({"enabled": True, "outage_minutes": 0.25, "saver_enabled": True},
+                       [None] * 150)
+        self.assertFalse(any(c.startswith(("shutdown", "pinctrl set")) for c in calls()))
+        self.assertEqual(hw()["pin16"], "op dl")
 
     def test_gauge_lost_on_mains_is_fine(self):
         hw(ups=False, pld=1)
@@ -1234,6 +1250,235 @@ class TestChargeTest(Base):
         self.assertEqual(hw()["pin16"], "ip pd")
 
 
+def as_board(model, top_khz, low_khz, fan=False, ups=False):
+    """Turn the simulated Pi 5 into another model."""
+    put("/sys/firmware/devicetree/base/model", model + "\x00")
+    put(CPUFREQ + "/cpuinfo_max_freq", top_khz)
+    put(CPUFREQ + "/cpuinfo_min_freq", low_khz)
+    put(CPUFREQ + "/scaling_max_freq", top_khz)
+    if not fan:
+        shutil.rmtree("/sys/class/thermal/cooling_device0")
+        shutil.rmtree("/sys/class/hwmon/hwmon2")
+    hw(ups=ups)
+
+
+class TestOtherBoards(Base):
+    INSTALL = os.path.join(os.path.dirname(HERE), "install.sh")
+
+    def board(self, *a, **kw):
+        as_board(*a, **kw)
+        self.ep = load_module()
+        return self.ep
+
+    def block(self):
+        return self.config().split("# >>> pi5-energyplan")[1]
+
+    def test_pi4(self):
+        ep = self.board("Raspberry Pi 4 Model B Rev 1.4", 1800000, 600000)
+        self.assertEqual((ep.BOARD["family"], ep.BOARD["top"]), ("pi4", 1800))
+        plans = {n: p["max_freq_mhz"] for n, p in ep.PLANS.items()}
+        self.assertEqual(plans, {"Underclock": 1100, "Eco": 1400, "Balanced": 1800,
+                                 "Cool": 1800, "Max Cool": 1500, "Performance": 1800,
+                                 "OC 2.0 GHz": 2000, "Custom": 1800})
+        self.assertRegex(cli("--list").stdout, r"Balanced\s+ondemand\s+fan -\s+")
+        out = cli("--apply", "Cool").stdout
+        self.assertIn("no fan control", out)
+        self.assertIn("# plan: Cool\n[pi4]\narm_freq=1800\n[all]\n# <<<", self.block())
+        self.assertNotIn("fan_temp0=", self.block())
+        cli("--apply", "OC 2.0")
+        self.assertIn("[pi4]\narm_freq=2000\nover_voltage=6\n[all]", self.block())
+        r = cli("--set-fan", "Cool", "Max", check=False)
+        self.assertIn("no fan control", r.stderr)
+        st = cli("--status").stdout
+        self.assertIn("Board       : Raspberry Pi 4 Model B Rev 1.4 · no fan control · no UPS",
+                      st)
+        self.assertIn("Battery     : no X120x UPS: it fits only the Raspberry Pi 5", st)
+        self.assertNotIn("Sweet spot", st)
+        self.assertNotIn("GPU (3D)", st)
+        r = cli("--autotest", "--yes", check=False)
+        self.assertIn("only for the Raspberry Pi 5", r.stderr)
+
+    def test_older_pi4_gets_a_milder_overclock_too(self):
+        ep = self.board("Raspberry Pi 4 Model B Rev 1.2", 1500000, 600000)
+        self.assertEqual(ep.PLANS["OC 1.8 GHz"]["over_voltage"], 2)
+        self.assertEqual(ep.PLANS["Balanced"]["max_freq_mhz"], 1500)
+
+    def test_zero_2_w(self):
+        ep = self.board("Raspberry Pi Zero 2 W Rev 1.0", 1000000, 600000)
+        self.assertEqual(list(ep.PLANS), ["Underclock", "Eco", "Balanced", "Cool",
+                                          "Max Cool", "Performance", "Custom"])   # no OC
+        self.assertEqual(ep.PLANS["Underclock"]["max_freq_mhz"], 600)
+        cli("--apply", "Underclock")
+        self.assertIn("[pi02]\narm_freq=600\n[all]", self.block())
+        self.assertEqual(get(CPUFREQ + "/scaling_max_freq"), "600000")
+        # the Custom plan can't overclock it, and has no voltage / GPU / fan settings
+        for bad, why in (({"max_freq_mhz": 1200}, "CPU speed: 600-1000 MHz"),
+                         ({"over_voltage": 2}, "Extra voltage"),
+                         ({"over_voltage_delta": 25000}, "Extra voltage"),
+                         ({"v3d_freq": 1000}, "only the Raspberry Pi 5")):
+            r = cli("--set-custom", json.dumps(bad), check=False)
+            self.assertIn(why, r.stderr, bad)
+        out = cli("--set-custom", '{"max_freq_mhz": 900, "governor": "schedutil"}',
+                  "--apply", "Custom").stdout
+        self.assertIn("Custom plan saved: CPU 900 MHz, schedutil governor", out)
+        self.assertIn("[pi02]\narm_freq=900\n[all]", self.block())
+
+    def test_zero_w(self):
+        ep = self.board("Raspberry Pi Zero W Rev 1.1", 1000000, 700000)
+        self.assertEqual(ep.PLANS["Underclock"]["max_freq_mhz"], 700)
+        cli("--apply", "Balanced")
+        self.assertIn("[pi0]\narm_freq=1000\n[all]", self.block())
+
+    def test_sd_card_moved_from_a_pi5_to_a_pi4(self):
+        cli("--apply", "OC 2.8")                      # on the Pi 5
+        self.assertIn("[pi5]", self.block())
+        self.board("Raspberry Pi 4 Model B Rev 1.4", 1800000, 600000)
+        put(CPUFREQ + "/scaling_governor", "powersave")
+        self.no_sleep()
+        self.ep.boot_apply()                           # the Pi 5 plan doesn't exist here
+        self.assertEqual(get(CPUFREQ + "/scaling_governor"), "performance")
+        self.assertEqual(get(CPUFREQ + "/scaling_max_freq"), "1800000")
+        cli("--apply", "Balanced")
+        cfg = self.config()
+        self.assertEqual(cfg.count("# >>> pi5-energyplan"), 1)
+        self.assertIn("[pi4]\narm_freq=1800", cfg)
+        self.assertNotIn("arm_freq=2800", cfg)
+
+    def test_guard_stays_idle_on_other_boards(self):
+        ep = self.board("Raspberry Pi 4 Model B Rev 1.4", 1800000, 600000)
+        ep.write_json_atomic(ep.BATTERY_CFG, ep.validate_battery_cfg(
+            {"enabled": True, "saver_enabled": True}))
+        n = [0]
+
+        def on_sleep():
+            n[0] += 1
+            if n[0] > 3:
+                raise Stop
+        ep.time = Clock(on_sleep)
+        with self.assertRaises(Stop):
+            ep.battery_guard()
+        self.assertFalse(any(c.startswith(("pinctrl set", "shutdown")) for c in calls()))
+        self.assertFalse(os.path.exists(ep.GUARD_STATUS))
+
+    def test_pi5_without_the_x1202(self):
+        hw(ups=False)
+        self.ep = load_module()
+        r = cli("--ups-config", '{"enabled": true}', check=False)
+        self.assertIn("No X120x UPS found", r.stderr)
+        r = cli("--eeprom-setup", check=False)
+        self.assertIn("PSU_MAX_CURRENT=5000 is only for a 5 A supply", r.stderr)
+        self.assertFalse(any(c.startswith("rpi-eeprom-config --apply") for c in calls()))
+        out = TestInstaller.install(self, "--ups-recommended")
+        self.assertIn("No X120x UPS found: bootloader settings skipped", out)
+        self.assertIn("No X120x UPS found: battery protection not turned on", out)
+        self.assertFalse(os.path.exists("/etc/systemd/system/pi5-battery-guard.service"))
+        self.assertIn("UPS not answering", cli("--status").stdout)
+
+
+class TestStorage(Base):
+    """Slow storage + RAM to spare: keep more in RAM. Never on a low-RAM board."""
+
+    def setUp(self):
+        super().setUp()
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.ep.MEMINFO = os.path.join(self.tmp, "meminfo")
+        self.ep.SWAPS = os.path.join(self.tmp, "swaps")
+        clear("/sys/block")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def setup(self, disk="mmcblk0", kind="SD", ram_mb=8000, swap="/var/swap", tmp="ext4",
+              usb_speed=None):
+        part = disk + ("p2" if disk[-1].isdigit() else "2")
+        real = f"/sys/class/fakedev/{'usb1/1-1/1-1:1.0/host0' if usb_speed else 'mmc'}/{disk}"
+        os.makedirs(f"{real}/{part}")
+        put(f"{real}/{part}/partition", 2)
+        os.symlink(f"{real}/{part}", f"/sys/class/block/{part}") if os.path.isdir(
+            "/sys/class/block") else (os.makedirs("/sys/class/block"),
+                                      os.symlink(f"{real}/{part}", f"/sys/class/block/{part}"))
+        os.makedirs(f"/sys/block/{disk}")
+        if disk.startswith("mmcblk"):
+            put(f"/sys/block/{disk}/device/type", kind)
+        elif usb_speed:
+            put("/sys/class/fakedev/usb1/1-1/speed", usb_speed)
+            os.symlink(f"{real}", f"/sys/block/{disk}/device")
+        put(self.ep.MEMINFO, f"MemTotal:       {ram_mb * 1024} kB\nMemFree: 1 kB")
+        swaps = "Filename\tType\tSize\tUsed\tPriority\n"
+        if swap:
+            swaps += f"{swap}\tfile\t1\t0\t-2\n"
+        put(self.ep.SWAPS, swaps)
+        hw(mounts={"/": {"SOURCE": f"/dev/{part}"}, "/tmp": {"FSTYPE": tmp}})
+
+    def test_sd_card_with_ram_to_spare(self):
+        self.setup()
+        out = self.ep.storage_tune("auto")
+        self.assertIn("SD card is slow and there are 8000 MB of RAM: file cache kept in RAM "
+                      "longer, swap only when really needed", out)
+        self.assertIn("/tmp in RAM from the next boot", out)
+        conf = get(self.ep.SYSCTL_FILE)
+        self.assertIn("vm.vfs_cache_pressure = 50", conf)
+        self.assertIn("vm.swappiness = 10", conf)
+        self.assertIn("Where=/tmp", get("/etc/systemd/system/tmp.mount"))
+        self.assertIn("systemctl enable tmp.mount", calls())
+        self.assertIn(f"sysctl -p {self.ep.SYSCTL_FILE}", calls())
+        n = len(calls())
+        self.ep.storage_tune("auto")                        # again: nothing twice
+        self.assertEqual(len([c for c in calls()[n:] if "enable tmp.mount" in c]), 0)
+        self.assertIn("SD card (slow) · 7.8 GB RAM · swap: file · kept in RAM: file cache, "
+                      "/tmp, swap only when needed", self.ep.storage_line())
+
+    def test_trixie_already_keeps_swap_and_tmp_in_ram(self):
+        self.setup(swap="/dev/zram0", tmp="tmpfs")
+        out = self.ep.storage_tune("auto")
+        self.assertIn("(swap is zram: left as it is)", out[0])
+        self.assertIn("/tmp is already in RAM", out)
+        self.assertNotIn("swappiness", get(self.ep.SYSCTL_FILE))
+        self.assertFalse(os.path.exists("/etc/systemd/system/tmp.mount"))
+
+    def test_low_ram_board_is_left_alone(self):
+        self.setup(ram_mb=427)                              # Zero 2 W: 512 MB
+        out = self.ep.storage_tune("auto")
+        self.assertIn("with only 427 MB of RAM keeping more in RAM would make it slower", out[0])
+        self.assertFalse(os.path.exists(self.ep.SYSCTL_FILE))
+        self.assertFalse(os.path.exists("/etc/systemd/system/tmp.mount"))
+
+    def test_fast_storage_is_left_alone(self):
+        for disk, kind, speed, what in (("nvme0n1", None, None, "NVMe SSD"),
+                                        ("mmcblk0", "MMC", None, "eMMC"),
+                                        ("sda", None, 5000, "USB 3 drive")):
+            make_pi()
+            self.setup(disk=disk, kind=kind, usb_speed=speed)
+            self.assertEqual(self.ep.root_storage(), (what, False))
+            self.assertIn("fast enough", self.ep.storage_tune("auto")[0])
+            self.assertFalse(os.path.exists(self.ep.SYSCTL_FILE))
+
+    def test_usb2_drive_is_slow(self):
+        self.setup(disk="sda", usb_speed=480)
+        self.assertEqual(self.ep.root_storage(), ("USB 2 drive", True))
+
+    def test_off_undoes_and_is_remembered(self):
+        self.setup()
+        self.ep.storage_tune("auto")
+        self.assertIn("Storage tuning removed", self.ep.storage_tune("off")[0])
+        self.assertFalse(os.path.exists(self.ep.SYSCTL_FILE))
+        self.assertFalse(os.path.exists("/etc/systemd/system/tmp.mount"))
+        self.assertIn("sysctl --system", calls())
+        self.assertIn("is off", self.ep.storage_tune("auto")[0])   # updates respect it
+        self.assertFalse(os.path.exists(self.ep.SYSCTL_FILE))
+        self.ep.storage_tune("on")
+        self.assertTrue(os.path.exists(self.ep.SYSCTL_FILE))
+
+    def test_someone_elses_tmp_mount_is_kept(self):
+        self.setup()
+        put("/etc/systemd/system/tmp.mount", "[Mount]\nWhat=tmpfs\nWhere=/tmp\n")
+        out = self.ep.storage_tune("auto")
+        self.assertIn("/tmp: there's already a tmp.mount of your own, left as it is", out)
+        self.ep.storage_tune("off")
+        self.assertTrue(os.path.exists("/etc/systemd/system/tmp.mount"))
+
+
 class TestCustomPlan(Base):
     MINE = {"max_freq_mhz": 2700, "v3d_freq": 1020, "over_voltage_delta": 25000,
             "fan_profile": "Strong", "governor": "conservative"}
@@ -1252,7 +1497,7 @@ class TestCustomPlan(Base):
 
     def test_fill_in_and_use(self):
         out = cli("--set-custom", json.dumps(self.MINE)).stdout
-        self.assertIn("Custom plan saved: CPU 2700 MHz +25 mV, GPU 1020 MHz, Strong fan, "
+        self.assertIn("Custom plan saved: CPU 2700 MHz +0.025 V, GPU 1020 MHz, Strong fan, "
                       "conservative governor", out)
         self.assertRegex(cli("--list").stdout,
                          r"Custom\s+conservative\s+fan Strong\s+Yours: CPU 2.7 GHz \+0.025 V, "
@@ -1276,7 +1521,7 @@ class TestCustomPlan(Base):
         cli("--set-custom", '{"max_freq_mhz": 2000, "v3d_freq": 960, "fan_profile": "Quiet",'
                             ' "governor": "powersave"}', "--apply", "Custom")
         block = self.block()
-        self.assertIn("arm_freq=2000\n# <<<", block)
+        self.assertIn("arm_freq=2000\n[all]\n# <<<", block)
         self.assertNotIn("v3d_freq", block)
         self.assertNotIn("over_voltage", block)
         self.assertEqual(get(CPUFREQ + "/scaling_max_freq"), "2000000")
@@ -1762,6 +2007,18 @@ class TestSmallScreens(Base):
 
 
 HAVE_TK = bool(importlib.util.find_spec("tkinter") and os.environ.get("DISPLAY"))
+
+
+def widget_texts(widget):
+    """Every text shown in a Tk window, to check what's there."""
+    out = []
+    for w in widget.winfo_children():
+        try:
+            out.append(w.cget("text"))
+        except Exception:  # noqa: BLE001
+            pass
+        out += widget_texts(w)
+    return out
 KEEP_TK = []
 
 
@@ -1790,6 +2047,24 @@ class TestInstallLauncher(unittest.TestCase):
 
 @unittest.skipUnless(HAVE_TK, "needs tkinter and a display (use xvfb-run)")
 class TestInstallGui(Base):
+    def test_no_ups_options_on_other_boards(self):
+        as_board("Raspberry Pi Zero 2 W Rev 1.0", 1000000, 600000)
+        spec = importlib.util.spec_from_file_location(
+            "ig", os.path.join(os.path.dirname(HERE), "install_gui.py"))
+        ig = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ig)
+        app = ig.Installer()
+        try:
+            app.root.update()
+            texts = widget_texts(app.root)
+            self.assertFalse(any("Battery protection" in t or "bootloader" in t for t in texts))
+            self.assertIn("Menu entry", texts)
+            self.assertTrue(any(t.startswith("Board: Raspberry Pi Zero 2 W") for t in texts))
+            self.assertFalse(app.opt_ups.get() or app.opt_eeprom.get())
+        finally:
+            app.root.destroy()
+            KEEP_TK.append(app)
+
     def test_button_says_update_reinstall_or_go_back(self):
         spec = importlib.util.spec_from_file_location(
             "ig", os.path.join(os.path.dirname(HERE), "install_gui.py"))
@@ -1864,6 +2139,51 @@ class TestInstallGui(Base):
             app.root.destroy()
             KEEP_TK.append(app)   # freed at exit on the main thread (Tk aborts otherwise)
             shutil.rmtree(home, ignore_errors=True)
+
+
+@unittest.skipUnless(HAVE_TK, "needs tkinter and a display (use xvfb-run)")
+class TestGuiOtherBoards(Base):
+    def texts(self, widget):
+        return widget_texts(widget)
+
+    def test_zero_2_w_window(self):
+        as_board("Raspberry Pi Zero 2 W Rev 1.0", 1000000, 600000)
+        ep = load_module()
+        app = ep.App()
+        try:
+            for _ in range(5):
+                app.root.update()
+            t = self.texts(app.root)
+            self.assertIn("Raspberry Pi Zero 2 W Rev 1.0  ·  no fan control  ·  no UPS", t)
+            for gone in ("UPS settings…", "Find sweet spot…", "Battery in panel", "Fan",
+                         "Sweet spot", "OC 2.6 GHz"):
+                self.assertNotIn(gone, t)
+            self.assertEqual(app.fan_vars, {})
+            app.open_custom_editor()
+            app.root.update()
+            e = self.texts(app.custom_win)
+            self.assertIn("CPU max speed", e)
+            for gone in ("GPU (3D) speed", "Fan profile", "Extra CPU voltage"):
+                self.assertNotIn(gone, e)
+            self.assertEqual(app.custom_controls["cpu"].get(), 1000)
+        finally:
+            app.root.destroy()
+            KEEP_TK.append(app)
+
+    def test_pi5_without_ups_says_why(self):
+        hw(ups=False)
+        ep = load_module()
+        app = ep.App()
+        try:
+            app.root.update()
+            t = self.texts(app.root)
+            self.assertTrue(any(x.startswith("No X120x UPS found: UPS not answering")
+                                for x in t), t)
+            self.assertNotIn("UPS settings…", t)
+            self.assertIn("Find sweet spot…", t)              # still a Pi 5
+        finally:
+            app.root.destroy()
+            KEEP_TK.append(app)
 
 
 @unittest.skipUnless(HAVE_TK, "needs tkinter and a display (use xvfb-run)")
