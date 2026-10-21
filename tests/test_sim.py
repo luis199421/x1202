@@ -2186,6 +2186,155 @@ class TestGuiOtherBoards(Base):
             KEEP_TK.append(app)
 
 
+FAKE_WINDOW = """\
+import os, socket, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind("\\0pi5-energyplan-gui")
+if os.environ.get("FAKE_HOW") == "stuck":
+    s.listen(1)          # takes the call but never answers, like a frozen window
+print("ready", flush=True)
+time.sleep(600)
+"""
+
+
+def gui_lock_taken():
+    with open("/proc/net/unix") as f:
+        return any(line.rstrip().endswith("@pi5-energyplan-gui") for line in f)
+
+
+@unittest.skipUnless(HAVE_TK, "needs tkinter and a display (use xvfb-run)")
+class TestWindowLaunch(Base):
+    """Opening Energy Plan again (menu or panel icon) while it is already open."""
+    def setUp(self):
+        super().setUp()
+        import tempfile
+        self.home = tempfile.mkdtemp()
+        self.env = dict(os.environ, HOME=self.home)
+        self.procs = []
+        self.addCleanup(self.stop_all)
+        self.addCleanup(shutil.rmtree, self.home, True)
+
+    def stop_all(self):
+        for p in self.procs:
+            if p.poll() is None:
+                p.kill()
+            p.wait()
+            if p.stdout:
+                p.stdout.close()
+        for _ in range(50):
+            if not gui_lock_taken():
+                break
+            time.sleep(0.1)
+
+    def start(self, argv):
+        p = subprocess.Popen(argv, env=self.env, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        self.procs.append(p)
+        return p
+
+    def wait_open(self, proc):
+        for _ in range(300):
+            if gui_lock_taken() and proc.poll() is None:
+                return
+            self.assertIsNone(proc.poll(), "window didn't stay open")
+            time.sleep(0.1)
+        self.fail("window never opened")
+
+    def log(self):
+        try:
+            with open(os.path.join(self.home, ".cache/pi5-energyplan/window.log")) as f:
+                return f.read()
+        except OSError:
+            return ""
+
+    def fake_window(self, how):
+        folder = os.path.join(self.home, "old")
+        os.makedirs(folder)
+        path = os.path.join(folder, "pi5_energyplan.py")
+        with open(path, "w") as f:
+            f.write(FAKE_WINDOW)
+        p = subprocess.Popen([sys.executable, path], env=dict(self.env, FAKE_HOW=how),
+                             stdout=subprocess.PIPE, text=True)
+        self.procs.append(p)
+        self.assertEqual(p.stdout.readline().strip(), "ready")
+        return p
+
+    def test_second_launch_brings_the_open_window_back(self):
+        a = self.start([sys.executable, SCRIPT])
+        self.wait_open(a)
+        b = subprocess.run([sys.executable, SCRIPT], env=self.env, capture_output=True,
+                           text=True, timeout=60)
+        self.assertEqual(b.returncode, 0, b.stderr)
+        self.assertIn("brought it to the front", b.stdout)
+        self.assertIsNone(a.poll(), "the open window must stay open")
+        self.assertIn("brought to the front", self.log())
+        self.assertIn("window opened (version", self.log())
+
+    def test_frozen_window_is_replaced(self):
+        old = self.fake_window("stuck")
+        b = self.start([sys.executable, SCRIPT])
+        self.wait_open(b)
+        for _ in range(300):
+            if old.poll() is not None:
+                break
+            time.sleep(0.1)
+        self.assertIsNotNone(old.poll(), "the frozen window should be closed")
+        time.sleep(1)
+        self.assertIsNone(b.poll(), "the new window should be open")
+
+    def test_old_version_window_is_replaced(self):
+        old = self.fake_window("old")      # holds the lock but can't be asked anything
+        b = self.start([sys.executable, SCRIPT])
+        self.wait_open(b)
+        old.wait(timeout=30)
+        time.sleep(1)
+        self.assertIsNone(b.poll(), "the new window should be open")
+
+    def test_minimised_window_comes_back(self):
+        app = self.ep.App()
+        try:
+            app.root.update()
+            app.root.iconify()
+            app.root.update()
+            app.show_window()
+            app.root.update()
+            self.assertEqual(app.root.state(), "normal")
+        finally:
+            app.root.destroy()
+            KEEP_TK.append(app)
+
+    def test_an_error_doesnt_stop_the_updates(self):
+        app = self.ep.App()
+        try:
+            app._show_error = lambda *e: None
+            app.root.report_callback_exception = app._show_error
+            app.root.update()
+            real, app._refresh = app._refresh, lambda: 1 / 0
+            with self.assertRaises(ZeroDivisionError):
+                app.refresh()
+            app._refresh = real
+            pending = app.root.tk.call("after", "info")
+            names = [app.root.tk.call("after", "info", i)[0] for i in pending]
+            self.assertTrue(any("refresh" in str(n) for n in names), names)
+        finally:
+            app.root.destroy()
+            KEEP_TK.append(app)
+
+    def test_only_windows_are_replaced(self):
+        folder = os.path.join(self.home, "x")
+        os.makedirs(folder)
+        path = os.path.join(folder, "pi5_energyplan.py")
+        with open(path, "w") as f:
+            f.write("import time\ntime.sleep(600)\n")
+        window = self.start([sys.executable, path])
+        tray = self.start([sys.executable, path, "--tray"])
+        time.sleep(0.3)
+        found = self.ep.open_windows()
+        self.assertIn(window.pid, found)
+        self.assertNotIn(tray.pid, found)
+        self.assertNotIn(os.getpid(), found)
+
+
 @unittest.skipUnless(HAVE_TK, "needs tkinter and a display (use xvfb-run)")
 class TestGui(Base):
     def test_window_builds_and_refreshes(self):

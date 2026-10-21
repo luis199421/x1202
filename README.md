@@ -673,6 +673,7 @@ over, then compare every managed file byte for byte.
 | **The charge LED turns off, but the battery % keeps going up** | Usually that's not charging. The X1202 has no current sensor: its fuel gauge (MAX17048) *estimates* the % from the cell voltage, and the estimate lags behind, so after charging stops it often creeps up 1–2 % more. Check the **cell voltage** (`pi5_energyplan.py --monitor`, or the "Cell … V" line in the window) for 15–20 minutes. If it falls or stays flat, charging really stopped. If it keeps rising, the board is still charging; the guard notices that by itself and tries the other pin setting. Send the output of `pi5_energyplan.py --charge-debug` if it stays unclear. |
 | Charge limit "✗": board can't pause charging | Your board revision ignores GPIO 16. The guard leaves charging to the board, which stops by itself at full (4.2 V). |
 | A shutdown is counting down and you want to stop it | Plug the adapter back in, or run `sudo shutdown -c`. |
+| **The menu or the panel icon doesn't open the window** (after it was open a while) | Versions before 2.0.0 let only one window run and quietly did nothing if one was already open, even minimised, hidden behind other windows, off the screen, frozen or from an older version. Now opening it again brings the open window to the front; if that window doesn't answer within 15 s (or is an older version), it's closed and a new one opens. Errors from a window opened from the menu or the panel are kept in `~/.cache/pi5-energyplan/window.log`. |
 | *"No desktop display found"* | You are on SSH: use `--status`, `--apply`, `--battery`. |
 | Fan temperatures say "applies after reboot" | Your kernel doesn't allow live changes to trip points. The new curve applies after a reboot. |
 | Plan's governor shows something else after boot | The boot service applies it again 60 s after boot. Check with `systemctl status pi5-energyplan`. |
@@ -705,7 +706,7 @@ The installer test for the menu entry and panel icon needs a throwaway user:
 `sudo INSTALL_TEST_USER=someuser sh tests/run_sim_tests.sh`. To run some tests only:
 `sudo TESTS="TestUps TestNothingTwice" sh tests/run_sim_tests.sh`.
 
-The 109 tests cover:
+The 115 tests cover:
 
 * **Plans:** applying each kind of plan, the live sysfs changes and governor fallback,
   `config.txt` editing (backup, commenting out conflicting lines, only `[all]`/`[pi5]`
@@ -758,6 +759,10 @@ The 109 tests cover:
   plan; the saver ignores a single glitch; `--status` says who set the governor; the
   boot service is installed with the program but not added back after
   `--uninstall-service`.
+* **Opening the window again:** a second launch brings the open window to the front
+  (also when minimised) and exits; a frozen window or one from an older version is
+  replaced; only windows are replaced, never the panel icon; an error in one update
+  doesn't stop the window's updates.
 * **Packages and updates:** the package's dependencies, install and remove steps; and
   with the **real apt**, a published repository: a new version shows up as upgradable
   (what the Pi's updater sees), downloads with signature and hash checks, and

@@ -1561,16 +1561,122 @@ def eeprom_setup(halt_only=False):
             f"Old settings: {EEPROM_BACKUP}")
 
 
-def single_instance(name):
-    """Return False if another copy (same name) is already running."""
+def single_instance(name, listen=False):
+    """Return False if another copy (same name) is already running.
+    listen=True: also take requests from later copies (see take_requests)."""
     import socket
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         s.bind("\0" + name)
     except OSError:
+        s.close()
         return False
-    globals().setdefault("_instance_socks", []).append(s)
+    if listen:
+        s.listen(4)
+        s.setblocking(False)
+    globals().setdefault("_instance_socks", {})[name] = s
     return True
+
+
+def take_requests(name):
+    """Requests ("show") sent to this copy by later copies, without waiting."""
+    s = globals().get("_instance_socks", {}).get(name)
+    out = []
+    while s is not None:
+        try:
+            conn, _ = s.accept()
+        except (BlockingIOError, OSError):
+            break
+        try:
+            conn.settimeout(1)
+            out.append((conn.recv(64).decode(errors="replace").strip(), conn))
+        except OSError:
+            conn.close()
+    return out
+
+
+GUI_LOCK = "pi5-energyplan-gui"
+
+
+def ask_open_window(timeout=15):
+    """Ask the Energy Plan window that is already open to come to the front.
+    Returns "shown", or why not: "old" (a copy that can't be asked, e.g. an older
+    version), "frozen" (it didn't answer), or "gone" (it just closed)."""
+    import socket
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect("\0" + GUI_LOCK)
+    except ConnectionRefusedError:
+        return "old"
+    except OSError:
+        return "gone"
+    try:
+        s.sendall(b"show\n")
+        return "shown" if s.recv(16).startswith(b"ok") else "frozen"
+    except OSError:
+        return "frozen"
+    finally:
+        s.close()
+
+
+def open_windows():
+    """PIDs of this user's other Energy Plan windows (any version)."""
+    me, uid, out = os.getpid(), os.getuid(), []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) == me:
+            continue
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != uid:
+                continue
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                argv = f.read().decode(errors="replace").split("\0")
+        except OSError:
+            continue
+        while argv and argv[-1] == "":
+            argv.pop()
+        # "python3 [-flags] …/pi5_energyplan.py" with nothing after it: the window
+        if len(argv) >= 2 and "python" in os.path.basename(argv[0]) and \
+                argv[-1].endswith("pi5_energyplan.py"):
+            out.append(int(pid))
+    return out
+
+
+def replace_open_window():
+    """Close the window that is open but doesn't answer, so this one can open."""
+    import signal
+    if single_instance(GUI_LOCK, listen=True):   # it closed in the meantime
+        return True
+    pids = open_windows()
+    for sig, wait in ((signal.SIGTERM, 3), (signal.SIGKILL, 2)):
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                pass
+        end = time.time() + wait
+        while time.time() < end:
+            if single_instance(GUI_LOCK, listen=True):
+                return True
+            time.sleep(0.1)
+    return single_instance(GUI_LOCK, listen=True)
+
+
+def log_to_file():
+    """Started from the menu or the panel icon, errors would be lost: keep them in
+    ~/.cache/pi5-energyplan/window.log."""
+    if sys.stderr is not None and sys.stderr.isatty():
+        return
+    try:
+        folder = os.path.expanduser("~/.cache/pi5-energyplan")
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, "window.log")
+        mode = "w" if os.path.exists(path) and os.path.getsize(path) > 256 * 1024 else "a"
+        sys.stderr = open(path, mode, buffering=1)
+        print(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} window opened "
+              f"(version {VERSION}, pid {os.getpid()})", file=sys.stderr)
+    except OSError:
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -1686,8 +1792,12 @@ def run_tray():
 
     def method(conn, sender, path, iface, name, params, invocation):
         if name == "Activate":
-            subprocess.Popen([sys.executable, os.path.abspath(__file__)],
-                             start_new_session=True)
+            # a new copy opens the window, or brings the open one to the front
+            try:
+                windows.append(subprocess.Popen([sys.executable, os.path.abspath(__file__)],
+                                                start_new_session=True))
+            except OSError as e:
+                print(f"Can't open the window: {e}", flush=True)
         invocation.return_value(None)
 
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
@@ -1700,7 +1810,10 @@ def run_tray():
         except GLib.Error:
             pass
 
+    windows = []
+
     def update():
+        windows[:] = [w for w in windows if w.poll() is None]   # reap closed windows
         b = bat.read()
         if b["ok"]:
             title = f"Battery {b['soc']:.0f}% · {b['state']}"
@@ -2633,6 +2746,42 @@ class App:
         self._build()
         self.refresh()
         self.root.after(800, self.check_update)
+        self.root.after(300, self.serve_requests)
+
+    def serve_requests(self):
+        """Another launch (menu, panel icon) asks this window to come to the front."""
+        try:
+            for req, conn in take_requests(GUI_LOCK):
+                try:
+                    if req == "show":
+                        self.show_window()
+                    conn.sendall(b"ok\n")
+                except OSError:
+                    pass
+                finally:
+                    conn.close()
+        finally:
+            self.root.after(300, self.serve_requests)
+
+    def show_window(self):
+        """Bring the window back: un-minimise it, put it back on the screen and on
+        top. Mapping it again makes the desktop raise and focus it, which a plain
+        lift() doesn't do on Wayland."""
+        root = self.root
+        geo = root.geometry()
+        root.withdraw()
+        root.update_idletasks()
+        root.deiconify()
+        root.geometry(geo[geo.index("+"):] if "+" in geo else "")
+        keep_on_screen(root)
+        root.lift()
+        root.attributes("-topmost", True)
+        root.after(500, lambda: root.attributes("-topmost", False))
+        try:
+            root.focus_force()
+        except tk.TclError:
+            pass
+        print(f"{time.strftime('%H:%M:%S')} brought to the front", file=sys.stderr)
 
     def check_update(self):
         me = os.path.abspath(__file__)
@@ -2861,6 +3010,12 @@ class App:
 
     # ----- live refresh -----
     def refresh(self):
+        try:
+            self._refresh()
+        finally:   # an error once must not stop the updates for good
+            self.root.after(REFRESH_MS, self.refresh)
+
+    def _refresh(self):
         s = get_status()
         t = s["temp"]
         self.temp_lbl.config(text=f"{t:.1f} °C" if t is not None else "--.- °C",
@@ -2900,7 +3055,6 @@ class App:
         if t is not None:
             self.history = (self.history + [t])[-self.HISTORY:]
         self.draw_graph()
-        self.root.after(REFRESH_MS, self.refresh)
 
     def on_stuck_answer(self, ans):
         if ans == "later" or self.blocked("the test", lock_during_test=False):
@@ -4361,8 +4515,22 @@ def main():
         sys.exit("tkinter not found. Install it with: sudo apt install python3-tk")
     if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
         sys.exit("No desktop display found. Over SSH use --status / --apply PLAN instead.")
-    if not single_instance("pi5-energyplan-gui"):
-        sys.exit("Energy Plan is already open")
+    open_gui()
+
+
+def open_gui():
+    """Open the window, or bring the one that is already open to the front.
+    A window that doesn't answer (stuck, or an older version) is replaced."""
+    if not single_instance(GUI_LOCK, listen=True):
+        why = ask_open_window()
+        if why == "shown":
+            print("Energy Plan is already open: brought it to the front.")
+            return
+        print(f"The open Energy Plan window didn't answer ({why}): opening a new one.",
+              file=sys.stderr)
+        if not replace_open_window():
+            sys.exit("Energy Plan is already open, and it couldn't be replaced.")
+    log_to_file()
     App().run()
 
 
