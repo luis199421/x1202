@@ -3862,22 +3862,26 @@ def charge_test(minutes=10, interval=15):
         print(line, flush=True)
         log_lines.append(line)
 
+    bat = Battery()
+    b = bat.read()
+    if not b["ok"]:
+        raise RuntimeError(b["error"])
+    if b["ac"] != 1:
+        raise RuntimeError("plug in the adapter first: the test needs mains power")
+    if b["soc"] >= 90 or b["volt"] >= 4.15:
+        # a full cell takes no current anyway: "stops" would prove nothing
+        raise RuntimeError(
+            f"the battery is full ({b['soc']:.0f} %, {b['volt']:.2f} V), so the charger has "
+            "already stopped by itself and the test can't tell anything. Unplug the adapter "
+            "and let the Pi run on battery until it's below 85 % (about 4.05 V), then plug "
+            "the adapter back in and run the test again")
     guard_on = subprocess.run(["systemctl", "is-active", "--quiet", GUARD_SERVICE]).returncode == 0
     if guard_on:   # it sets the pin every 30 s; stopping it switches charging on
         subprocess.run(["systemctl", "stop", GUARD_SERVICE], capture_output=True)
-    bat = Battery()
     samples = []
     try:
-        b = bat.read()
-        if not b["ok"]:
-            raise RuntimeError(b["error"])
-        if b["ac"] != 1:
-            raise RuntimeError("plug in the adapter first: the test needs mains power")
         out(f"Charge test: charging paused (GPIO 16 high) for {minutes} min, "
             f"reading every {interval} s. Charging is switched back on at the end.")
-        if b["soc"] >= 95:
-            out("Note: the battery is nearly full, so the charger may be stopping by "
-                "itself. The test is clearest below 90 %.")
         subprocess.run(["pinctrl", "set", str(CHARGE_GPIO), "op", "dh"], capture_output=True,
                        timeout=3)
         out("  time   battery   cell V   GPIO16  adapter")

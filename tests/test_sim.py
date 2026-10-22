@@ -1243,6 +1243,16 @@ class TestChargeTest(Base):
             self.run_test([(60, 3.9)] * 9, unplug_at=3)
         self.assertEqual(hw()["pin16"], "ip pd")
 
+    def test_full_battery_is_not_tested(self):
+        """At 100 % the charger has stopped by itself: "stops" would prove nothing."""
+        hw(soc=100, volt=4.19, active=["pi5-battery-guard.service"])
+        r = cli("--charge-test", "2", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("the battery is full (100 %, 4.19 V)", r.stderr)
+        self.assertIn("below 85 %", r.stderr)
+        self.assertFalse([c for c in calls() if c.startswith("pinctrl set 16")])
+        self.assertNotIn("systemctl stop pi5-battery-guard.service", calls())
+
     def test_needs_the_adapter(self):
         hw(pld=0)
         r = cli("--charge-test", "2", check=False)
