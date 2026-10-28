@@ -90,8 +90,10 @@ The last row, **Custom**, starts empty. Click it (or its **Edit…** button) and
 | Setting | Range |
 |---|---|
 | CPU max speed | 1.5–3.0 GHz in 100 MHz steps (2.4 GHz is the Pi 5's normal top speed) |
+| CPU min speed | From the lowest speed (1.5 GHz, normal) up to the max speed. The slowest the CPU goes when idle: higher feels snappier but uses more power and heat. Applies right away, and the boot service sets it again at every boot |
 | Extra CPU voltage | None, +0.025 V or +0.05 V (2.8 GHz and more usually need it) |
 | GPU (3D) speed | 600–1100 MHz in 10 MHz steps (960 MHz = default, which writes nothing) |
+| GPU min speed | Default (500 MHz when idle, writes nothing), or 600 MHz up to the GPU speed (`v3d_freq_min` in `config.txt`, applies after a reboot) |
 | Fan profile | Silent, Quiet, Default, Cool, Strong, Max |
 | CPU governor | powersave, conservative, ondemand, schedutil, performance |
 
@@ -103,6 +105,11 @@ use applies the new values again. From the terminal:
 sudo pi5_energyplan.py --set-custom '{"max_freq_mhz": 2600, "over_voltage_delta": 25000,
   "v3d_freq": 1000, "fan_profile": "Strong", "governor": "ondemand"}' --apply Custom
 ```
+
+The lowest speeds are optional: add `"min_freq_mhz": 1800` (CPU) and `"v3d_freq_min": 800`
+(GPU); leave them out for the normal lowest speeds. A lower minimum than the normal one
+isn't possible: the Raspberry Pi firmware doesn't support it, and it wouldn't save power.
+Any other plan, and the battery saver, go back to the normal lowest speed.
 
 ![The Custom plan editor](docs/custom-plan.png)
 
@@ -706,7 +713,7 @@ The installer test for the menu entry and panel icon needs a throwaway user:
 `sudo INSTALL_TEST_USER=someuser sh tests/run_sim_tests.sh`. To run some tests only:
 `sudo TESTS="TestUps TestNothingTwice" sh tests/run_sim_tests.sh`.
 
-The 116 tests cover:
+The 118 tests cover:
 
 * **Plans:** applying each kind of plan, the live sysfs changes and governor fallback,
   `config.txt` editing (backup, commenting out conflicting lines, only `[all]`/`[pi5]`
@@ -774,7 +781,9 @@ The 116 tests cover:
   version moved into `[cm5]`; lines that were in `[cm5]` from the start stay there.
 * **Custom plan:** empty at first and can't be applied; filled in from the window
   (editor click-through) or with `--set-custom`; its CPU, voltage, GPU, fan and
-  governor end up in `config.txt` and live; the GPU default writes nothing; bad values
+  governor end up in `config.txt` and live; the CPU and GPU minimum speeds (live and at
+  boot, never above the max, back to normal with another plan); the GPU default writes
+  nothing; bad values
   are refused; changing it while in use applies it again; it coexists with Sweet Spot.
 * **GPU overclock:** 1000 → 1050 → 1100 MHz for the three overclock plans, none for
   the others, and a hand-made `v3d_freq` can't override the plan.

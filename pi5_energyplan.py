@@ -227,7 +227,7 @@ BLOCK_START = "# >>> pi5-energyplan (managed by pi5_energyplan.py) >>>"
 BLOCK_END = "# <<< pi5-energyplan <<<"
 CONFLICT_RE = re.compile(
     r"^\s*(dtparam=fan_temp\d|arm_freq\s*=|over_voltage(_delta)?\s*=|gpu_freq\s*=|"
-    r"v3d_freq\s*=)")
+    r"v3d_freq(_min)?\s*=)")
 THERMAL_ZONE = "/sys/class/thermal/thermal_zone0"
 CPU0 = "/sys/devices/system/cpu/cpu0/cpufreq"
 # If a kernel lacks a governor, use the closest one that exists.
@@ -278,6 +278,7 @@ CUSTOM_COLOR = "#8d6e63"
 CUSTOM_VOLTAGES = BOARD["volts"]       # extra CPU voltage choices on this board
 VOLT_KEY = BOARD["volt_key"]           # over_voltage_delta (Pi 5) / over_voltage (Pi 4)
 V3D_DEFAULT = 960          # Pi 5 3D GPU clock, MHz
+V3D_MIN_DEFAULT = 500      # and its lowest (v3d_freq_min), Raspberry Pi docs
 CPU_RANGE = (BOARD["low"], BOARD["oc_top"], 100)    # min, max, step (MHz)
 GPU_RANGE = (600, 1100, 10)                          # Pi 5 3D GPU
 
@@ -499,6 +500,8 @@ def get_status():
         "fan_rpm": read(hw + "/fan1_input") if hw else None,
         "freq": as_int(read(CPU0 + "/scaling_cur_freq")),
         "max_freq": as_int(read(CPU0 + "/scaling_max_freq")),
+        "min_freq": as_int(read(CPU0 + "/scaling_min_freq")),
+        "hw_min_freq": as_int(read(CPU0 + "/cpuinfo_min_freq")),
         "governor": read(CPU0 + "/scaling_governor"),
         "throttled": throttle_text(),
         "plan": saved_plan(),
@@ -521,7 +524,10 @@ def fmt_freq(s):
         return "?"
     txt = f"{s['freq'] / 1e6:.2f} GHz"
     if s["max_freq"]:
-        txt += f" (max {s['max_freq'] / 1e6:.1f})"
+        lowest = s.get("min_freq")
+        raised = lowest and s.get("hw_min_freq") and lowest > s["hw_min_freq"]
+        txt += f" (max {s['max_freq'] / 1e6:.1f}" + \
+            (f", min {lowest / 1e6:.1f})" if raised else ")")
     return txt
 
 
@@ -928,12 +934,16 @@ def file_sha(path):
         return None
 
 
-def custom_desc(cpu, volt, gpu):
+def custom_desc(cpu, volt, gpu, cpu_min=None, gpu_min=0):
     text = f"Yours: CPU {_speed(cpu)}"
     if volt:
         text += " " + dict(CUSTOM_VOLTAGES)[volt]
+    if cpu_min and cpu_min > BOARD["low"]:
+        text += f" (min {_speed(cpu_min)})"
     if BOARD["gpu"]:
         text += f", GPU {gpu} MHz" + (" (default)" if gpu == V3D_DEFAULT else "")
+        if gpu_min:
+            text += f" (min {gpu_min})"
     return text + "."
 
 
@@ -950,12 +960,20 @@ def validate_custom(c):
             raise ValueError(f"{what}: {lo}-{hi} MHz in steps of {step}")
         return v
     cpu = num("max_freq_mhz", BOARD["top"], *CPU_RANGE, "CPU speed")
+    cpu_min = num("min_freq_mhz", BOARD["low"], *CPU_RANGE, "CPU min speed")
+    if cpu_min > cpu:
+        raise ValueError(f"CPU min speed: at most the max speed ({cpu} MHz)")
     if BOARD["gpu"]:
         gpu = num("v3d_freq", V3D_DEFAULT, *GPU_RANGE, "GPU speed")
-    elif c.get("v3d_freq", V3D_DEFAULT) != V3D_DEFAULT:
+        gpu_min = 0                                  # 0 = the firmware's own minimum
+        if c.get("v3d_freq_min"):
+            gpu_min = num("v3d_freq_min", 0, *GPU_RANGE, "GPU min speed")
+            if gpu_min > gpu:
+                raise ValueError(f"GPU min speed: at most the GPU speed ({gpu} MHz)")
+    elif c.get("v3d_freq", V3D_DEFAULT) != V3D_DEFAULT or c.get("v3d_freq_min"):
         raise ValueError("GPU speed: only the Raspberry Pi 5 has this setting")
     else:
-        gpu = V3D_DEFAULT
+        gpu, gpu_min = V3D_DEFAULT, 0
     other = {"over_voltage_delta", "over_voltage"} - {VOLT_KEY}
     if any(c.get(k) for k in other):
         raise ValueError(f"Extra voltage: on this Raspberry Pi use {VOLT_KEY or 'nothing'}")
@@ -969,15 +987,16 @@ def validate_custom(c):
     gov = c.get("governor", "ondemand")
     if gov not in GOV_INFO:
         raise ValueError(f"Governor: one of {', '.join(GOV_INFO)}")
-    return {"max_freq_mhz": cpu, "v3d_freq": gpu, "volt": volt,
-            "fan_profile": fan, "governor": gov}
+    return {"max_freq_mhz": cpu, "min_freq_mhz": cpu_min, "v3d_freq": gpu,
+            "v3d_freq_min": gpu_min, "volt": volt, "fan_profile": fan, "governor": gov}
 
 
 def set_custom(c, reapply=True):
     """Save the Custom plan (root). If it's the plan in use, apply it again."""
     c = validate_custom(c)
     cpu, gpu, volt = c["max_freq_mhz"], c["v3d_freq"], c["volt"]
-    plan = {"desc": custom_desc(cpu, volt, gpu), "governor": c["governor"],
+    cpu_min, gpu_min = c["min_freq_mhz"], c["v3d_freq_min"]
+    plan = {"desc": custom_desc(cpu, volt, gpu, cpu_min, gpu_min), "governor": c["governor"],
             "max_freq_mhz": cpu, "fan": FAN_PROFILES[c["fan_profile"]],
             "color": CUSTOM_COLOR,
             "warn": cpu > BOARD["top"] or volt > 0 or gpu > V3D_DEFAULT}
@@ -985,6 +1004,10 @@ def set_custom(c, reapply=True):
         plan[VOLT_KEY] = volt
     if gpu != V3D_DEFAULT:          # the default writes no line at all
         plan["v3d_freq"] = gpu
+    if cpu_min > BOARD["low"]:      # the lowest speed is what the kernel does anyway
+        plan["min_freq_mhz"] = cpu_min
+    if gpu_min:
+        plan["v3d_freq_min"] = gpu_min
     try:
         with open(CUSTOM_PLANS) as f:
             data = json.load(f)
@@ -1003,7 +1026,9 @@ def set_custom(c, reapply=True):
     reload_plan_settings()
     msgs = [f"Custom plan saved: CPU {cpu} MHz"
             + (" " + dict(CUSTOM_VOLTAGES)[volt] if volt else "")
+            + (f" (min {cpu_min} MHz)" if cpu_min > BOARD["low"] else "")
             + (f", GPU {gpu} MHz" if BOARD["gpu"] else "")
+            + (f" (min {gpu_min} MHz)" if gpu_min else "")
             + (f", {c['fan_profile']} fan" if BOARD["fan"] else "")
             + f", {c['governor']} governor"]
     if reapply and find_plan(saved_plan() or "") == CUSTOM:
@@ -1889,7 +1914,7 @@ def build_block(name, p=None):
         if p.get(key):
             lines.append(f"{key}={int(p[key])}")
     if BOARD["gpu"]:
-        for key in ("gpu_freq", "v3d_freq"):   # gpu_freq: older custom plans may use it
+        for key in ("gpu_freq", "v3d_freq", "v3d_freq_min"):   # gpu_freq: older plans
             if p.get(key):
                 lines.append(f"{key}={int(p[key])}")
     if flt:
@@ -2061,11 +2086,21 @@ def apply_live(name, by="plan"):
             needs_reboot |= target > hw_max
             target = min(target, hw_max)
         target = max(target, hw_min)
+        # lowest speed: the plan's minimum, or the board's own lowest. The min goes
+        # down first so the new max is always allowed, then up to the plan's min.
+        low = max(hw_min, min(p.get("min_freq_mhz", 0) * 1000, target))
+        if hw_min:
+            write(pol + "/scaling_min_freq", hw_min)
         write(pol + "/scaling_max_freq", target)
+        if hw_min:
+            write(pol + "/scaling_min_freq", low)
+    lowest = f", min {p['min_freq_mhz']} MHz" if p.get("min_freq_mhz") else ""
     if needs_reboot:
-        msgs.append(f"CPU: {used_gov} governor now; {p['max_freq_mhz']} MHz unlocks after reboot")
+        msgs.append(f"CPU: {used_gov} governor now; {p['max_freq_mhz']} MHz unlocks after "
+                    f"reboot{lowest}")
     else:
-        msgs.append(f"CPU: {used_gov} governor, max {p['max_freq_mhz']} MHz (applied now)")
+        msgs.append(f"CPU: {used_gov} governor, max {p['max_freq_mhz']} MHz{lowest} "
+                    "(applied now)")
     try:
         write_json_atomic(GOV_RECORD, {"plan": name, "by": by, "governor": used_gov,
                                        "time": time.time()})
@@ -3475,7 +3510,9 @@ class App:
         win, foot = make_scrollable(top, footer=True, padx=16, pady=12)
 
         vcpu = tk.IntVar(value=p["max_freq_mhz"])
+        vcpu_min = tk.IntVar(value=max(BOARD["low"], p.get("min_freq_mhz", BOARD["low"])))
         vgpu = tk.IntVar(value=V3D_DEFAULT if empty else p.get("v3d_freq", V3D_DEFAULT))
+        vgpu_min = tk.StringVar(value=str(p.get("v3d_freq_min") or "Default"))
         volt_lbl = dict(CUSTOM_VOLTAGES)
         vvolt = tk.StringVar(value=volt_lbl.get(p.get(VOLT_KEY, 0) if VOLT_KEY else 0,
                                                 "None"))
@@ -3516,6 +3553,11 @@ class App:
                           f"{top_speed} = this Pi's normal top speed." +
                           (" Above it is an overclock." if BOARD["oc_top"] > BOARD["top"]
                            else " This model isn't overclocked here."))
+        show_cpu_min = slider("CPU min speed", vcpu_min, CPU_RANGE,
+                              lambda v: _speed(v) + (" · normal" if v == BOARD["low"] else ""),
+                              f"Slowest the CPU goes when idle. {_speed(BOARD['low'])} = normal "
+                              "(least power). Higher feels snappier but uses more power and "
+                              "heat. Applies right away.")
         if len(CUSTOM_VOLTAGES) > 1:
             picker("Extra CPU voltage", vvolt, [(lbl, lbl) for _, lbl in CUSTOM_VOLTAGES])
         show_gpu = lambda: None   # noqa: E731
@@ -3524,6 +3566,20 @@ class App:
                               lambda v: f"{v} MHz" + (" · default" if v == V3D_DEFAULT else ""),
                               "960 MHz = default. Lower saves power, higher is a GPU "
                               "overclock.")
+
+            def gpu_min_options():
+                steps = list(range(GPU_RANGE[0], vgpu.get(), 100)) + [vgpu.get()]
+                return [("Default", f"Default  ·  {V3D_MIN_DEFAULT} MHz when idle")] + \
+                    [(str(m), f"{m} MHz" + ("  ·  always full GPU speed"
+                                             if m == vgpu.get() else "")) for m in steps]
+            row = tk.Frame(win, bg=BG)
+            row.pack(fill="x", pady=(8, 0))
+            self._label(row, "GPU min speed", 10).pack(side="left")
+            self.picker_button(row, vgpu_min, 12, lambda btn: self.choose(
+                "GPU min speed", gpu_min_options(), vgpu_min.set, anchor=btn,
+                current=vgpu_min.get(),
+                text="Slowest the 3D GPU goes. Higher can make games and video smoother "
+                     "but uses more power. Applies after a reboot.")).pack(side="right")
         if BOARD["fan"]:
             picker("Fan profile", vfan, [(f, f"{f}  ·  {fan_profile_info(f)}")
                                          for f in FAN_PROFILES])
@@ -3533,8 +3589,10 @@ class App:
         note.pack(anchor="w", pady=(10, 0))
 
         def settings():
-            c = {"max_freq_mhz": vcpu.get(), "v3d_freq": vgpu.get(),
-                 "fan_profile": vfan.get(), "governor": vgov.get()}
+            c = {"max_freq_mhz": vcpu.get(), "min_freq_mhz": vcpu_min.get(),
+                 "v3d_freq": vgpu.get(), "fan_profile": vfan.get(), "governor": vgov.get()}
+            if BOARD["gpu"] and vgpu_min.get().isdigit():
+                c["v3d_freq_min"] = int(vgpu_min.get())
             if VOLT_KEY:
                 c[VOLT_KEY] = [v for v, lbl in CUSTOM_VOLTAGES if lbl == vvolt.get()][0]
             return c
@@ -3543,7 +3601,12 @@ class App:
             return c.get(VOLT_KEY, 0) if VOLT_KEY else 0
 
         def refresh(*_):
+            if vcpu_min.get() > vcpu.get():      # the min can't be above the max
+                vcpu_min.set(vcpu.get())
+            if vgpu_min.get().isdigit() and int(vgpu_min.get()) > vgpu.get():
+                vgpu_min.set(str(vgpu.get()))
             show_cpu()
+            show_cpu_min()
             show_gpu()
             c = settings()
             warn = []
@@ -3558,7 +3621,7 @@ class App:
                 warn.append(f"Extra voltage only makes the Pi warmer at {_speed(top)} or "
                             "less.")
             note.config(text="\n".join(warn))
-        for v in (vvolt, vfan, vgov):
+        for v in (vvolt, vfan, vgov, vgpu_min):
             v.trace_add("write", refresh)
         refresh()
 
@@ -3586,7 +3649,8 @@ class App:
 
         btns = tk.Frame(foot, bg=BG)
         btns.pack(fill="x", pady=(4, 12))
-        self.custom_controls = {"cpu": vcpu, "gpu": vgpu, "volt": vvolt, "fan": vfan,
+        self.custom_controls = {"cpu": vcpu, "cpu_min": vcpu_min, "gpu": vgpu,
+                                "gpu_min": vgpu_min, "volt": vvolt, "fan": vfan,
                                 "gov": vgov, "note": note}
         for text, cmd, bg in (("Save and use", lambda: save(True), "#43a047"),
                               ("Save", lambda: save(False), CARD),
@@ -4291,8 +4355,10 @@ def main():
                     help="choose the CPU governor a plan uses (sudo)")
     ap.add_argument("--set-custom", metavar="JSON",
                     help='fill in the Custom plan (sudo), e.g. \'{"max_freq_mhz": 2600, '
-                         '"v3d_freq": 1000, "over_voltage_delta": 25000, "fan_profile": '
-                         '"Strong", "governor": "ondemand"}\'; add --apply Custom to use it')
+                         '"min_freq_mhz": 1800, "v3d_freq": 1000, "v3d_freq_min": 800, '
+                         '"over_voltage_delta": 25000, "fan_profile": "Strong", "governor": '
+                         '"ondemand"}\' (min_freq_mhz / v3d_freq_min: lowest CPU / GPU speed; '
+                         'leave them out for the normal lowest); add --apply Custom to use it')
     ap.add_argument("--set-fan", nargs=2, metavar=("PLAN", "PROFILE"),
                     help=f"choose a plan's fan profile: {', '.join(FAN_PROFILES)} (sudo)")
     ap.add_argument("--eeprom-setup", action="store_true",

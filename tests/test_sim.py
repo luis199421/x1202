@@ -1547,10 +1547,48 @@ class TestCustomPlan(Base):
         self.assertIn("Saved to /boot/firmware/config.txt", out)
         self.assertIn("arm_freq=2500\nv3d_freq=1020\n", self.block())
 
+    def test_lowest_speeds(self):
+        out = cli("--set-custom", json.dumps(dict(self.MINE, min_freq_mhz=2000,
+                                                  v3d_freq_min=800)), "--apply", "Custom").stdout
+        self.assertIn("CPU 2700 MHz +0.025 V (min 2000 MHz), GPU 1020 MHz (min 800 MHz)", out)
+        self.assertIn("min 2000 MHz", out)
+        self.assertEqual(get(CPUFREQ + "/scaling_min_freq"), "2000000")    # right away
+        self.assertIn("v3d_freq=1020\nv3d_freq_min=800\n", self.block())  # after reboot
+        self.assertRegex(cli("--list").stdout, r"Yours: CPU 2.7 GHz \+0.025 V \(min 2.0 GHz\), "
+                                               r"GPU 1020 MHz \(min 800\)")
+        self.assertIn("min 2.0)", cli("--status").stdout)
+        # the boot service puts the minimum back after a reboot
+        put(CPUFREQ + "/scaling_min_freq", 1500000)
+        self.no_sleep()
+        self.ep.load_custom_plans()
+        self.ep.boot_apply()
+        self.assertEqual(get(CPUFREQ + "/scaling_min_freq"), "2000000")
+        # another plan goes back to the normal lowest speed and drops the GPU line
+        cli("--apply", "Eco")
+        self.assertEqual(get(CPUFREQ + "/scaling_min_freq"), "1500000")
+        self.assertNotIn("v3d_freq_min", self.block())
+        # an overclock unlocks after the reboot: until then the min is capped at 2.4 GHz
+        cli("--set-custom", json.dumps({"max_freq_mhz": 2700, "min_freq_mhz": 2700}),
+            "--apply", "Custom")
+        self.assertEqual(get(CPUFREQ + "/scaling_max_freq"), "2400000")
+        self.assertEqual(get(CPUFREQ + "/scaling_min_freq"), "2400000")
+
+    def test_lowest_speed_left_out_changes_nothing(self):
+        cli("--set-custom", json.dumps(self.MINE), "--apply", "Custom")
+        self.assertEqual(get(CPUFREQ + "/scaling_min_freq"), "1500000")
+        self.assertNotIn("min", self.ep.PLANS["Custom"]["desc"] +
+                         json.dumps(json.loads(get("/etc/pi5-energyplan/custom.json"))))
+        self.assertNotIn("v3d_freq_min", self.block())
+
     def test_bad_values_are_refused(self):
         for bad, why in (({"max_freq_mhz": 3200}, "CPU speed: 1500-3000 MHz"),
                          ({"max_freq_mhz": 2650}, "in steps of 100"),
                          ({"v3d_freq": 1300}, "GPU speed: 600-1100 MHz"),
+                         ({"max_freq_mhz": 2000, "min_freq_mhz": 2100},
+                          "CPU min speed: at most the max speed (2000 MHz)"),
+                         ({"min_freq_mhz": 1000}, "CPU min speed: 1500-3000 MHz"),
+                         ({"v3d_freq_min": 1000}, "GPU min speed: at most the GPU speed"),
+                         ({"v3d_freq_min": 505}, "GPU min speed: 600-1100 MHz"),
                          ({"over_voltage_delta": 75000}, "Extra voltage"),
                          ({"fan_profile": "Turbo"}, "Fan profile"),
                          ({"governor": "fast"}, "Governor"),
@@ -2380,7 +2418,13 @@ class TestGui(Base):
             ctl = app.custom_controls
             self.assertEqual((ctl["cpu"].get(), ctl["gpu"].get(), ctl["fan"].get()),
                              (2400, 960, "Default"))         # starts at the Pi's defaults
+            self.assertEqual((ctl["cpu_min"].get(), ctl["gpu_min"].get()), (1500, "Default"))
             ctl["cpu"].set(2600)
+            ctl["cpu_min"].set(2800)
+            ctl["gpu_min"].set("900")
+            app.root.update()
+            self.assertEqual(ctl["cpu_min"].get(), 2600)      # never above the max
+            ctl["cpu_min"].set(1800)
             ctl["volt"].set("+0.025 V")                       # triggers the warning text
             app.root.update()
             self.assertIn("Overclock", ctl["note"].cget("text"))
@@ -2391,7 +2435,10 @@ class TestGui(Base):
                 time.sleep(0.05)
             self.assertIn("# plan: Custom", self.config())
             self.assertIn("arm_freq=2600", self.config())
-            self.assertIn("Yours: CPU 2.6 GHz", app.desc_labels["Custom"].cget("text"))
+            self.assertIn("v3d_freq_min=900", self.config())
+            self.assertEqual(get(CPUFREQ + "/scaling_min_freq"), "1800000")
+            self.assertIn("Yours: CPU 2.6 GHz +0.025 V (min 1.8 GHz), GPU 960 MHz (default) "
+                          "(min 900)", app.desc_labels["Custom"].cget("text"))
             # banners for the guard states
             b = {"on_battery": True, "soc": 18}
             g = {"enabled": True, "min": 20, "outage_minutes": 0}
