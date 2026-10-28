@@ -115,6 +115,7 @@ uninstall() {
         if [ -f "$DEST" ]; then
             say "Removing the background services"
             python3 "$DEST" --storage-tune undo || true
+            python3 "$DEST" --power-limit off >/dev/null 2>&1 || true
             python3 "$DEST" --uninstall-service || true   # keeps the copy while the guard needs it
             [ -f "$DEST" ] && { python3 "$DEST" --uninstall-guard || true; }
         fi

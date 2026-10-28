@@ -150,7 +150,10 @@ def _mhz(x):
 
 
 def _speed(m):
-    return f"{m / 1000:.1f} GHz" if m >= 1000 else f"{m} MHz"
+    if m < 1000:
+        return f"{m} MHz"
+    ghz = f"{m / 1000:.3f}".rstrip("0")      # 2400 → 2.4, 2650 → 2.65, 1755 → 1.755
+    return (ghz + "0" if ghz.endswith(".") else ghz) + " GHz"
 
 
 def make_plans(b):
@@ -226,7 +229,7 @@ CONFIG_PATHS = ["/boot/firmware/config.txt", "/boot/config.txt"]
 BLOCK_START = "# >>> pi5-energyplan (managed by pi5_energyplan.py) >>>"
 BLOCK_END = "# <<< pi5-energyplan <<<"
 CONFLICT_RE = re.compile(
-    r"^\s*(dtparam=fan_temp\d|arm_freq\s*=|over_voltage(_delta)?\s*=|gpu_freq\s*=|"
+    r"^\s*(dtparam=fan_temp\d|arm_freq(_min)?\s*=|over_voltage(_delta)?\s*=|gpu_freq\s*=|"
     r"v3d_freq(_min)?\s*=)")
 THERMAL_ZONE = "/sys/class/thermal/thermal_zone0"
 CPU0 = "/sys/devices/system/cpu/cpu0/cpufreq"
@@ -279,8 +282,12 @@ CUSTOM_VOLTAGES = BOARD["volts"]       # extra CPU voltage choices on this board
 VOLT_KEY = BOARD["volt_key"]           # over_voltage_delta (Pi 5) / over_voltage (Pi 4)
 V3D_DEFAULT = 960          # Pi 5 3D GPU clock, MHz
 V3D_MIN_DEFAULT = 500      # and its lowest (v3d_freq_min), Raspberry Pi docs
-CPU_RANGE = (BOARD["low"], BOARD["oc_top"], 100)    # min, max, step (MHz)
-GPU_RANGE = (600, 1100, 10)                          # Pi 5 3D GPU
+# Any speed (MHz) can be typed in the Custom plan. Below the board's normal lowest
+# speed (or 500 MHz for the GPU) the firmware's own minimum is lowered too
+# (arm_freq_min / v3d_freq_min): not officially supported, but allowed.
+SPEED_FLOOR = 100
+CPU_RANGE = (SPEED_FLOOR, BOARD["oc_top"], 1)    # min, max, step (MHz)
+GPU_RANGE = (SPEED_FLOOR, 1100, 1)               # Pi 5 3D GPU
 
 
 def custom_empty():
@@ -938,7 +945,7 @@ def custom_desc(cpu, volt, gpu, cpu_min=None, gpu_min=0):
     text = f"Yours: CPU {_speed(cpu)}"
     if volt:
         text += " " + dict(CUSTOM_VOLTAGES)[volt]
-    if cpu_min and cpu_min > BOARD["low"]:
+    if cpu_min and cpu_min != min(BOARD["low"], cpu):
         text += f" (min {_speed(cpu_min)})"
     if BOARD["gpu"]:
         text += f", GPU {gpu} MHz" + (" (default)" if gpu == V3D_DEFAULT else "")
@@ -957,10 +964,11 @@ def validate_custom(c):
         except (TypeError, ValueError):
             raise ValueError(f"{what}: not a number") from None
         if not lo <= v <= hi or (v - lo) % step:
-            raise ValueError(f"{what}: {lo}-{hi} MHz in steps of {step}")
+            raise ValueError(f"{what}: {lo}-{hi} MHz" +
+                             (f" in steps of {step}" if step > 1 else ""))
         return v
     cpu = num("max_freq_mhz", BOARD["top"], *CPU_RANGE, "CPU speed")
-    cpu_min = num("min_freq_mhz", BOARD["low"], *CPU_RANGE, "CPU min speed")
+    cpu_min = num("min_freq_mhz", min(BOARD["low"], cpu), *CPU_RANGE, "CPU min speed")
     if cpu_min > cpu:
         raise ValueError(f"CPU min speed: at most the max speed ({cpu} MHz)")
     if BOARD["gpu"]:
@@ -996,6 +1004,7 @@ def set_custom(c, reapply=True):
     c = validate_custom(c)
     cpu, gpu, volt = c["max_freq_mhz"], c["v3d_freq"], c["volt"]
     cpu_min, gpu_min = c["min_freq_mhz"], c["v3d_freq_min"]
+    low = min(BOARD["low"], cpu)        # the normal lowest speed, or the max if below it
     plan = {"desc": custom_desc(cpu, volt, gpu, cpu_min, gpu_min), "governor": c["governor"],
             "max_freq_mhz": cpu, "fan": FAN_PROFILES[c["fan_profile"]],
             "color": CUSTOM_COLOR,
@@ -1004,8 +1013,12 @@ def set_custom(c, reapply=True):
         plan[VOLT_KEY] = volt
     if gpu != V3D_DEFAULT:          # the default writes no line at all
         plan["v3d_freq"] = gpu
-    if cpu_min > BOARD["low"]:      # the lowest speed is what the kernel does anyway
+    if cpu_min != low:              # the normal lowest speed is what the kernel does anyway
         plan["min_freq_mhz"] = cpu_min
+    if min(cpu_min, cpu) < BOARD["low"]:   # below the firmware's lowest: lower that too
+        plan["arm_freq_min"] = min(cpu_min, cpu)
+    if not gpu_min and gpu < V3D_MIN_DEFAULT:
+        gpu_min = gpu                   # a GPU speed below the firmware's own minimum
     if gpu_min:
         plan["v3d_freq_min"] = gpu_min
     try:
@@ -1026,7 +1039,7 @@ def set_custom(c, reapply=True):
     reload_plan_settings()
     msgs = [f"Custom plan saved: CPU {cpu} MHz"
             + (" " + dict(CUSTOM_VOLTAGES)[volt] if volt else "")
-            + (f" (min {cpu_min} MHz)" if cpu_min > BOARD["low"] else "")
+            + (f" (min {cpu_min} MHz)" if cpu_min != low else "")
             + (f", GPU {gpu} MHz" if BOARD["gpu"] else "")
             + (f" (min {gpu_min} MHz)" if gpu_min else "")
             + (f", {c['fan_profile']} fan" if BOARD["fan"] else "")
@@ -1894,6 +1907,354 @@ def restart_tray():
 
 
 # --------------------------------------------------------------------------- #
+#  Power limit (Pi 5): keep the Pi's power use under a number of watts you choose
+#
+#  The Pi 5's power chip (PMIC) measures every supply rail of the board
+#  (vcgencmd pmic_read_adc). Their sum is the Pi's own power use; USB devices and
+#  the fan aren't included. A small root service reads it every 2 s:
+#   * CPU (right away): over the limit, the CPU's top speed goes down one 100 MHz
+#     step (two when far over). It learns how many watts one step makes, and goes
+#     back up a step when that still fits under the limit, never above the plan's
+#     own top speed.
+#   * GPU (after a reboot): Linux can't change the 3D GPU's speed while running, only
+#     config.txt can (v3d_freq). If the Pi stays over the limit for a minute with the
+#     CPU already at its lowest speed, the GPU's top speed is lowered 100 MHz for the
+#     next boot; after 30 minutes with plenty of room it goes back up 100 MHz. At most
+#     one GPU change per boot, never below 500 MHz (the GPU's normal lowest speed).
+# --------------------------------------------------------------------------- #
+POWER_CFG = "/etc/pi5-energyplan/power.json"
+POWER_STATUS = "/run/pi5-energyplan/power-limit.json"
+PLAN_LIMITS = "/run/pi5-energyplan/plan-limits.json"   # the plan's CPU speeds (kHz)
+POWER_SERVICE = "pi5-power-limit.service"
+POWER_UNIT_PATH = "/etc/systemd/system/" + POWER_SERVICE
+POWER_RANGE = (2.0, 30.0)   # W
+DEFAULT_POWER_CFG = {"enabled": False, "watts": 8.0, "gpu": True, "gpu_cap": None}
+
+POWER_UNIT = f"""[Unit]
+Description=Pi 5 power limit (keeps the Pi's power use under the chosen watts)
+After=sysinit.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 {INSTALLED_SCRIPT} --power-limit-run
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def load_power_cfg():
+    cfg = dict(DEFAULT_POWER_CFG)
+    try:
+        with open(POWER_CFG) as f:
+            cfg.update({k: v for k, v in json.load(f).items() if k in cfg})
+    except (OSError, ValueError):
+        pass
+    return cfg
+
+
+def validate_power_cfg(cfg):
+    try:
+        watts = round(float(cfg["watts"]) * 10) / 10
+    except (TypeError, ValueError):
+        raise ValueError("Power limit: a number of watts, e.g. 6 or 7.5") from None
+    if not POWER_RANGE[0] <= watts <= POWER_RANGE[1]:
+        raise ValueError(f"Power limit: {POWER_RANGE[0]:g}-{POWER_RANGE[1]:g} W")
+    cap = cfg.get("gpu_cap")
+    return {"enabled": bool(cfg["enabled"]), "watts": watts, "gpu": bool(cfg["gpu"]),
+            "gpu_cap": int(cap) if cap else None}
+
+
+def power_gpu_cap():
+    """The GPU top speed the power limit chose for this boot (MHz), or None."""
+    if not BOARD["gpu"]:
+        return None
+    cfg = load_power_cfg()
+    return cfg["gpu_cap"] if cfg["enabled"] and cfg["gpu"] else None
+
+
+def plan_gpu(p):
+    """A plan's GPU top and lowest speed in config.txt, with the power limit's cap."""
+    top, low = p.get("v3d_freq"), p.get("v3d_freq_min")
+    cap = power_gpu_cap()
+    if cap and cap < (top or V3D_DEFAULT):
+        top = cap
+        low = min(low, cap) if low else None
+    return top, low
+
+
+def read_power_status():
+    try:
+        with open(POWER_STATUS) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return st if time.time() - st.get("updated", 0) < 30 else None
+
+
+def plan_limits(pol):
+    """The CPU speeds (kHz) the plan in use wants for this cpufreq policy."""
+    try:
+        with open(PLAN_LIMITS) as f:
+            d = json.load(f).get(os.path.basename(pol))
+            return int(d["max"]), int(d["min"])
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return (as_int(read(pol + "/cpuinfo_max_freq"), 0),
+                as_int(read(pol + "/cpuinfo_min_freq"), 0))
+
+
+def cpu_steps(pol, top):
+    """The CPU speeds (kHz) Linux can use up to `top`, lowest first."""
+    freqs = sorted(int(f) for f in (read(pol + "/scaling_available_frequencies") or
+                                    "").split() if f.isdigit())
+    if not freqs:                                  # 100 MHz steps, like the Pi's driver
+        lo = as_int(read(pol + "/cpuinfo_min_freq"), 0)
+        hi = as_int(read(pol + "/cpuinfo_max_freq"), 0)
+        freqs = list(range(lo, hi + 1, 100000)) if lo and hi >= lo else []
+    return [f for f in freqs if f <= top] or [top]
+
+
+def set_cpu_speeds(pol, top, low):
+    """Set a policy's top and lowest speed (kHz) in a safe order."""
+    hw_min = as_int(read(pol + "/cpuinfo_min_freq"), 0)
+    low = max(hw_min, min(low, top))
+    if as_int(read(pol + "/scaling_max_freq")) == top and \
+            as_int(read(pol + "/scaling_min_freq")) == low:
+        return
+    if hw_min:
+        write(pol + "/scaling_min_freq", hw_min)
+    write(pol + "/scaling_max_freq", top)
+    if hw_min:
+        write(pol + "/scaling_min_freq", low)
+
+
+class PowerLimiter:
+    """One step every couple of seconds (see power_limit_run)."""
+    UP_AFTER = 3                  # readings in a row with room before a step up
+    FAR_OVER = 1.5                # W: two steps down at once
+    STEP_W = 0.4                  # W per 100 MHz step, until it's measured
+    GPU_OVER_S = 60               # over the limit at the CPU's lowest speed: GPU down
+    GPU_ROOM_S = 30 * 60          # plenty of room this long: GPU up again
+    GPU_ROOM_W = 1.5              # "plenty" = this far under the limit
+    GPU_FLOOR = V3D_MIN_DEFAULT
+
+    def __init__(self, log=print):
+        self.log = log
+        self.readings = []
+        self.cap = {}             # policy -> kHz while limited
+        self.set_to = {}          # policy -> the top speed this limiter last set
+        self.step_w = self.STEP_W
+        self.changed_at = None    # (watts, steps) just before the last change
+        self.room = 0
+        self.over_since = None
+        self.room_since = None
+        self.gpu_done = False     # one GPU change per boot
+        self.note = ""
+
+    def policies(self):
+        return sorted(glob.glob("/sys/devices/system/cpu/cpufreq/policy*"))
+
+    def restore(self):
+        """Give the plan its own speeds back."""
+        for pol in self.policies():
+            set_cpu_speeds(pol, *plan_limits(pol))
+        self.cap = {}
+
+    def step(self, now):
+        cfg = load_power_cfg()
+        limit = cfg["watts"]
+        watts = read_pmic().get("watts")
+        if watts is None:
+            self.note = "can't read the Pi's power use (vcgencmd pmic_read_adc)"
+            return self.status(cfg, None, now)
+        # a plan (or the battery saver) just set its own speeds: put the limit back
+        # and judge the power again from the next readings
+        moved = [pol for pol, khz in self.set_to.items()
+                 if as_int(read(pol + "/scaling_max_freq")) != khz]
+        if moved:
+            for pol in self.policies():
+                top, low = plan_limits(pol)
+                self.set_to[pol] = min(self.cap.get(pol, top), top)
+                set_cpu_speeds(pol, self.set_to[pol], low)
+            self.readings, self.room, self.changed_at = [], 0, None
+            return self.status(cfg, None, now)
+        self.readings = (self.readings + [watts])[-3:]
+        avg = sum(self.readings) / len(self.readings)
+        if self.changed_at and len(self.readings) >= 2:   # learn the watts per step
+            before, steps = self.changed_at
+            per_step = abs(before - avg) / steps
+            if per_step > 0.05:
+                self.step_w = min(3.0, max(0.1, (self.step_w + per_step) / 2))
+            self.changed_at = None
+        fits = avg + self.step_w * 1.1 < limit         # one step up would still fit
+        changed = at_floor = False
+        moved_steps = 0
+        for pol in self.policies():
+            top, low = plan_limits(pol)
+            steps = cpu_steps(pol, top)
+            cur = min(self.cap.get(pol, top), top)
+            new = cur
+            if avg > limit:
+                lower = [f for f in steps if f < cur]
+                n = 2 if avg > limit + self.FAR_OVER else 1
+                if lower:
+                    new = lower[-n] if len(lower) >= n else lower[0]
+            elif fits and cur < top and self.room + 1 >= self.UP_AFTER:
+                new = min([f for f in steps if f > cur] or [top])
+            if new >= top:
+                self.cap.pop(pol, None)
+            else:
+                self.cap[pol] = new
+            if new != cur:
+                changed = True
+                moved_steps = max(moved_steps, sum(1 for f in steps
+                                                   if min(new, cur) < f <= max(new, cur)))
+            at_floor |= new == steps[0]
+            set_cpu_speeds(pol, new, low)     # also puts it back if a plan changed it
+            self.set_to[pol] = new
+        if fits and self.cap and not changed:
+            self.room += 1
+        else:
+            self.room = 0
+        if changed:
+            self.readings = []                # judge the new speed on its own readings
+            self.changed_at = (avg, max(1, moved_steps))
+        self.note = ""
+        if cfg["gpu"] and BOARD["gpu"]:
+            self.gpu_step(cfg, avg, at_floor, now)
+        return self.status(cfg, avg, now)
+
+    def gpu_step(self, cfg, avg, at_floor, now):
+        over = avg > cfg["watts"] and at_floor
+        self.over_since = (self.over_since or now) if over else None
+        roomy = avg < cfg["watts"] - self.GPU_ROOM_W and not self.cap and cfg["gpu_cap"]
+        self.room_since = (self.room_since or now) if roomy else None
+        if self.gpu_done:
+            return
+        plan = find_plan(saved_plan() or "")
+        top = (PLANS[plan].get("v3d_freq") or V3D_DEFAULT) if plan else V3D_DEFAULT
+        cap = cfg["gpu_cap"]
+        new = cap
+        if self.over_since and now - self.over_since >= self.GPU_OVER_S:
+            new = min(cap or top, top) - 100
+            if new < self.GPU_FLOOR:
+                self.note = (f"over the limit at the lowest CPU speed and the GPU is at "
+                             f"{self.GPU_FLOOR} MHz already: the limit is too low")
+                return
+        elif self.room_since and now - self.room_since >= self.GPU_ROOM_S:
+            new = cap + 100
+            if new >= top:
+                new = None
+        if new == cap:
+            return
+        if not plan:
+            self.note = ("to lower the GPU too, keep a plan after reboot (it needs the "
+                         "plan's block in config.txt)")
+            return
+        st = load_state()
+        if st and st.get("phase") in ("pending", "running"):
+            return
+        self.gpu_done = True
+        save_power_cfg(dict(cfg, gpu_cap=new))
+        write_config(plan)
+        self.log(f"GPU top speed {'lowered' if new and new < (cap or top) else 'raised'} to "
+                 f"{new or top} MHz for the next boot ({avg:.1f} W, limit {cfg['watts']} W)")
+
+    def status(self, cfg, avg, now):
+        caps = sorted(set(self.cap.values()))
+        st = {"updated": now, "limit": cfg["watts"],
+              "watts": round(avg, 2) if avg is not None else None,
+              "cpu_cap_mhz": caps[0] // 1000 if caps else None,
+              "gpu_cap_mhz": cfg["gpu_cap"] if cfg["gpu"] else None, "note": self.note}
+        try:
+            write_json_atomic(POWER_STATUS, st)
+        except OSError:
+            pass
+        return st
+
+
+def save_power_cfg(cfg):
+    write_json_atomic(POWER_CFG, validate_power_cfg(cfg))
+
+
+def power_limit_run():
+    """The service: keep the power under the limit until stopped."""
+    lim = PowerLimiter(log=lambda m: print(m, flush=True))
+    last = None
+    try:
+        while True:
+            if not load_power_cfg()["enabled"]:
+                break
+            st = load_state()
+            if st and st.get("phase") in ("pending", "running"):
+                time.sleep(10)                 # the sweet spot test sets the speeds
+                continue
+            out = lim.step(time.time())
+            key = (out.get("cpu_cap_mhz"), out.get("note"))
+            if key != last:
+                print(f"{out['watts'] or '?'} W (limit {out['limit']} W): " +
+                      (f"CPU top speed {key[0]} MHz" if key[0] else "CPU at the plan's speed")
+                      + (f"; {key[1]}" if key[1] else ""), flush=True)
+                last = key
+            time.sleep(2)
+    finally:
+        lim.restore()
+        try:
+            os.remove(POWER_STATUS)
+        except OSError:
+            pass
+
+
+def set_power_limit(value):
+    """--power-limit: "off", a number of watts, or JSON settings (root)."""
+    cfg = load_power_cfg()
+    if isinstance(value, str) and value.strip().lower() in ("off", "0", "false"):
+        if not cfg["enabled"] and not os.path.exists(POWER_UNIT_PATH):
+            return ["Power limit is off"]
+        new = dict(cfg, enabled=False)
+    elif isinstance(value, dict):
+        new = dict(cfg, **{k: v for k, v in value.items() if k in ("enabled", "watts", "gpu")})
+    else:
+        new = dict(cfg, enabled=True, watts=value)
+    new = validate_power_cfg(new)
+    if new["enabled"]:
+        if not BOARD["gpu"]:
+            raise RuntimeError("the power limit needs a Raspberry Pi 5: only its power chip "
+                               "measures the power use")
+        if read_pmic().get("watts") is None:
+            raise RuntimeError("can't read the Pi's power use (vcgencmd pmic_read_adc)")
+    gpu_was = power_gpu_cap()
+    if not (new["enabled"] and new["gpu"]):
+        new["gpu_cap"] = None
+    write_json_atomic(POWER_CFG, new)
+    msgs = []
+    if new["enabled"]:
+        install_copy()
+        if read(POWER_UNIT_PATH) != POWER_UNIT.strip():
+            write(POWER_UNIT_PATH, POWER_UNIT)
+            subprocess.run(["systemctl", "daemon-reload"])
+        subprocess.run(["systemctl", "enable", "--now", POWER_SERVICE], capture_output=True)
+        msgs.append(f"Power limit on: {new['watts']:g} W. The CPU's top speed follows it "
+                    "right away" + ("; the GPU's after a reboot when needed" if new["gpu"]
+                                    else "") + ".")
+    else:
+        subprocess.run(["systemctl", "disable", "--now", POWER_SERVICE], capture_output=True)
+        if os.path.exists(POWER_UNIT_PATH):
+            os.remove(POWER_UNIT_PATH)
+            subprocess.run(["systemctl", "daemon-reload"])
+        PowerLimiter().restore()                 # in case the service wasn't running
+        msgs.append("Power limit off: the plan's own speeds are back.")
+    if gpu_was and not power_gpu_cap():
+        plan = find_plan(saved_plan() or "")
+        if plan:
+            write_config(plan)
+            msgs.append("GPU speed back to the plan's after a reboot.")
+    return msgs
+
+
+# --------------------------------------------------------------------------- #
 #  Applying a plan (root needed)
 # --------------------------------------------------------------------------- #
 def build_block(name, p=None):
@@ -1910,13 +2271,17 @@ def build_block(name, p=None):
                 f"dtparam=fan_temp{i}_speed={int(speed)}",
             ]
     lines.append(f"arm_freq={p['max_freq_mhz']}")
+    if p.get("arm_freq_min"):               # Custom plan below the normal lowest speed
+        lines.append(f"arm_freq_min={int(p['arm_freq_min'])}")
     for key in ("over_voltage_delta", "over_voltage"):
         if p.get(key):
             lines.append(f"{key}={int(p[key])}")
     if BOARD["gpu"]:
-        for key in ("gpu_freq", "v3d_freq", "v3d_freq_min"):   # gpu_freq: older plans
-            if p.get(key):
-                lines.append(f"{key}={int(p[key])}")
+        if p.get("gpu_freq"):                   # older custom plans may use it
+            lines.append(f"gpu_freq={int(p['gpu_freq'])}")
+        for key, mhz in zip(("v3d_freq", "v3d_freq_min"), plan_gpu(p)):
+            if mhz:
+                lines.append(f"{key}={int(mhz)}")
     if flt:
         lines.append("[all]")               # what comes after applies to every model
     lines.append(BLOCK_END)
@@ -2072,6 +2437,7 @@ def apply_live(name, by="plan"):
     needs_reboot = False
     used_gov = "unchanged"
 
+    limits = {}
     for pol in glob.glob("/sys/devices/system/cpu/cpufreq/policy*"):
         avail = (read(pol + "/scaling_available_governors") or "").split()
         gov = next((g for g in [p["governor"]] + GOVERNOR_FALLBACK.get(p["governor"], [])
@@ -2094,7 +2460,16 @@ def apply_live(name, by="plan"):
         write(pol + "/scaling_max_freq", target)
         if hw_min:
             write(pol + "/scaling_min_freq", low)
-    lowest = f", min {p['min_freq_mhz']} MHz" if p.get("min_freq_mhz") else ""
+        limits[os.path.basename(pol)] = {"max": target, "min": low}
+    try:     # for the power limit: the speeds it may lower, and gives back
+        write_json_atomic(PLAN_LIMITS, limits)
+    except OSError:
+        pass
+    lowest = ""
+    if p.get("min_freq_mhz"):
+        # below the CPU's lowest until the reboot lowers it (arm_freq_min)
+        later = as_int(read(CPU0 + "/cpuinfo_min_freq"), 0) > p["min_freq_mhz"] * 1000
+        lowest = f", min {p['min_freq_mhz']} MHz" + (" after reboot" if later else "")
     if needs_reboot:
         msgs.append(f"CPU: {used_gov} governor now; {p['max_freq_mhz']} MHz unlocks after "
                     f"reboot{lowest}")
@@ -2167,7 +2542,8 @@ def uninstall_service():
     os.makedirs(os.path.dirname(NO_BOOT_SERVICE), exist_ok=True)
     write(NO_BOOT_SERVICE, "removed with --uninstall-service: updates don't add it back\n")
     # the battery guard runs from the same system copy: keep it while the guard is there
-    paths = [SERVICE_PATH] + ([] if os.path.exists(GUARD_UNIT_PATH) else [INSTALLED_SCRIPT])
+    paths = [SERVICE_PATH] + ([] if os.path.exists(GUARD_UNIT_PATH) or
+                             os.path.exists(POWER_UNIT_PATH) else [INSTALLED_SCRIPT])
     for path in paths:
         if os.path.exists(path):
             os.remove(path)
@@ -2181,7 +2557,8 @@ def uninstall_guard():
     # stopping the guard switches charging back on (see battery_guard's finally)
     subprocess.run(["systemctl", "disable", "--now", GUARD_SERVICE], capture_output=True)
     paths = [GUARD_UNIT_PATH, GUARD_STATUS] + \
-        ([] if os.path.exists(SERVICE_PATH) else [INSTALLED_SCRIPT])
+        ([] if os.path.exists(SERVICE_PATH) or os.path.exists(POWER_UNIT_PATH)
+         else [INSTALLED_SCRIPT])
     for path in paths:
         if os.path.exists(path):
             os.remove(path)
@@ -3036,6 +3413,8 @@ class App:
         actions = [("Quit", self.root.destroy), ("Reboot now", self.on_reboot)]
         if BOARD["autotest"]:
             actions.append(("Find sweet spot…", self.on_autotest))
+        if BOARD["gpu"]:
+            actions.append(("Power limit…", self.open_power_limit))
         if self.ups_found:
             actions.append(("Battery in panel", self.on_tray))
         for text, cmd in actions:
@@ -3065,7 +3444,10 @@ class App:
         self.stat["Governor"].config(text=f"{gov} · {short}",
                                      fg="#ffa726" if short == "not set since boot" else FG)
         thr = s["throttled"] or "?"
-        self.stat["Power"].config(text=thr, fg="#ef5350" if thr.startswith("NOW") else FG)
+        pw = self.power_text() if BOARD["gpu"] else ""     # Pi 5: watts and the limit
+        self.stat["Power"].config(text=f"{pw} · {thr}" if pw else thr,
+                                  fg="#ef5350" if thr.startswith("NOW") else
+                                  "#ffa726" if "limited" in pw else FG)
         self.stat["Saved plan"].config(text=s["plan"] or f"none ({DEFAULT_PLAN} at boot)")
         sweet = autotest_summary() if "Sweet spot" in self.stat else ""
         if sweet:
@@ -3509,10 +3891,14 @@ class App:
         top.transient(self.root)
         win, foot = make_scrollable(top, footer=True, padx=16, pady=12)
 
-        vcpu = tk.IntVar(value=p["max_freq_mhz"])
-        vcpu_min = tk.IntVar(value=max(BOARD["low"], p.get("min_freq_mhz", BOARD["low"])))
-        vgpu = tk.IntVar(value=V3D_DEFAULT if empty else p.get("v3d_freq", V3D_DEFAULT))
-        vgpu_min = tk.StringVar(value=str(p.get("v3d_freq_min") or "Default"))
+        def text_of(v):
+            return "" if v is None else str(v)
+        vcpu = tk.StringVar(value=text_of(p["max_freq_mhz"]))
+        vcpu_min = tk.StringVar(value=text_of(p.get("min_freq_mhz") or
+                                              min(BOARD["low"], p["max_freq_mhz"])))
+        vgpu = tk.StringVar(value=text_of(V3D_DEFAULT if empty else
+                                          p.get("v3d_freq", V3D_DEFAULT)))
+        vgpu_min = tk.StringVar(value=text_of(p.get("v3d_freq_min")))   # "" = default
         volt_lbl = dict(CUSTOM_VOLTAGES)
         vvolt = tk.StringVar(value=volt_lbl.get(p.get(VOLT_KEY, 0) if VOLT_KEY else 0,
                                                 "None"))
@@ -3520,25 +3906,40 @@ class App:
         vgov = tk.StringVar(value=p["governor"])
 
         self._label(win, "Custom plan", 13, bold=True).pack(anchor="w")
-        self._label(win, "Choose the speed and governor. Speeds change after a reboot; the "
-                         "governor (and fan) start right away.", 9, MUTED,
+        self._label(win, "Type the exact speeds in MHz (or use the arrows). The CPU min "
+                         "speed and the governor (and fan) start right away; the rest "
+                         "after a reboot.", 9, MUTED,
                     wraplength=380, justify="left").pack(anchor="w", pady=(2, 6))
 
-        def slider(title, var, rng, fmt, hint):
+        def mhz(var):
+            """The number typed in a box, None if it's empty, False if it isn't one."""
+            t = var.get().strip()
+            if not t:
+                return None
+            return int(t) if t.isdigit() else False
+
+        def speedbox(title, var, rng, inc, fmt, hint):
             box = tk.Frame(win, bg=CARD, padx=10, pady=6)
             box.pack(fill="x", pady=(6, 0))
-            top_row = tk.Frame(box, bg=CARD)
-            top_row.pack(fill="x")
-            self._label(top_row, title, 10).pack(side="left")
-            val = self._label(top_row, "", 12, bold=True)
-            val.pack(side="right")
-            tk.Scale(box, from_=rng[0], to=rng[1], resolution=rng[2], orient="horizontal",
-                     variable=var, showvalue=False, length=360, bg=CARD,
-                     troughcolor="#3a3d45", highlightthickness=0, bd=0,
-                     activebackground="#90caf9",
-                     command=lambda *_: refresh()).pack(fill="x")
+            row = tk.Frame(box, bg=CARD)
+            row.pack(fill="x")
+            self._label(row, title, 10).pack(side="left")
+            self._label(row, "MHz", 9, MUTED).pack(side="right", padx=(4, 0))
+            typed = var.get()
+            tk.Spinbox(row, textvariable=var, from_=rng[0], to=rng[1], increment=inc,
+                       width=6, justify="right", bg="#3a3d45", fg=FG, insertbackground=FG,
+                       buttonbackground="#3a3d45", relief="flat",
+                       font=("DejaVu Sans", 11, "bold")).pack(side="right")
+            var.set(typed)          # a Spinbox fills an empty box with its lowest value
+            val = self._label(row, "", 9, MUTED)
+            val.pack(side="right", padx=(0, 8))
             self._label(box, hint, 8, MUTED, wraplength=360, justify="left").pack(anchor="w")
-            return lambda: val.config(text=fmt(var.get()))
+            var.trace_add("write", lambda *_: refresh())
+
+            def show():
+                v = mhz(var)
+                val.config(text="" if not v else fmt(v))
+            return show
 
         def picker(title, var, options):
             row = tk.Frame(win, bg=BG)
@@ -3548,38 +3949,31 @@ class App:
                                lambda btn: self.choose(title, options, var.set, anchor=btn,
                                                        current=var.get())).pack(side="right")
 
-        top_speed = _speed(BOARD["top"])
-        show_cpu = slider("CPU max speed", vcpu, CPU_RANGE, _speed,
-                          f"{top_speed} = this Pi's normal top speed." +
-                          (" Above it is an overclock." if BOARD["oc_top"] > BOARD["top"]
-                           else " This model isn't overclocked here."))
-        show_cpu_min = slider("CPU min speed", vcpu_min, CPU_RANGE,
-                              lambda v: _speed(v) + (" · normal" if v == BOARD["low"] else ""),
-                              f"Slowest the CPU goes when idle. {_speed(BOARD['low'])} = normal "
-                              "(least power). Higher feels snappier but uses more power and "
-                              "heat. Applies right away.")
+        low, top_speed = BOARD["low"], _speed(BOARD["top"])
+        steps = ("Linux changes the CPU speed in 100 MHz steps: a speed in between runs at "
+                 "the step below it (max) or above it (min).")
+        show_cpu = speedbox("CPU max speed", vcpu, CPU_RANGE, 100, _speed,
+                            f"{top_speed} = this Pi's normal top speed." +
+                            (" Above it is an overclock." if BOARD["oc_top"] > BOARD["top"]
+                             else " This model isn't overclocked here."))
+        show_cpu_min = speedbox("CPU min speed", vcpu_min, CPU_RANGE, 100,
+                                lambda v: _speed(v) + (" · normal" if v == low else ""),
+                                f"Slowest the CPU goes when idle. {_speed(low)} = normal. "
+                                "Higher feels snappier but uses more power and heat. "
+                                + steps)
         if len(CUSTOM_VOLTAGES) > 1:
             picker("Extra CPU voltage", vvolt, [(lbl, lbl) for _, lbl in CUSTOM_VOLTAGES])
-        show_gpu = lambda: None   # noqa: E731
+        show_gpu = show_gpu_min = lambda: None   # noqa: E731
         if BOARD["gpu"]:
-            show_gpu = slider("GPU (3D) speed", vgpu, GPU_RANGE,
-                              lambda v: f"{v} MHz" + (" · default" if v == V3D_DEFAULT else ""),
-                              "960 MHz = default. Lower saves power, higher is a GPU "
-                              "overclock.")
-
-            def gpu_min_options():
-                steps = list(range(GPU_RANGE[0], vgpu.get(), 100)) + [vgpu.get()]
-                return [("Default", f"Default  ·  {V3D_MIN_DEFAULT} MHz when idle")] + \
-                    [(str(m), f"{m} MHz" + ("  ·  always full GPU speed"
-                                             if m == vgpu.get() else "")) for m in steps]
-            row = tk.Frame(win, bg=BG)
-            row.pack(fill="x", pady=(8, 0))
-            self._label(row, "GPU min speed", 10).pack(side="left")
-            self.picker_button(row, vgpu_min, 12, lambda btn: self.choose(
-                "GPU min speed", gpu_min_options(), vgpu_min.set, anchor=btn,
-                current=vgpu_min.get(),
-                text="Slowest the 3D GPU goes. Higher can make games and video smoother "
-                     "but uses more power. Applies after a reboot.")).pack(side="right")
+            show_gpu = speedbox("GPU (3D) speed", vgpu, GPU_RANGE, 10,
+                                lambda v: "default" if v == V3D_DEFAULT else "",
+                                f"{V3D_DEFAULT} MHz = default. Lower saves power, higher is a "
+                                "GPU overclock.")
+            show_gpu_min = speedbox("GPU min speed", vgpu_min, GPU_RANGE, 10,
+                                    lambda v: "always full speed" if v == mhz(vgpu) else "",
+                                    f"Slowest the 3D GPU goes. Empty = default "
+                                    f"({V3D_MIN_DEFAULT} MHz when idle). Higher can make "
+                                    "games and video smoother but uses more power.")
         if BOARD["fan"]:
             picker("Fan profile", vfan, [(f, f"{f}  ·  {fan_profile_info(f)}")
                                          for f in FAN_PROFILES])
@@ -3589,29 +3983,38 @@ class App:
         note.pack(anchor="w", pady=(10, 0))
 
         def settings():
-            c = {"max_freq_mhz": vcpu.get(), "min_freq_mhz": vcpu_min.get(),
-                 "v3d_freq": vgpu.get(), "fan_profile": vfan.get(), "governor": vgov.get()}
-            if BOARD["gpu"] and vgpu_min.get().isdigit():
-                c["v3d_freq_min"] = int(vgpu_min.get())
+            """The settings as --set-custom takes them; raises ValueError if wrong."""
+            boxes = [("max_freq_mhz", vcpu, "CPU max speed"),
+                     ("min_freq_mhz", vcpu_min, "CPU min speed")]
+            if BOARD["gpu"]:
+                boxes += [("v3d_freq", vgpu, "GPU speed"),
+                          ("v3d_freq_min", vgpu_min, "GPU min speed")]
+            c = {"fan_profile": vfan.get(), "governor": vgov.get()}
+            for key, var, what in boxes:
+                v = mhz(var)
+                if v is False or (v is None and key != "v3d_freq_min"):
+                    raise ValueError(f"{what}: type a number (MHz)")
+                if v is not None:
+                    c[key] = v
             if VOLT_KEY:
                 c[VOLT_KEY] = [v for v, lbl in CUSTOM_VOLTAGES if lbl == vvolt.get()][0]
+            validate_custom(c)
             return c
 
         def volt_of(c):
             return c.get(VOLT_KEY, 0) if VOLT_KEY else 0
 
         def refresh(*_):
-            if vcpu_min.get() > vcpu.get():      # the min can't be above the max
-                vcpu_min.set(vcpu.get())
-            if vgpu_min.get().isdigit() and int(vgpu_min.get()) > vgpu.get():
-                vgpu_min.set(str(vgpu.get()))
-            show_cpu()
-            show_cpu_min()
-            show_gpu()
-            c = settings()
+            for show in (show_cpu, show_cpu_min, show_gpu, show_gpu_min):
+                show()
+            try:
+                c = settings()
+            except ValueError as e:
+                note.config(text=f"✘ {e}", fg="#ef5350")
+                return
             warn = []
             top = BOARD["top"]
-            if c["max_freq_mhz"] > top or c["v3d_freq"] > V3D_DEFAULT or volt_of(c):
+            if c["max_freq_mhz"] > top or c.get("v3d_freq", 0) > V3D_DEFAULT or volt_of(c):
                 warn.append("Overclock: use the official power supply and a fan. If it "
                             "doesn't boot, remove the 'pi5-energyplan' block from config.txt "
                             "on another computer.")
@@ -3620,15 +4023,28 @@ class App:
             if volt_of(c) and c["max_freq_mhz"] <= top:
                 warn.append(f"Extra voltage only makes the Pi warmer at {_speed(top)} or "
                             "less.")
-            note.config(text="\n".join(warn))
-        for v in (vvolt, vfan, vgov, vgpu_min):
+            if min(c["max_freq_mhz"], c["min_freq_mhz"]) < low or \
+                    0 < min(c.get("v3d_freq", 999), c.get("v3d_freq_min") or 999) < \
+                    V3D_MIN_DEFAULT:
+                warn.append(f"Below the normal lowest speed (CPU {_speed(low)}"
+                            + (f", GPU {V3D_MIN_DEFAULT} MHz" if BOARD["gpu"] else "")
+                            + ") isn't officially supported by Raspberry Pi: it applies "
+                            "after a reboot, and if the firmware ignores it the Pi just "
+                            "runs at its normal lowest speed. It saves little power.")
+            note.config(text="\n".join(warn), fg="#ffa726")
+        for v in (vvolt, vfan, vgov):
             v.trace_add("write", refresh)
         refresh()
 
         def save(use):
-            c = settings()
-            overclock = c["max_freq_mhz"] > BOARD["top"] or c["v3d_freq"] > V3D_DEFAULT or \
-                volt_of(c)
+            try:
+                c = settings()
+            except ValueError as e:
+                note.config(text=f"✘ {e}", fg="#ef5350")
+                self.root.bell()
+                return
+            overclock = c["max_freq_mhz"] > BOARD["top"] or \
+                c.get("v3d_freq", 0) > V3D_DEFAULT or volt_of(c)
             if self.blocked("the plan" if use else "the Custom plan",
                             lock_during_test=use):
                 return
@@ -3758,6 +4174,112 @@ class App:
             run_root(["--autotest", "--yes"], timeout=900)), daemon=True).start()
         self.root.after(200, self.poll_result)
 
+    def power_text(self):
+        """'5.8 W · limit 6 W (CPU ≤ 1.8 GHz)' for the stats card."""
+        cfg, st = load_power_cfg(), read_power_status()
+        watts = st["watts"] if st and st.get("watts") else read_pmic().get("watts")
+        text = f"{watts:.1f} W" if watts else "?"
+        if cfg["enabled"]:
+            text += f" · limit {cfg['watts']:g} W"
+            if not st:
+                text += " (not running)"
+            elif st.get("cpu_cap_mhz"):
+                text += f" · limited: CPU ≤ {_speed(st['cpu_cap_mhz'])}"
+        return text
+
+    def open_power_limit(self):
+        old = getattr(self, "power_win", None)
+        if old is not None and old.winfo_exists():
+            old.destroy()
+        cfg = load_power_cfg()
+        top = self.power_win = tk.Toplevel(self.root)
+        top.title("Power limit")
+        top.configure(bg=BG)
+        top.transient(self.root)
+        win, foot = make_scrollable(top, footer=True, padx=16, pady=12)
+        self._label(win, "Power limit", 13, bold=True).pack(anchor="w")
+        self._label(win, "Keeps the Pi's power use under the watts you choose. The CPU's "
+                         "top speed is lowered and raised by itself every 2 seconds. The "
+                         "GPU's speed can only change at boot: if the CPU is already at "
+                         "its lowest and it's still too much, the GPU's top speed is "
+                         "lowered for the next boot (and raised again later). Measured by "
+                         "the Pi 5's power chip: USB devices and the fan aren't counted.",
+                    9, MUTED, wraplength=380, justify="left").pack(anchor="w", pady=(2, 8))
+        ven = tk.BooleanVar(value=cfg["enabled"])
+        vgpu = tk.BooleanVar(value=cfg["gpu"])
+        vw = tk.StringVar(value=f"{cfg['watts']:g}")
+        box = tk.Frame(win, bg=CARD, padx=10, pady=8)
+        box.pack(fill="x")
+        tk.Checkbutton(box, text="Limit the power use", variable=ven, bg=CARD, fg=FG,
+                       selectcolor=BG, activebackground=CARD, activeforeground=FG,
+                       font=("DejaVu Sans", 10, "bold")).pack(anchor="w")
+        row = tk.Frame(box, bg=CARD)
+        row.pack(fill="x", pady=(6, 0))
+        self._label(row, "Most power", 10).pack(side="left")
+        self._label(row, "W", 9, MUTED).pack(side="right", padx=(4, 0))
+        tk.Spinbox(row, textvariable=vw, from_=POWER_RANGE[0], to=POWER_RANGE[1],
+                   increment=0.5, width=5, justify="right", bg="#3a3d45", fg=FG,
+                   insertbackground=FG, buttonbackground="#3a3d45", relief="flat",
+                   font=("DejaVu Sans", 11, "bold")).pack(side="right")
+        vw.set(f"{cfg['watts']:g}")
+        tk.Checkbutton(box, text="Also lower the GPU speed when needed (after a reboot)",
+                       variable=vgpu, bg=CARD, fg=FG, selectcolor=BG, activebackground=CARD,
+                       activeforeground=FG, font=("DejaVu Sans", 9)).pack(anchor="w",
+                                                                         pady=(6, 0))
+        self._label(box, "Idle, a Pi 5 uses about 2.5-3 W; busy at 2.4 GHz about 7-9 W. "
+                         "A limit under what it needs at the lowest speeds can't be "
+                         "kept.", 8, MUTED, wraplength=360, justify="left") \
+            .pack(anchor="w", pady=(6, 0))
+        now = self._label(win, "", 10)
+        now.pack(anchor="w", pady=(10, 0))
+        note = self._label(win, "", 9, "#ffa726", wraplength=380, justify="left")
+        note.pack(anchor="w", pady=(4, 0))
+
+        def live():
+            if not top.winfo_exists():
+                return
+            st = read_power_status()
+            now.config(text="Now: " + self.power_text() +
+                       (f" · GPU ≤ {st['gpu_cap_mhz']} MHz from boot"
+                        if st and st.get("gpu_cap_mhz") else ""))
+            note.config(text=st.get("note", "") if st else "")
+            top.after(2000, live)
+        live()
+
+        def save():
+            try:
+                c = validate_power_cfg({"enabled": ven.get(), "watts": vw.get().strip(),
+                                        "gpu": vgpu.get()})
+            except ValueError as e:
+                note.config(text=f"✘ {e}", fg="#ef5350")
+                self.root.bell()
+                return
+            if self.blocked("the power limit"):
+                return
+            args = ["--power-limit", json.dumps({k: c[k] for k in
+                                                 ("enabled", "watts", "gpu")})]
+            self.set_busy("saving the power limit")
+            self.msg.config(text="Saving the power limit… (enter your password if asked)",
+                            fg=MUTED)
+            threading.Thread(target=lambda: setattr(
+                self, "result", ("Power limit", False) + run_root(args)),
+                daemon=True).start()
+            self.root.after(200, self.poll_result)
+            top.destroy()
+
+        btns = tk.Frame(foot, bg=BG)
+        btns.pack(fill="x", pady=(4, 12))
+        self.power_controls = {"enabled": ven, "watts": vw, "gpu": vgpu, "now": now,
+                               "note": note}
+        for text, cmd, bg in (("Save", save, "#43a047"), ("Close", top.destroy, CARD)):
+            b = tk.Button(btns, text=text, command=cmd, relief="flat", bg=bg, fg=FG,
+                          activebackground="#555", activeforeground=FG,
+                          font=("DejaVu Sans", 9, "bold" if text == "Save" else "normal"))
+            b.pack(side="right", padx=(6, 0), ipadx=6, ipady=2)
+            self.power_controls[text] = b
+        top.geometry(f"+{self.root.winfo_rootx() + 30}+{max(0, self.root.winfo_rooty() - 10)}")
+        keep_on_screen(top)
+
     def on_tray(self):
         install_tray()
         self.msg.config(text="✔ Battery icon added to the panel (starts at every login).",
@@ -3845,7 +4367,8 @@ def update_root():
     any number of times never adds anything twice."""
     msgs = []
     changed = False
-    installed = [p for p in (SERVICE_PATH, GUARD_UNIT_PATH) if os.path.exists(p)]
+    installed = [p for p in (SERVICE_PATH, GUARD_UNIT_PATH, POWER_UNIT_PATH)
+                 if os.path.exists(p)]
     if installed and installed_is_newer():
         msgs.append(f"A newer version ({fmt_version(version_of(INSTALLED_SCRIPT))}) is "
                     f"installed: this older copy ({VERSION}) was not installed")
@@ -3853,7 +4376,8 @@ def update_root():
         msgs.append(f"System copy updated to version {VERSION}: {INSTALLED_SCRIPT}")
         changed = True
     reload_needed = False
-    for path, unit in ((SERVICE_PATH, SERVICE_UNIT), (GUARD_UNIT_PATH, GUARD_UNIT)):
+    for path, unit in ((SERVICE_PATH, SERVICE_UNIT), (GUARD_UNIT_PATH, GUARD_UNIT),
+                       (POWER_UNIT_PATH, POWER_UNIT)):
         if os.path.exists(path) and read(path) != unit.strip():
             write(path, unit)
             reload_needed = True
@@ -3863,6 +4387,8 @@ def update_root():
     if os.path.exists(GUARD_UNIT_PATH) and (changed or reload_needed):
         subprocess.run(["systemctl", "try-restart", GUARD_SERVICE], capture_output=True)
         msgs.append("Battery guard restarted with the new version")
+    if os.path.exists(POWER_UNIT_PATH) and (changed or reload_needed):
+        subprocess.run(["systemctl", "try-restart", POWER_SERVICE], capture_output=True)
     old_pin = [f for f in OLD_CHARGE_PIN_FILES if os.path.exists(f)]
     if old_pin:
         for f in old_pin:
@@ -3887,7 +4413,8 @@ def update_root():
 def update_all():
     """User part (menu entry, panel icon) plus the root part when needed."""
     msgs = refresh_desktop()
-    if any(os.path.exists(p) for p in (SERVICE_PATH, GUARD_UNIT_PATH)) or saved_plan():
+    if any(os.path.exists(p) for p in (SERVICE_PATH, GUARD_UNIT_PATH, POWER_UNIT_PATH)) \
+            or saved_plan():
         if os.geteuid() == 0:
             msgs += update_root()
         elif sys.stdin.isatty():
@@ -4227,7 +4754,26 @@ def print_status():
     print(f"Battery     : {battery_line(Battery().read()) if BOARD['ups'] else why}")
     if BOARD["family"] == "pi5":
         print(f"Pi power    : {fmt_pmic(read_pmic())}")
+    if BOARD["gpu"]:
+        print(f"Power limit : {power_limit_line()}")
     print(f"Storage     : {storage_line()}")
+
+
+def power_limit_line():
+    cfg = load_power_cfg()
+    if not cfg["enabled"]:
+        return "off"
+    st = read_power_status()
+    if not st:
+        return (f"{cfg['watts']:g} W, but the service isn't running "
+                f"(systemctl status {POWER_SERVICE})")
+    parts = [f"{cfg['watts']:g} W", f"now {st['watts']:.1f} W" if st.get("watts") else
+             "power use unknown"]
+    parts.append(f"CPU limited to {_speed(st['cpu_cap_mhz'])}" if st.get("cpu_cap_mhz")
+                 else "CPU at the plan's speed")
+    if st.get("gpu_cap_mhz"):
+        parts.append(f"GPU limited to {st['gpu_cap_mhz']} MHz")
+    return " · ".join(parts) + (f" ({st['note']})" if st.get("note") else "")
 
 
 def fmt_pmic(pm):
@@ -4359,6 +4905,12 @@ def main():
                          '"over_voltage_delta": 25000, "fan_profile": "Strong", "governor": '
                          '"ondemand"}\' (min_freq_mhz / v3d_freq_min: lowest CPU / GPU speed; '
                          'leave them out for the normal lowest); add --apply Custom to use it')
+    ap.add_argument("--power-limit", metavar="WATTS|off|JSON",
+                    help="Pi 5: keep the Pi's power use under WATTS (2-30); the CPU speed "
+                         "follows right away, the GPU's after a reboot. off = no limit. "
+                         'JSON: \'{"watts": 6, "gpu": false}\' (gpu: also lower the GPU '
+                         "speed, default on) (sudo)")
+    ap.add_argument("--power-limit-run", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--set-fan", nargs=2, metavar=("PLAN", "PROFILE"),
                     help=f"choose a plan's fan profile: {', '.join(FAN_PROFILES)} (sudo)")
     ap.add_argument("--eeprom-setup", action="store_true",
@@ -4401,6 +4953,24 @@ def main():
     if args.update:
         for line in update_all():
             print(line)
+        return
+
+    if args.power_limit is not None or args.power_limit_run:
+        if os.geteuid() != 0:
+            sys.exit("Needs root: run with sudo")
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+        if args.power_limit_run:
+            if not single_instance("pi5-energyplan-power"):
+                sys.exit("The power limit is already running")
+            power_limit_run()
+            return
+        value = args.power_limit.strip()
+        try:
+            for line in set_power_limit(json.loads(value) if value.startswith("{")
+                                        else value):
+                print(line)
+        except (ValueError, RuntimeError, OSError) as e:
+            sys.exit(f"Error: {e}")
         return
 
     if args.ups_config or args.battery_guard:

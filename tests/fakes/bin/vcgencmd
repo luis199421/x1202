@@ -10,13 +10,25 @@ cmd = sys.argv[1:2]
 if cmd == ["get_throttled"]:
     print(f"throttled={hw.get('throttled', '0x0')}")
 elif cmd == ["pmic_read_adc"]:
-    print("""   3V7_WL_SW_A current(0)=0.00390372A
+    if hw.get("pmic") is False:
+        sys.exit(1)
+    # power model for the power limit: the CPU core's current follows the CPU's top
+    # speed (core_a_per_ghz), plus other load such as the GPU (extra_w, on DDR_VDD2)
+    core_a = 1.0
+    if "core_a_per_ghz" in hw:
+        with open("/sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq") as f:
+            ghz = int(f.read()) / 1e6
+        core_a = hw.get("core_a_base", 0.5) + hw["core_a_per_ghz"] * ghz
+    extra = hw.get("extra_w", 0) / 1.1
+    print(f"""   3V7_WL_SW_A current(0)=0.00390372A
    3V3_SYS_A current(1)=0.06636324A
-   VDD_CORE_A current(7)=1.00000000A
+   VDD_CORE_A current(7)={core_a:.8f}A
+   DDR_VDD2_A current(5)={extra:.8f}A
    EXT5V_A current(8)=0.00000000A
    3V7_WL_SW_V volt(8)=3.71048200V
    3V3_SYS_V volt(9)=3.31136000V
    VDD_CORE_V volt(15)=0.80000000V
+   DDR_VDD2_V volt(13)=1.10000000V
    EXT5V_V volt(24)=5.13996000V""")
 elif cmd == ["measure_clock"] and sys.argv[2:3] == ["v3d"]:
     print(f"frequency(0)={hw.get('v3d_mhz', 960) * 1000000}")

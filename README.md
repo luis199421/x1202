@@ -85,15 +85,16 @@ It detects the board and only offers what that board has:
 
 ### Your own plan (Custom)
 
-The last row, **Custom**, starts empty. Click it (or its **Edit…** button) and choose:
+The last row, **Custom**, starts empty. Click it (or its **Edit…** button) and choose.
+The speeds are boxes: type the exact number of MHz, or use the arrows.
 
 | Setting | Range |
 |---|---|
-| CPU max speed | 1.5–3.0 GHz in 100 MHz steps (2.4 GHz is the Pi 5's normal top speed) |
-| CPU min speed | From the lowest speed (1.5 GHz, normal) up to the max speed. The slowest the CPU goes when idle: higher feels snappier but uses more power and heat. Applies right away, and the boot service sets it again at every boot |
+| CPU max speed | 100–3000 MHz, any number (2400 MHz is the Pi 5's normal top speed; above it is an overclock) |
+| CPU min speed | 100 MHz up to the max speed (1500 MHz = normal). The slowest the CPU goes when idle: higher feels snappier but uses more power and heat. Applies right away, and the boot service sets it again at every boot |
 | Extra CPU voltage | None, +0.025 V or +0.05 V (2.8 GHz and more usually need it) |
-| GPU (3D) speed | 600–1100 MHz in 10 MHz steps (960 MHz = default, which writes nothing) |
-| GPU min speed | Default (500 MHz when idle, writes nothing), or 600 MHz up to the GPU speed (`v3d_freq_min` in `config.txt`, applies after a reboot) |
+| GPU (3D) speed | 100–1100 MHz, any number (960 MHz = default, which writes nothing) |
+| GPU min speed | Empty = default (500 MHz when idle, writes nothing), or 100 MHz up to the GPU speed (`v3d_freq_min` in `config.txt`, applies after a reboot) |
 | Fan profile | Silent, Quiet, Default, Cool, Strong, Max |
 | CPU governor | powersave, conservative, ondemand, schedutil, performance |
 
@@ -107,9 +108,17 @@ sudo pi5_energyplan.py --set-custom '{"max_freq_mhz": 2600, "over_voltage_delta"
 ```
 
 The lowest speeds are optional: add `"min_freq_mhz": 1800` (CPU) and `"v3d_freq_min": 800`
-(GPU); leave them out for the normal lowest speeds. A lower minimum than the normal one
-isn't possible: the Raspberry Pi firmware doesn't support it, and it wouldn't save power.
-Any other plan, and the battery saver, go back to the normal lowest speed.
+(GPU); leave them out for the normal lowest speeds. Any other plan, and the battery saver,
+go back to the normal lowest speed.
+
+* **Exact speeds:** Linux changes the CPU's speed in 100 MHz steps, so a speed in between
+  runs at the step below it for the max (2650 → 2600 MHz while running) and the step above
+  it for the min (1750 → 1800 MHz). The GPU uses the exact number.
+* **Below the normal lowest speed** (CPU 1500 MHz, GPU 500 MHz on a Pi 5): the
+  firmware's own minimum is lowered too (`arm_freq_min`, `v3d_freq_min` in `config.txt`),
+  so it applies after a reboot. Raspberry Pi doesn't officially support this, and it
+  saves little power; if the firmware ignores it, the Pi simply runs at its normal lowest
+  speed. The window shows a warning.
 
 ![The Custom plan editor](docs/custom-plan.png)
 
@@ -175,6 +184,36 @@ Safety details:
 * Running the same plan again never adds a second block.
 * Speeds above what the current boot allows (for example 2.8 GHz when the Pi booted
   at 2.4 GHz) are noted as "unlocks after reboot".
+
+### Power limit (Pi 5)
+
+**Power limit…** (in the window), or `sudo pi5_energyplan.py --power-limit 6`, keeps the
+Pi's power use under the watts you choose (2–30 W). It's measured by the Pi 5's power chip
+(`vcgencmd pmic_read_adc`, the sum of every supply rail of the board); USB devices and the
+fan aren't counted. A small service (`pi5-power-limit.service`) checks it every 2 seconds:
+
+* **CPU, right away:** over the limit, the CPU's top speed goes down one 100 MHz step (two
+  when more than 1.5 W over). It measures how many watts one step makes, and goes back up a
+  step when that still fits under the limit, after three readings with room. It never goes
+  above the plan's own top speed, and a min speed above the limit's speed is lowered with
+  it. When a plan or the battery saver changes the speed, the limit takes over again
+  within 2 seconds.
+* **GPU, after a reboot:** Linux can't change the 3D GPU's speed while the Pi runs; only
+  `config.txt` can (`v3d_freq`). So if the Pi stays over the limit for a minute with the
+  CPU already at its lowest speed, the GPU's top speed is lowered 100 MHz for the next
+  boot. After 30 minutes at least 1.5 W under the limit (CPU not limited) it goes back up
+  100 MHz. At most one GPU change per boot, never below 500 MHz (the GPU's normal lowest
+  speed), and only with a plan kept after reboot (it lives in the plan's block). Untick
+  **Also lower the GPU speed** (`'{"watts": 6, "gpu": false}'`) to leave the GPU alone.
+* **Off** (`--power-limit off`, or untick it in the window): the service is removed, the
+  plan's own speeds come back right away, and the GPU's after a reboot.
+
+Idle, a Pi 5 uses about 2.5–3 W, and about 7–9 W busy at 2.4 GHz. A limit under what it
+needs at the lowest speeds can't be kept; the window and `--status` say so. The stats card
+shows the power use (orange when the limit is holding the CPU back), and `--status` has a
+**Power limit** line.
+
+![Power limit](docs/power-limit.png)
 
 ### Live status
 
@@ -502,6 +541,7 @@ After `install.sh`, you can write `pi5_energyplan.py` instead of
 | `sudo python3 pi5_energyplan.py --set-governor Eco performance` | Change the governor a plan uses |
 | `sudo python3 pi5_energyplan.py --set-fan Eco Strong` | Change a plan's fan profile (Silent, Quiet, Default, Cool, Strong, Max) |
 | `sudo python3 pi5_energyplan.py --set-custom '{…}' [--apply Custom]` | Fill in the Custom plan (see [Your own plan](#your-own-plan-custom)) |
+| `sudo python3 pi5_energyplan.py --power-limit 6` | Pi 5: keep the power use under 6 W (`off` = no limit; `'{"watts": 6, "gpu": false}'` leaves the GPU alone). See [Power limit](#power-limit-pi-5) |
 | `python3 pi5_energyplan.py --battery` | Live battery readout every 3 s (Ctrl+C to stop) |
 | `python3 pi5_energyplan.py --monitor [SECONDS]` | Full UPS and Pi report, refreshed in place (Ctrl+C to stop) |
 | `sudo python3 pi5_energyplan.py --charge-full on` | Charge to 100 % once, then back to the limit (`off` cancels) |
@@ -553,6 +593,9 @@ After `install.sh`, you can write `pi5_energyplan.py` instead of
 | `/boot/firmware/config.txt.before-repair` | Only if an update repaired lines an older version had moved (see Troubleshooting) |
 | `/etc/systemd/system/pi5-energyplan.service` | Restores the plan at boot |
 | `/etc/systemd/system/pi5-battery-guard.service` | Battery guard |
+| `/etc/systemd/system/pi5-power-limit.service` | Only while the power limit is on |
+| `/etc/pi5-energyplan/power.json` | Power limit settings (and the GPU speed it chose) |
+| `/run/pi5-energyplan/power-limit.json`, `plan-limits.json` | Live power-limit status; the plan's CPU speeds it gives back |
 | `/etc/pi5-energyplan/battery.json` | UPS settings |
 | `/etc/pi5-energyplan/governors.json`, `fans.json` | Your per-plan governor and fan choices |
 | `/etc/pi5-energyplan/custom.json` | The "Sweet Spot" and "Custom" plans |
@@ -649,7 +692,7 @@ second copy of anything:
 |---|---|
 | `config.txt` | One managed block between markers, replaced as a whole. Old lines are commented out once. The backup is made only the first time. |
 | Bootloader | Each setting is replaced in place, never added again, and only written when it's different. Your 5 V choice is kept. |
-| Services | The two unit files are rewritten in place; `systemctl enable` is the same every time. |
+| Services | The unit files are rewritten in place; `systemctl enable` is the same every time. The power limit's service exists only while the limit is on. |
 | Package | Installing again reinstalls the same package; only the latest built `.deb` is kept. |
 | Menu entry, panel icon | Always the same two files. Starting the icon stops the old one first; a second icon, window, battery guard or boot task refuses to start. |
 | UPS settings | `--ups-recommended` only applies on a first install. |
@@ -713,7 +756,7 @@ The installer test for the menu entry and panel icon needs a throwaway user:
 `sudo INSTALL_TEST_USER=someuser sh tests/run_sim_tests.sh`. To run some tests only:
 `sudo TESTS="TestUps TestNothingTwice" sh tests/run_sim_tests.sh`.
 
-The 118 tests cover:
+The 129 tests cover:
 
 * **Plans:** applying each kind of plan, the live sysfs changes and governor fallback,
   `config.txt` editing (backup, commenting out conflicting lines, only `[all]`/`[pi5]`
@@ -782,9 +825,20 @@ The 118 tests cover:
 * **Custom plan:** empty at first and can't be applied; filled in from the window
   (editor click-through) or with `--set-custom`; its CPU, voltage, GPU, fan and
   governor end up in `config.txt` and live; the CPU and GPU minimum speeds (live and at
-  boot, never above the max, back to normal with another plan); the GPU default writes
-  nothing; bad values
-  are refused; changing it while in use applies it again; it coexists with Sweet Spot.
+  boot, never above the max, back to normal with another plan); exact speeds typed in
+  the boxes, and speeds below the normal lowest (`arm_freq_min` / `v3d_freq_min`, after
+  a reboot); the GPU default writes nothing; bad values (also typed letters) are
+  refused and the window says why; changing it while in use applies it again; it
+  coexists with Sweet Spot.
+* **Power limit:** the CPU settles at the fastest step under the limit and comes back
+  up when the load drops (never above the plan); it learns the watts per step; plan
+  changes and min speeds are handled; the GPU is lowered for the next boot after a
+  minute over the limit at the lowest CPU speed, once per boot, raised again after 30
+  minutes with room, kept in `config.txt` through plan changes, never below 500 MHz,
+  and only with a saved plan; `--power-limit` on / JSON / off (service added once,
+  removed, speeds and GPU given back), bad values, other boards and a missing power
+  reading are refused; the service gives the speeds back when it stops; updates
+  refresh it; the window's power limit box and power reading.
 * **GPU overclock:** 1000 → 1050 → 1100 MHz for the three overclock plans, none for
   the others, and a hand-made `v3d_freq` can't override the plan.
 * **GUI and panel icon:** the window builds and shows live values; the panel icon

@@ -1322,7 +1322,7 @@ class TestOtherBoards(Base):
         self.assertIn("[pi02]\narm_freq=600\n[all]", self.block())
         self.assertEqual(get(CPUFREQ + "/scaling_max_freq"), "600000")
         # the Custom plan can't overclock it, and has no voltage / GPU / fan settings
-        for bad, why in (({"max_freq_mhz": 1200}, "CPU speed: 600-1000 MHz"),
+        for bad, why in (({"max_freq_mhz": 1200}, "CPU speed: 100-1000 MHz"),
                          ({"over_voltage": 2}, "Extra voltage"),
                          ({"over_voltage_delta": 25000}, "Extra voltage"),
                          ({"v3d_freq": 1000}, "only the Raspberry Pi 5")):
@@ -1573,6 +1573,35 @@ class TestCustomPlan(Base):
         self.assertEqual(get(CPUFREQ + "/scaling_max_freq"), "2400000")
         self.assertEqual(get(CPUFREQ + "/scaling_min_freq"), "2400000")
 
+    def test_exact_speeds_and_below_the_normal_lowest(self):
+        out = cli("--set-custom", json.dumps({"max_freq_mhz": 2650, "min_freq_mhz": 1750,
+                                              "v3d_freq": 955, "v3d_freq_min": 505}),
+                  "--apply", "Custom").stdout
+        self.assertIn("CPU 2650 MHz (min 1750 MHz), GPU 955 MHz (min 505 MHz)", out)
+        block = self.block()
+        self.assertIn("arm_freq=2650\n", block)
+        self.assertNotIn("arm_freq_min", block)             # 1750 is above the normal 1500
+        self.assertIn("v3d_freq=955\nv3d_freq_min=505\n", block)
+        self.assertEqual(get(CPUFREQ + "/scaling_min_freq"), "1750000")
+        self.assertRegex(cli("--list").stdout, r"Yours: CPU 2.65 GHz \(min 1.75 GHz\)")
+        # below the normal lowest: the firmware's minimum is lowered too (after reboot)
+        out = cli("--set-custom", json.dumps({"max_freq_mhz": 1200, "min_freq_mhz": 600,
+                                              "v3d_freq": 400}), "--apply", "Custom").stdout
+        self.assertIn("min 600 MHz after reboot", out)
+        block = self.block()
+        self.assertIn("arm_freq=1200\narm_freq_min=600\n", block)
+        self.assertIn("v3d_freq=400\nv3d_freq_min=400\n", block)  # below 500: min follows
+        self.assertEqual(get(CPUFREQ + "/scaling_min_freq"), "1500000")   # until the reboot
+        # only the max given, below the normal lowest: the min follows it
+        cli("--set-custom", '{"max_freq_mhz": 1000}', "--apply", "Custom")
+        self.assertIn("arm_freq=1000\narm_freq_min=1000\n", self.block())
+        # a hand-made arm_freq_min elsewhere doesn't override the plan
+        cfg = self.config().replace("arm_boost=1", "arm_boost=1\narm_freq_min=300")
+        put("/boot/firmware/config.txt", cfg)
+        cli("--apply", "Eco")
+        self.assertIn("#energyplan-disabled# arm_freq_min=300", self.config())
+        self.assertNotIn("arm_freq_min=1000", self.config())
+
     def test_lowest_speed_left_out_changes_nothing(self):
         cli("--set-custom", json.dumps(self.MINE), "--apply", "Custom")
         self.assertEqual(get(CPUFREQ + "/scaling_min_freq"), "1500000")
@@ -1581,14 +1610,15 @@ class TestCustomPlan(Base):
         self.assertNotIn("v3d_freq_min", self.block())
 
     def test_bad_values_are_refused(self):
-        for bad, why in (({"max_freq_mhz": 3200}, "CPU speed: 1500-3000 MHz"),
-                         ({"max_freq_mhz": 2650}, "in steps of 100"),
-                         ({"v3d_freq": 1300}, "GPU speed: 600-1100 MHz"),
+        for bad, why in (({"max_freq_mhz": 3200}, "CPU speed: 100-3000 MHz"),
+                         ({"max_freq_mhz": 50}, "CPU speed: 100-3000 MHz"),
+                         ({"v3d_freq": 1300}, "GPU speed: 100-1100 MHz"),
                          ({"max_freq_mhz": 2000, "min_freq_mhz": 2100},
                           "CPU min speed: at most the max speed (2000 MHz)"),
-                         ({"min_freq_mhz": 1000}, "CPU min speed: 1500-3000 MHz"),
+                         ({"min_freq_mhz": 99}, "CPU min speed: 100-3000 MHz"),
                          ({"v3d_freq_min": 1000}, "GPU min speed: at most the GPU speed"),
-                         ({"v3d_freq_min": 505}, "GPU min speed: 600-1100 MHz"),
+                         ({"v3d_freq_min": 50}, "GPU min speed: 100-1100 MHz"),
+                         ({"max_freq_mhz": "fast"}, "CPU speed: not a number"),
                          ({"over_voltage_delta": 75000}, "Extra voltage"),
                          ({"fan_profile": "Turbo"}, "Fan profile"),
                          ({"governor": "fast"}, "Governor"),
@@ -1611,6 +1641,176 @@ class TestCustomPlan(Base):
         self.assertIn("Sweet Spot", lst)
         self.assertEqual(lst.strip().splitlines()[-1].split()[0], "Custom")   # still last
         self.assertNotIn("Custom", json.loads(get("/etc/pi5-energyplan/fans.json")))
+
+
+class TestPowerLimit(Base):
+    """Keep the Pi's power use under a limit: CPU right away, GPU at the next boot.
+    The fake PMIC's power follows the CPU's top speed: 0.63 W + 3.2 W per GHz
+    (2.4 GHz = 8.3 W, 1.8 GHz = 6.4 W, 1.5 GHz = 5.4 W), plus `extra_w` (GPU etc.)."""
+
+    def setUp(self):
+        super().setUp()
+        hw(core_a_per_ghz=4)
+        cli("--apply", "Performance")
+        self.ep.save_power_cfg({"enabled": True, "watts": 6.5, "gpu": True})
+        self.t = time.time()
+
+    def run_limiter(self, lim, seconds):
+        out = None
+        for _ in range(int(seconds / 2)):
+            self.t += 2
+            out = lim.step(self.t)
+        return out
+
+    def top(self):
+        return int(get(CPUFREQ + "/scaling_max_freq")) // 1000
+
+    def test_cpu_follows_the_limit(self):
+        lim = self.ep.PowerLimiter(log=lambda m: None)
+        st = self.run_limiter(lim, 30)
+        self.assertEqual(self.top(), 1800)           # 6.4 W: the fastest under 6.5 W
+        self.assertEqual(st["cpu_cap_mhz"], 1800)
+        self.assertLess(st["watts"], 6.5)
+        self.run_limiter(lim, 60)
+        self.assertEqual(self.top(), 1800)           # steady, no back and forth
+        self.assertAlmostEqual(lim.step_w, 0.32, delta=0.06)   # learned: W per 100 MHz
+        lim.cap[CPUFREQ] = 1700000                    # one step too low
+        self.run_limiter(lim, 30)
+        self.assertEqual(self.top(), 1800)           # 1.8 GHz still fits: back up
+        self.assertIn("CPU limited to 1.8 GHz", self.ep.power_limit_line())
+        # lighter load: back up step by step to the plan's own 2.4 GHz, never above
+        hw(core_a_per_ghz=2)
+        self.run_limiter(lim, 120)
+        self.assertEqual(self.top(), 2400)
+        self.assertIsNone(lim.step(self.t + 2)["cpu_cap_mhz"])
+
+    def test_plan_changes_and_min_speed(self):
+        cli("--set-custom", '{"max_freq_mhz": 2400, "min_freq_mhz": 2000}', "--apply",
+            "Custom")
+        lim = self.ep.PowerLimiter(log=lambda m: None)
+        self.run_limiter(lim, 30)
+        self.assertEqual(self.top(), 1800)
+        self.assertEqual(get(CPUFREQ + "/scaling_min_freq"), "1800000")   # under the cap
+        cli("--apply", "Custom")                      # a plan sets 2.4 GHz again...
+        self.assertEqual(self.top(), 2400)
+        self.run_limiter(lim, 2)
+        self.assertEqual(self.top(), 1800)            # ...and the limit takes over again
+        cli("--apply", "Eco")                         # a slower plan: under the limit
+        self.run_limiter(lim, 10)
+        self.assertEqual(self.top(), 1800)
+        lim.restore()
+        self.assertEqual(self.top(), 1800)            # Eco's own speed
+        cli("--apply", "Custom")
+        self.run_limiter(lim, 30)
+        lim.restore()                                 # stopping gives the plan back
+        self.assertEqual(self.top(), 2400)
+        self.assertEqual(get(CPUFREQ + "/scaling_min_freq"), "2000000")
+
+    def test_gpu_is_lowered_for_the_next_boot_once_per_boot(self):
+        hw(extra_w=4)                                 # too much even at 1.5 GHz
+        logs = []
+        lim = self.ep.PowerLimiter(log=logs.append)
+        self.run_limiter(lim, 20)
+        self.assertEqual(self.top(), 1500)
+        self.assertNotIn("v3d_freq", self.config())
+        self.run_limiter(lim, 70)                     # a minute over at the lowest speed
+        self.assertIn("v3d_freq=860\n", self.config())
+        self.assertIn("GPU top speed lowered to 860 MHz for the next boot", logs[0])
+        self.assertEqual(self.ep.load_power_cfg()["gpu_cap"], 860)
+        self.run_limiter(lim, 300)
+        self.assertEqual(len(logs), 1)                # only once per boot
+        lim = self.ep.PowerLimiter(log=logs.append)  # after the reboot: once more
+        self.run_limiter(lim, 90)
+        self.assertIn("v3d_freq=760\n", self.config())
+        # with plenty of room for 30 minutes it goes back up (one step per boot)
+        hw(extra_w=0, core_a_per_ghz=1)
+        lim = self.ep.PowerLimiter(log=logs.append)
+        self.run_limiter(lim, 40 * 60)
+        self.assertIn("v3d_freq=860\n", self.config())
+        self.assertIn("raised to 860 MHz", logs[-1])
+        # a plan change keeps the cap in config.txt
+        cli("--apply", "OC 2.6 GHz")
+        self.assertIn("v3d_freq=860\n", self.config())
+        self.assertNotIn("v3d_freq=1000", self.config())
+
+    def test_gpu_needs_a_saved_plan_and_stops_at_500(self):
+        put("/boot/firmware/config.txt", STOCK_CONFIG.rstrip("\n"))   # no saved plan
+        hw(extra_w=4)
+        lim = self.ep.PowerLimiter(log=lambda m: None)
+        st = self.run_limiter(lim, 90)
+        self.assertIn("keep a plan after reboot", st["note"])
+        self.assertEqual(self.config(), STOCK_CONFIG.rstrip("\n"))
+        self.ep.save_power_cfg({"enabled": True, "watts": 6.5, "gpu": True, "gpu_cap": 500})
+        cli("--apply", "Performance")
+        lim = self.ep.PowerLimiter(log=lambda m: None)
+        st = self.run_limiter(lim, 90)
+        self.assertIn("the limit is too low", st["note"])
+        self.assertEqual(self.ep.load_power_cfg()["gpu_cap"], 500)
+
+    def test_command_line_and_service(self):
+        out = cli("--power-limit", "6").stdout
+        self.assertIn("Power limit on: 6 W", out)
+        unit = get("/etc/systemd/system/pi5-power-limit.service")
+        self.assertIn("pi5_energyplan.py --power-limit-run", unit)
+        self.assertIn("systemctl enable --now pi5-power-limit.service", calls())
+        self.assertEqual(json.loads(get("/etc/pi5-energyplan/power.json"))["watts"], 6.0)
+        self.assertIn("Power limit : 6 W, but the service isn't running", cli("--status").stdout)
+        cli("--power-limit", "6")                     # again: nothing twice
+        self.assertEqual(get("/etc/systemd/system/pi5-power-limit.service"), unit)
+        cli("--power-limit", '{"watts": 7.5, "gpu": false}')
+        cfg = json.loads(get("/etc/pi5-energyplan/power.json"))
+        self.assertEqual((cfg["watts"], cfg["gpu"], cfg["enabled"]), (7.5, False, True))
+        # off: service gone, the GPU cap removed from config.txt, plan speeds back
+        self.ep.save_power_cfg(dict(cfg, gpu=True, gpu_cap=860))
+        cli("--apply", "Performance")
+        self.assertIn("v3d_freq=860", self.config())
+        put(CPUFREQ + "/scaling_max_freq", 1800000)
+        out = cli("--power-limit", "off").stdout
+        self.assertIn("Power limit off", out)
+        self.assertIn("GPU speed back to the plan's after a reboot", out)
+        self.assertFalse(os.path.exists("/etc/systemd/system/pi5-power-limit.service"))
+        self.assertIn("systemctl disable --now pi5-power-limit.service", calls())
+        self.assertNotIn("v3d_freq", self.config())
+        self.assertEqual(self.top(), 2400)
+        self.assertEqual(cli("--status").stdout.count("Power limit : off"), 1)
+        self.assertIn("Power limit is off", cli("--power-limit", "off").stdout)
+
+    def test_bad_values_and_other_boards(self):
+        for bad, why in (("1", "2-30 W"), ("50", "2-30 W"), ("lots", "a number of watts")):
+            r = cli("--power-limit", bad, check=False)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn(why, r.stderr)
+        hw(pmic=False)
+        r = cli("--power-limit", "6", check=False)
+        self.assertIn("can't read the Pi's power use", r.stderr)
+        hw(pmic=True)
+        as_board("Raspberry Pi 4 Model B Rev 1.4", 1800000, 600000)
+        r = cli("--power-limit", "6", check=False)
+        self.assertIn("needs a Raspberry Pi 5", r.stderr)
+        self.assertNotIn("Power limit", cli("--status").stdout)
+
+    def test_service_loop_stops_cleanly_and_gives_speeds_back(self):
+        ep = self.ep
+        n = [0]
+
+        def on_sleep():
+            n[0] += 1
+            if n[0] == 20:
+                raise Stop
+        ep.time = Clock(on_sleep)
+        with self.assertRaises(Stop):
+            ep.power_limit_run()
+        self.assertEqual(self.top(), 2400)            # restored when it stops
+        self.assertFalse(os.path.exists("/run/pi5-energyplan/power-limit.json"))
+        ep.save_power_cfg({"enabled": False, "watts": 6.5, "gpu": True})
+        ep.power_limit_run()                          # off: returns by itself
+
+    def test_update_refreshes_the_service(self):
+        cli("--power-limit", "6")
+        put("/etc/systemd/system/pi5-power-limit.service", "[Unit]\nold")
+        out = cli("--update-root").stdout
+        self.assertIn("Service file refreshed: pi5-power-limit.service", out)
+        self.assertIn("--power-limit-run", get("/etc/systemd/system/pi5-power-limit.service"))
 
 
 class TestConfigLinesKeepTheirSection(Base):
@@ -2213,7 +2413,7 @@ class TestGuiOtherBoards(Base):
             self.assertIn("CPU max speed", e)
             for gone in ("GPU (3D) speed", "Fan profile", "Extra CPU voltage"):
                 self.assertNotIn(gone, e)
-            self.assertEqual(app.custom_controls["cpu"].get(), 1000)
+            self.assertEqual(app.custom_controls["cpu"].get(), "1000")
         finally:
             app.root.destroy()
             KEEP_TK.append(app)
@@ -2417,14 +2617,20 @@ class TestGui(Base):
             ep.messagebox.askyesno = lambda *a: True
             ctl = app.custom_controls
             self.assertEqual((ctl["cpu"].get(), ctl["gpu"].get(), ctl["fan"].get()),
-                             (2400, 960, "Default"))         # starts at the Pi's defaults
-            self.assertEqual((ctl["cpu_min"].get(), ctl["gpu_min"].get()), (1500, "Default"))
-            ctl["cpu"].set(2600)
-            ctl["cpu_min"].set(2800)
+                             ("2400", "960", "Default"))     # starts at the Pi's defaults
+            self.assertEqual((ctl["cpu_min"].get(), ctl["gpu_min"].get()), ("1500", ""))
+            ctl["cpu"].set("2600")
+            ctl["cpu_min"].set("2800")
             ctl["gpu_min"].set("900")
             app.root.update()
-            self.assertEqual(ctl["cpu_min"].get(), 2600)      # never above the max
-            ctl["cpu_min"].set(1800)
+            self.assertIn("CPU min speed: at most the max speed", ctl["note"].cget("text"))
+            ctl["Save"].invoke()                               # refused, window stays
+            app.root.update()
+            self.assertTrue(app.custom_win.winfo_exists())
+            self.assertFalse(app.busy)
+            ctl["cpu_min"].set("abc")
+            self.assertIn("CPU min speed: type a number", ctl["note"].cget("text"))
+            ctl["cpu_min"].set("1800")
             ctl["volt"].set("+0.025 V")                       # triggers the warning text
             app.root.update()
             self.assertIn("Overclock", ctl["note"].cget("text"))
@@ -2450,6 +2656,51 @@ class TestGui(Base):
         finally:
             app.root.destroy()
             KEEP_TK.append(app)   # freed at exit on the main thread (Tk aborts otherwise)
+
+
+@unittest.skipUnless(HAVE_TK, "needs tkinter and a display (use xvfb-run)")
+class TestPowerLimitWindow(Base):
+    def test_power_limit_window(self):
+        ep = self.ep
+        app = ep.App()
+        try:
+            app.root.update()
+            self.assertRegex(app.stat["Power"].cget("text"), r"^\d+\.\d W · OK")
+            app.open_power_limit()
+            app.root.update()
+            ctl = app.power_controls
+            self.assertFalse(ctl["enabled"].get())
+            self.assertEqual(ctl["watts"].get(), "8")
+            ctl["enabled"].set(True)
+            ctl["watts"].set("1")
+            ctl["Save"].invoke()
+            self.assertIn("2-30 W", ctl["note"].cget("text"))   # refused, window stays
+            self.assertFalse(app.busy)
+            ctl["watts"].set("6.5")
+            ctl["Save"].invoke()
+            end = time.time() + 60
+            while app.busy and time.time() < end:
+                app.root.update()
+                time.sleep(0.05)
+            self.assertIn("Power limit on: 6.5 W", app.msg.cget("text"))
+            self.assertTrue(json.loads(get("/etc/pi5-energyplan/power.json"))["enabled"])
+            app._refresh()
+            self.assertIn("limit 6.5 W (not running)", app.stat["Power"].cget("text"))
+        finally:
+            app.root.destroy()
+            KEEP_TK.append(app)
+
+    def test_not_on_other_boards(self):
+        as_board("Raspberry Pi 4 Model B Rev 1.4", 1800000, 600000)
+        ep = load_module()
+        app = ep.App()
+        try:
+            app.root.update()
+            self.assertNotIn(" W", app.stat["Power"].cget("text"))
+            self.assertNotIn("Power limit…", widget_texts(app.root))
+        finally:
+            app.root.destroy()
+            KEEP_TK.append(app)
 
 
 @unittest.skipUnless(shutil.which("dbus-daemon"), "needs dbus-daemon")
