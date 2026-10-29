@@ -92,7 +92,7 @@ The speeds are boxes: type the exact number of MHz, or use the arrows.
 |---|---|
 | CPU max speed | 100–3000 MHz, any number (2400 MHz is the Pi 5's normal top speed; above it is an overclock) |
 | CPU min speed | 100 MHz up to the max speed (1500 MHz = normal). The slowest the CPU goes when idle: higher feels snappier but uses more power and heat. Applies right away, and the boot service sets it again at every boot |
-| Extra CPU voltage | None, +0.025 V or +0.05 V (2.8 GHz and more usually need it) |
+| Core voltage (CPU + GPU) | Change from the normal voltage in mV, typed in a box. Pi 5: −200 to +50 mV, any number (`over_voltage_delta`). Pi 4: −400 to +150 mV in 25 mV steps (`over_voltage`). Pi 3 / Zero / older: −400 to 0 mV in 25 mV steps (undervolt only). **Negative = undervolt**: less power and heat, but too low and the Pi freezes or won't boot. 2.8 GHz and more usually need +25 to +50 mV. Applies after a reboot |
 | GPU (3D) speed | 100–1100 MHz, any number (960 MHz = default, which writes nothing) |
 | GPU min speed | Empty = default (500 MHz when idle, writes nothing), or 100 MHz up to the GPU speed (`v3d_freq_min` in `config.txt`, applies after a reboot) |
 | Fan profile | Silent, Quiet, Default, Cool, Strong, Max |
@@ -111,6 +111,12 @@ The lowest speeds are optional: add `"min_freq_mhz": 1800` (CPU) and `"v3d_freq_
 (GPU); leave them out for the normal lowest speeds. Any other plan, and the battery saver,
 go back to the normal lowest speed.
 
+* **Undervolt:** the CPU and the GPU share one voltage rail (VDD_CORE) on the Raspberry
+  Pi, so one setting changes both; there's no separate GPU voltage. Go down in small
+  steps (−25 mV at a time) and use the Pi normally for a while after each one, or let
+  the [sweet spot test](#3-sweet-spot-overclock-test) find the lowest stable voltage
+  safely. If an undervolt freezes the Pi or it won't boot, remove the `pi5-energyplan`
+  block from `config.txt` on another computer.
 * **Exact speeds:** Linux changes the CPU's speed in 100 MHz steps, so a speed in between
   runs at the step below it for the max (2650 → 2600 MHz while running) and the step above
   it for the min (1750 → 1800 MHz). The GPU uses the exact number.
@@ -343,9 +349,15 @@ some of them shut the Pi down and others only print. Everything they do is built
 ## 3. Sweet spot overclock test
 
 **Find sweet spot…** in the window, or `sudo python3 pi5_energyplan.py --autotest`,
-tries these steps in order:
+finds the fastest stable speed **and** the lowest stable voltage at it, in two parts:
 
-`2.6 GHz +0 mV → 2.6 GHz +25 mV → 2.8 GHz +25 mV → 2.8 GHz +50 mV → 3.0 GHz +50 mV`
+1. **Speed:** `2.6 GHz +0 mV → 2.6 GHz +25 mV → 2.8 GHz +25 mV → 2.8 GHz +50 mV →
+   3.0 GHz +50 mV`
+2. **Voltage (undervolt):** at the fastest speed that passed (or the normal 2.4 GHz if
+   no overclock was stable), the voltage goes down 25 mV per step (for example 2.6 GHz
+   −25 mV → −50 mV → −75 mV …) until a step fails, down to −200 mV at most. A voltage
+   that already failed at that speed isn't tried again. Leave this part out with
+   `--autotest --no-undervolt`.
 
 For each step:
 
@@ -360,10 +372,13 @@ For each step:
    the next boot comes back with your normal `config.txt` and the test continues.
    After a crash or a wrong result, it tries the same speed with more voltage. If a
    step fails from heat or power, the test stops there.
-4. At the end, the fastest step that passed is saved as the plan **"Sweet Spot"** and
-   turned on. Then the Pi reboots normally.
+4. At the end, the fastest speed with the **lowest stable voltage plus a 15 mV safety
+   margin** (for loads the stress test doesn't make) is saved as the plan
+   **"Sweet Spot"** and turned on, for example `2.6 GHz −35 mV` when −50 mV passed and
+   −75 mV froze. Then the Pi reboots normally. The log also shows the core voltage
+   measured during each step.
 
-The whole test takes about 20–40 minutes. Check progress with `--autotest-status`
+The whole test takes about 40–90 minutes. Check progress with `--autotest-status`
 and stop it with `sudo … --autotest-cancel`. If the Pi freezes for more than a minute,
 unplug it and plug it back in: it always comes back with your normal settings.
 
@@ -756,7 +771,7 @@ The installer test for the menu entry and panel icon needs a throwaway user:
 `sudo INSTALL_TEST_USER=someuser sh tests/run_sim_tests.sh`. To run some tests only:
 `sudo TESTS="TestUps TestNothingTwice" sh tests/run_sim_tests.sh`.
 
-The 129 tests cover:
+The 133 tests cover:
 
 * **Plans:** applying each kind of plan, the live sysfs changes and governor fallback,
   `config.txt` editing (backup, commenting out conflicting lines, only `[all]`/`[pi5]`
@@ -770,7 +785,13 @@ The 129 tests cover:
   the charge-pin self-check.
 * **Sweet spot test:** a full run (pass, unstable, no boot → Sweet Spot saved, tryboot
   removed, `config.txt` untouched until the end), a crash during stress,
-  old-bootloader detection, and cancel.
+  old-bootloader detection, and cancel; then the undervolt part: lower voltages at the
+  fastest speed until one fails, the 15 mV margin, the normal speed undervolted when no
+  overclock is stable, never below −200 mV, a voltage that already failed isn't tried
+  again, and `--no-undervolt`.
+* **Undervolt in the Custom plan:** negative core voltage on a Pi 5 (any mV), Pi 4 and
+  Zero 2 W (25 mV steps, undervolt only on the Zero), the limits, and the window's
+  voltage box and its warnings.
 * **Installer:** Trixie and Bookworm package names, I2C switch-on, bootloader
   settings (and skipping them), recommended UPS settings only on a first install, the
   warning about running Geekworm scripts, menu entry and panel icon for the sudo user,

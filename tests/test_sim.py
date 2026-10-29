@@ -640,7 +640,7 @@ class TestAutotest(Base):
 
     def test_finds_sweet_spot(self):
         ep = self.ep
-        ep.start_autotest(1, 80)
+        ep.start_autotest(1, 80, undervolt=False)
         self.assertEqual(calls()[-1], "reboot 0 tryboot")
         self.assertEqual(self.config(), self.normal)     # config.txt never touched
         self.assertIn("arm_freq=2600\n[all]\n# <<<", self.tryboot())
@@ -665,6 +665,98 @@ class TestAutotest(Base):
         self.assertEqual(custom["Sweet Spot"]["max_freq_mhz"], 2600)
         self.assertIn("Sweet Spot", cli("--list").stdout)
         self.assertIn("2600 MHz +0 mV → plan 'Sweet Spot'", cli("--status").stdout)
+
+    def test_finds_speed_then_lowest_voltage(self):
+        ep = self.ep
+        ep.start_autotest(1, 80)
+        ok = (True, "stable", 60.0)
+        self.results = [ok]
+        self.boot(True)                                   # 2600 +0 passes
+        self.results = [(False, "unstable", 70.0)]
+        self.boot(True)                                   # 2800 +25 mV unstable
+        self.boot(False)                                  # 2800 +50 mV didn't boot
+        st = ep.load_state()
+        self.assertEqual((st["mode"], st["step"]), ("undervolt", [2600, -25000]))
+        self.assertIn("arm_freq=2600\nover_voltage_delta=-25000", self.tryboot())
+        self.assertIn("TESTING 2600 MHz -25 mV (step 4, undervolt)",
+                      cli("--status").stdout)
+        self.assertEqual(self.config(), self.normal)     # config.txt still untouched
+        self.results = [ok]
+        self.boot(True)                                   # -25 mV passes
+        self.assertIn("over_voltage_delta=-50000", self.tryboot())
+        self.results = [ok]
+        self.boot(True)                                   # -50 mV passes
+        self.assertIn("over_voltage_delta=-75000", self.tryboot())
+        st = ep.load_state()
+        st["phase"] = "running"                           # -75 mV froze mid stress test
+        ep.save_state(st)
+        self.boot(False)
+        st = ep.load_state()
+        self.assertEqual(st["phase"], "done")
+        self.assertEqual(st["best"], [2600, -35000])      # -50 mV + 15 mV margin
+        self.assertIn("arm_freq=2600\nover_voltage_delta=-35000", self.config())
+        self.assertIn("# plan: Sweet Spot", self.config())
+        self.assertFalse(os.path.exists("/boot/firmware/tryboot.txt"))
+        log = get("/var/lib/pi5-energyplan/autotest.log")
+        self.assertIn("Lowest stable voltage: 2600 MHz -50 mV; with a 15 mV safety "
+                      "margin: 2600 MHz -35 mV", log)
+        self.assertIn("2600 MHz -35 mV → plan 'Sweet Spot'", cli("--status").stdout)
+        self.assertTrue(ep.PLANS["Sweet Spot"]["warn"])   # still an overclock
+
+    def test_no_overclock_stable_undervolts_the_normal_speed(self):
+        ep = self.ep
+        ep.start_autotest(1, 80)
+        bad = (False, "unstable", 70.0)
+        self.results = [bad]
+        self.boot(True)                                   # 2600 +0
+        self.results = [bad]
+        self.boot(True)                                   # 2600 +25: no overclock
+        self.assertIn("arm_freq=2400\nover_voltage_delta=-25000", self.tryboot())
+        self.results = [(True, "stable", 55.0)]
+        self.boot(True)
+        self.boot(False)                                  # -50 mV didn't boot
+        st = ep.load_state()
+        self.assertEqual(st["best"], [2400, -10000])
+        plan = json.loads(get("/etc/pi5-energyplan/custom.json"))["Sweet Spot"]
+        self.assertFalse(plan["warn"])                    # not an overclock
+        self.assertTrue(plan["undervolt"])
+        self.assertIn("2.4 GHz, -10 mV", plan["desc"])
+
+    def test_undervolt_stops_at_the_lowest_and_when_a_step_failed_before(self):
+        ep = self.ep
+        ep.start_autotest(1, 80)
+        ok = (True, "stable", 50.0)
+        self.results = [ok]
+        self.boot(True)                                   # 2600 +0
+        self.results = [ok]
+        self.boot(True)                                   # 2800 +25
+        self.results = [ok]
+        self.boot(True)                                   # 3000 +50: fastest
+        self.assertIn("arm_freq=3000\nover_voltage_delta=25000", self.tryboot())
+        for _ in range(12):                               # 25, 0, … -200 mV all pass
+            if ep.load_state()["phase"] == "done":
+                break
+            self.results = [ok]
+            self.boot(True)
+        st = ep.load_state()
+        self.assertEqual(st["phase"], "done")
+        self.assertEqual(min(r["ovd"] for r in st["results"]), -200000)   # never lower
+        self.assertEqual(st["best"], [3000, -185000])
+        # a voltage that already failed at that speed isn't tried again
+        ep.start_autotest(1, 80)
+        self.results = [ok]
+        self.boot(True)                                   # 2600 +0
+        self.results = [(False, "unstable", 70.0)]
+        self.boot(True)                                   # 2800 +25 fails
+        self.results = [ok]
+        self.boot(True)                                   # 2800 +50 passes
+        self.results = [(False, "unstable", 75.0)]
+        self.boot(True)                                   # 3000 +50 fails: 2800 fastest
+        st = ep.load_state()
+        self.assertEqual(st["phase"], "done")             # 2800 +25 failed already
+        self.assertEqual(st["best"], [2800, 50000])
+        self.assertIn("No lower voltage was stable",
+                      get("/var/lib/pi5-energyplan/autotest.log"))
 
     def test_crash_moves_to_more_voltage(self):
         ep = self.ep
@@ -1312,6 +1404,13 @@ class TestOtherBoards(Base):
         ep = self.board("Raspberry Pi 4 Model B Rev 1.2", 1500000, 600000)
         self.assertEqual(ep.PLANS["OC 1.8 GHz"]["over_voltage"], 2)
         self.assertEqual(ep.PLANS["Balanced"]["max_freq_mhz"], 1500)
+        # Custom: undervolt and overvolt in 25 mV steps (over_voltage -16 to 6)
+        out = cli("--set-custom", '{"max_freq_mhz": 1500, "over_voltage": -2}',
+                  "--apply", "Custom").stdout
+        self.assertIn("CPU 1500 MHz -0.05 V", out)
+        self.assertIn("[pi4]\narm_freq=1500\nover_voltage=-2\n[all]", self.block())
+        r = cli("--set-custom", '{"over_voltage": 7}', check=False)
+        self.assertIn("Core voltage: -400 to +150 mV", r.stderr)
 
     def test_zero_2_w(self):
         ep = self.board("Raspberry Pi Zero 2 W Rev 1.0", 1000000, 600000)
@@ -1321,10 +1420,12 @@ class TestOtherBoards(Base):
         cli("--apply", "Underclock")
         self.assertIn("[pi02]\narm_freq=600\n[all]", self.block())
         self.assertEqual(get(CPUFREQ + "/scaling_max_freq"), "600000")
-        # the Custom plan can't overclock it, and has no voltage / GPU / fan settings
+        # the Custom plan can't overclock it (only undervolt), and has no GPU / fan settings
         for bad, why in (({"max_freq_mhz": 1200}, "CPU speed: 100-1000 MHz"),
-                         ({"over_voltage": 2}, "Extra voltage"),
-                         ({"over_voltage_delta": 25000}, "Extra voltage"),
+                         ({"over_voltage": 2}, "Core voltage: -400 to +0 mV"),
+                         ({"over_voltage": -17}, "Core voltage: -400 to +0 mV"),
+                         ({"over_voltage_delta": 25000},
+                          "Core voltage: on this Raspberry Pi use over_voltage"),
                          ({"v3d_freq": 1000}, "only the Raspberry Pi 5")):
             r = cli("--set-custom", json.dumps(bad), check=False)
             self.assertIn(why, r.stderr, bad)
@@ -1332,6 +1433,11 @@ class TestOtherBoards(Base):
                   "--apply", "Custom").stdout
         self.assertIn("Custom plan saved: CPU 900 MHz, schedutil governor", out)
         self.assertIn("[pi02]\narm_freq=900\n[all]", self.block())
+        out = cli("--set-custom", '{"max_freq_mhz": 900, "over_voltage": -4}',
+                  "--apply", "Custom").stdout                        # undervolt -0.1 V
+        self.assertIn("Custom plan saved: CPU 900 MHz -0.1 V", out)
+        self.assertIn("Undervolt: Custom", out)
+        self.assertIn("[pi02]\narm_freq=900\nover_voltage=-4\n[all]", self.block())
 
     def test_zero_w(self):
         ep = self.board("Raspberry Pi Zero W Rev 1.1", 1000000, 700000)
@@ -1602,6 +1708,21 @@ class TestCustomPlan(Base):
         self.assertIn("#energyplan-disabled# arm_freq_min=300", self.config())
         self.assertNotIn("arm_freq_min=1000", self.config())
 
+    def test_undervolt(self):
+        out = cli("--set-custom", '{"max_freq_mhz": 2400, "over_voltage_delta": -50000}',
+                  "--apply", "Custom").stdout
+        self.assertIn("Custom plan saved: CPU 2400 MHz -0.05 V", out)
+        self.assertIn("Undervolt: Custom (applies after a reboot)", out)
+        self.assertNotIn("Overclock", out)
+        self.assertIn("arm_freq=2400\nover_voltage_delta=-50000\n", self.block())
+        self.assertFalse(self.ep.PLANS["Custom"].get("warn"))
+        self.assertRegex(cli("--list").stdout, r"Yours: CPU 2.4 GHz -0.05 V")
+        cli("--set-custom", '{"max_freq_mhz": 2400, "over_voltage_delta": -12500}',
+            "--apply", "Custom")                                     # any mV, even 12.5
+        self.assertIn("over_voltage_delta=-12500\n", self.block())
+        cli("--apply", "Balanced")                                  # gone with another plan
+        self.assertNotIn("over_voltage", self.block())
+
     def test_lowest_speed_left_out_changes_nothing(self):
         cli("--set-custom", json.dumps(self.MINE), "--apply", "Custom")
         self.assertEqual(get(CPUFREQ + "/scaling_min_freq"), "1500000")
@@ -1619,7 +1740,9 @@ class TestCustomPlan(Base):
                          ({"v3d_freq_min": 1000}, "GPU min speed: at most the GPU speed"),
                          ({"v3d_freq_min": 50}, "GPU min speed: 100-1100 MHz"),
                          ({"max_freq_mhz": "fast"}, "CPU speed: not a number"),
-                         ({"over_voltage_delta": 75000}, "Extra voltage"),
+                         ({"over_voltage_delta": 75000}, "Core voltage: -200 to +50 mV"),
+                         ({"over_voltage_delta": -250000}, "Core voltage: -200 to +50 mV"),
+                         ({"over_voltage": -2}, "on this Raspberry Pi use over_voltage_delta"),
                          ({"fan_profile": "Turbo"}, "Fan profile"),
                          ({"governor": "fast"}, "Governor"),
                          ([1, 2], "expected settings")):
@@ -2411,8 +2534,16 @@ class TestGuiOtherBoards(Base):
             app.root.update()
             e = self.texts(app.custom_win)
             self.assertIn("CPU max speed", e)
-            for gone in ("GPU (3D) speed", "Fan profile", "Extra CPU voltage"):
+            for gone in ("GPU (3D) speed", "Fan profile"):
                 self.assertNotIn(gone, e)
+            self.assertIn("Core voltage (CPU + GPU)", e)                # undervolt only
+            app.custom_controls["volt"].set("25")
+            self.assertIn("Core voltage: -400 to +0 mV",
+                          app.custom_controls["note"].cget("text"))
+            app.custom_controls["volt"].set("-30")
+            self.assertIn("in steps of 25 mV", app.custom_controls["note"].cget("text"))
+            app.custom_controls["volt"].set("-50")
+            self.assertIn("Undervolt", app.custom_controls["note"].cget("text"))
             self.assertEqual(app.custom_controls["cpu"].get(), "1000")
         finally:
             app.root.destroy()
@@ -2631,7 +2762,12 @@ class TestGui(Base):
             ctl["cpu_min"].set("abc")
             self.assertIn("CPU min speed: type a number", ctl["note"].cget("text"))
             ctl["cpu_min"].set("1800")
-            ctl["volt"].set("+0.025 V")                       # triggers the warning text
+            self.assertEqual(ctl["volt"].get(), "0")
+            ctl["volt"].set("-40")
+            self.assertIn("Undervolt", ctl["note"].cget("text"))
+            ctl["volt"].set("abc")
+            self.assertIn("Core voltage: type a number", ctl["note"].cget("text"))
+            ctl["volt"].set("+25")                            # triggers the warning text
             app.root.update()
             self.assertIn("Overclock", ctl["note"].cget("text"))
             ctl["Save and use"].invoke()

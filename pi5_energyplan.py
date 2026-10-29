@@ -11,7 +11,7 @@ CLI:   python3 pi5_energyplan.py --list
        python3 pi5_energyplan.py --install-launcher   (adds a menu entry)
        sudo python3 pi5_energyplan.py --uninstall-service (stop restoring at boot)
        sudo python3 pi5_energyplan.py --uninstall-guard   (remove the UPS battery guard)
-       sudo python3 pi5_energyplan.py --autotest          (find overclock sweet spot)
+       sudo python3 pi5_energyplan.py --autotest          (fastest stable speed + lowest voltage)
        python3 pi5_energyplan.py --autotest-status        (progress / results)
        sudo python3 pi5_energyplan.py --autotest-cancel
        python3 pi5_energyplan.py --install-tray           (battery % in the panel)
@@ -133,11 +133,14 @@ def detect_board():
     return {"model": model or "unknown (not a Raspberry Pi?)", "family": fam,
             "filter": None if fam == "other" else fam, "top": top, "low": low,
             "fan": pi5, "gpu": pi5, "ups": pi5, "autotest": pi5,
-            # extra CPU voltage the Custom plan may use
-            "volt_key": "over_voltage_delta" if pi5 else "over_voltage" if fam == "pi4" else None,
-            "volts": ([(0, "None"), (25000, "+0.025 V"), (50000, "+0.05 V")] if pi5 else
-                      [(0, "None"), (2, "+0.05 V"), (4, "+0.1 V"), (6, "+0.15 V")]
-                      if fam == "pi4" else [(0, "None")]),
+            # The Custom plan's core voltage offset (the CPU and GPU share this rail):
+            # negative = undervolt. Pi 5: over_voltage_delta in µV, any mV. Other
+            # models: over_voltage in 25 mV steps (-16 = -0.4 V); only the Pi 4 is
+            # allowed above 0 (the others aren't overclocked here).
+            "volt_key": "over_voltage_delta" if pi5 else None if fam == "other" else
+            "over_voltage",
+            "volt_mv": (-200, 50, 1) if pi5 else (-400, 150, 25) if fam == "pi4" else
+            (-400, 0, 25),
             # highest CPU speed the Custom plan allows (no overclock on Pi 3 / Zero / older)
             "oc_top": 3000 if pi5 else 2000 if fam == "pi4" else top}
 
@@ -272,14 +275,37 @@ BOOT_DELAY = 45  # seconds after boot before each test (time to cancel / settle)
 # (MHz, over_voltage_delta µV), tried in order. For each speed the lowest
 # voltage is tried first; if it fails, the next voltage for that speed is tried.
 AUTOTEST_STEPS = [(2600, 0), (2600, 25000), (2800, 25000), (2800, 50000), (3000, 50000)]
+# Then the undervolt part: at the fastest stable speed (or the normal 2.4 GHz if no
+# overclock was stable), lower the voltage 25 mV per step until a step fails. The
+# result is the lowest stable voltage plus a safety margin, so it stays stable with
+# loads the stress test doesn't make.
+UV_STEP = 25000          # µV
+UV_LOWEST = -200000      # µV, the Custom plan's lowest too
+UV_MARGIN = 15000        # µV added back to the lowest stable voltage
 
 
 # "Custom": a plan you fill in yourself in the window (Custom → Edit…) or with
 # --set-custom. Until then it's empty and can't be applied.
 CUSTOM = "Custom"
 CUSTOM_COLOR = "#8d6e63"
-CUSTOM_VOLTAGES = BOARD["volts"]       # extra CPU voltage choices on this board
-VOLT_KEY = BOARD["volt_key"]           # over_voltage_delta (Pi 5) / over_voltage (Pi 4)
+VOLT_KEY = BOARD["volt_key"]           # over_voltage_delta (Pi 5) / over_voltage (others)
+VOLT_MV = BOARD["volt_mv"]             # lowest, highest, step (mV)
+
+
+def volt_mv(v):
+    """A VOLT_KEY value in mV (over_voltage_delta is µV, over_voltage 25 mV units)."""
+    return v / 1000 if VOLT_KEY == "over_voltage_delta" else v * 25
+
+
+def mv_volt(mv):
+    """mV → the VOLT_KEY value."""
+    return int(round(mv * 1000)) if VOLT_KEY == "over_voltage_delta" else int(mv // 25)
+
+
+def fmt_volt(v):
+    """+0.025 V, -0.05 V"""
+    text = f"{volt_mv(v) / 1000:+.4f}".rstrip("0")
+    return text + ("0" if text.endswith(".") else "") + " V"
 V3D_DEFAULT = 960          # Pi 5 3D GPU clock, MHz
 V3D_MIN_DEFAULT = 500      # and its lowest (v3d_freq_min), Raspberry Pi docs
 # Any speed (MHz) can be typed in the Custom plan. Below the board's normal lowest
@@ -944,7 +970,7 @@ def file_sha(path):
 def custom_desc(cpu, volt, gpu, cpu_min=None, gpu_min=0):
     text = f"Yours: CPU {_speed(cpu)}"
     if volt:
-        text += " " + dict(CUSTOM_VOLTAGES)[volt]
+        text += " " + fmt_volt(volt)
     if cpu_min and cpu_min != min(BOARD["low"], cpu):
         text += f" (min {_speed(cpu_min)})"
     if BOARD["gpu"]:
@@ -984,11 +1010,17 @@ def validate_custom(c):
         gpu, gpu_min = V3D_DEFAULT, 0
     other = {"over_voltage_delta", "over_voltage"} - {VOLT_KEY}
     if any(c.get(k) for k in other):
-        raise ValueError(f"Extra voltage: on this Raspberry Pi use {VOLT_KEY or 'nothing'}")
-    volt = c.get(VOLT_KEY, 0) if VOLT_KEY else 0
-    if volt not in [v for v, _ in CUSTOM_VOLTAGES]:
-        raise ValueError("Extra voltage: one of " +
-                         ", ".join(str(v) for v, _ in CUSTOM_VOLTAGES) + f" ({VOLT_KEY})")
+        raise ValueError(f"Core voltage: on this Raspberry Pi use {VOLT_KEY or 'nothing'}")
+    volt = 0
+    if VOLT_KEY:
+        try:
+            volt = int(c.get(VOLT_KEY, 0))
+        except (TypeError, ValueError):
+            raise ValueError("Core voltage: not a number") from None
+        lo, hi, step = VOLT_MV
+        if not lo <= volt_mv(volt) <= hi:
+            raise ValueError(f"Core voltage: {lo:+d} to {hi:+d} mV ({VOLT_KEY} "
+                             f"{mv_volt(lo)} to {mv_volt(hi)})")
     fan = c.get("fan_profile", "Default")
     if fan not in FAN_PROFILES:
         raise ValueError(f"Fan profile: one of {', '.join(FAN_PROFILES)}")
@@ -1011,6 +1043,8 @@ def set_custom(c, reapply=True):
             "warn": cpu > BOARD["top"] or volt > 0 or gpu > V3D_DEFAULT}
     if volt:
         plan[VOLT_KEY] = volt
+    if volt < 0:
+        plan["undervolt"] = True
     if gpu != V3D_DEFAULT:          # the default writes no line at all
         plan["v3d_freq"] = gpu
     if cpu_min != low:              # the normal lowest speed is what the kernel does anyway
@@ -1038,7 +1072,7 @@ def set_custom(c, reapply=True):
             write_json_atomic(path, over)
     reload_plan_settings()
     msgs = [f"Custom plan saved: CPU {cpu} MHz"
-            + (" " + dict(CUSTOM_VOLTAGES)[volt] if volt else "")
+            + (" " + fmt_volt(volt) if volt else "")
             + (f" (min {cpu_min} MHz)" if cpu_min != low else "")
             + (f", GPU {gpu} MHz" if BOARD["gpu"] else "")
             + (f" (min {gpu_min} MHz)" if gpu_min else "")
@@ -2658,7 +2692,13 @@ def is_pi5():
 
 
 def step_label(freq, ovd):
-    return f"{freq} MHz +{ovd // 1000} mV"
+    return f"{freq} MHz {ovd / 1000:+g} mV"
+
+
+def current_step(state):
+    """(MHz, µV) being tested. Tests started by older versions only have "index"."""
+    step = state.get("step")
+    return tuple(step) if step else AUTOTEST_STEPS[state["index"]]
 
 
 def autotest_summary():
@@ -2667,8 +2707,9 @@ def autotest_summary():
         return "not tested"
     phase = st.get("phase")
     if phase in ("pending", "running"):
-        f, v = AUTOTEST_STEPS[st["index"]]
-        text = f"TESTING {step_label(f, v)} (step {len(st['results']) + 1})"
+        f, v = current_step(st)
+        text = f"TESTING {step_label(f, v)} (step {len(st['results']) + 1}" + \
+            (", undervolt)" if st.get("mode") == "undervolt" else ")")
         left = (st.get("stage_ends") or 0) - time.time()
         if left > 0:
             what = {"starting": "stress test starts in", "stress": "stress test",
@@ -2681,7 +2722,7 @@ def autotest_summary():
     if phase == "done":
         if st.get("best"):
             return f"{step_label(*st['best'])} → plan '{SWEET_SPOT}'"
-        return "done, no overclock was stable"
+        return "done, nothing better than the normal settings was stable"
     if phase == "error":
         last = (read(AUTOTEST_LOG, "") or "").strip().splitlines()
         return "error: " + (last[-1][21:] if last else "see --autotest-status")
@@ -2715,7 +2756,7 @@ def resume_autotest():
     tryboot_step(st)
 
 
-def start_autotest(minutes, max_temp):
+def start_autotest(minutes, max_temp, undervolt=True):
     if not is_pi5():
         raise RuntimeError("The sweet spot test is only for the Raspberry Pi 5")
     st = load_state()
@@ -2728,15 +2769,18 @@ def start_autotest(minutes, max_temp):
     install_service()
     os.makedirs(STATE_DIR, exist_ok=True)
     open(AUTOTEST_LOG, "w").close()
-    state = {"phase": "pending", "index": 0, "minutes": minutes, "max_temp": max_temp,
-             "results": [], "best": None, "started": time.strftime("%Y-%m-%d %H:%M")}
+    state = {"phase": "pending", "index": 0, "step": list(AUTOTEST_STEPS[0]),
+             "mode": "speed", "undervolt": undervolt, "minutes": minutes,
+             "max_temp": max_temp, "results": [], "best": None,
+             "started": time.strftime("%Y-%m-%d %H:%M")}
     save_state(state)
-    at_log(f"Sweet spot test started: {minutes} min per step, fail above {max_temp} °C")
+    at_log(f"Sweet spot test started: {minutes} min per step, fail above {max_temp} °C"
+           + (", then the lowest stable voltage" if undervolt else ""))
     tryboot_step(state)
 
 
 def tryboot_step(state):
-    freq, ovd = AUTOTEST_STEPS[state["index"]]
+    freq, ovd = current_step(state)
     plan = {"governor": "ondemand", "max_freq_mhz": freq,
             "over_voltage_delta": ovd, "fan": TEST_FAN}
     write_config(f"Autotest {step_label(freq, ovd)}", plan, target=tryboot_path())
@@ -2778,7 +2822,7 @@ def set_stage(state, stage, seconds):
 
 def autotest_boot(state):
     """Called at boot while a test is in progress."""
-    freq, ovd = AUTOTEST_STEPS[state["index"]]
+    freq, ovd = current_step(state)
     cancel_hint = f"cancel: sudo python3 {INSTALLED_SCRIPT} --autotest-cancel"
 
     if state["phase"] == "running":
@@ -2815,6 +2859,9 @@ def autotest_boot(state):
     if not state or state.get("phase") != "pending":
         return
     at_log("CPU set for the test: " + cpu_full_speed_for_test(freq))
+    core_v = read_pmic().get("core_v")
+    if core_v:
+        at_log(f"Core voltage now {core_v:.3f} V")
     state["phase"] = "running"
     set_stage(state, "stress", state["minutes"] * 60)
     result = run_stress(state["minutes"] * 60, state["max_temp"])
@@ -2826,11 +2873,19 @@ def autotest_boot(state):
 
 def finish_step(state, passed, reason, peak):
     i = state["index"]
-    freq, ovd = AUTOTEST_STEPS[i]
+    freq, ovd = current_step(state)
     state["results"].append({"freq": freq, "ovd": ovd, "passed": passed,
                              "reason": reason, "peak_temp": peak})
     peak_txt = f", peak {peak:.1f} °C" if peak else ""
     at_log(f"{step_label(freq, ovd)}: {'PASS' if passed else 'FAIL'} ({reason}{peak_txt})")
+
+    if state.get("mode") == "undervolt":
+        if passed:
+            state["uv_low"] = ovd
+            next_step(state, freq, ovd - UV_STEP)
+        else:
+            finish_autotest(state)
+        return
 
     if passed:
         state["best"] = [freq, ovd]
@@ -2843,18 +2898,42 @@ def finish_step(state, passed, reason, peak):
     else:
         nxt = None  # too hot / power problem: going higher won't help
 
-    if nxt is None:
-        finish_autotest(state)
-    else:
-        state["index"], state["phase"] = nxt, "pending"
+    if nxt is not None:
+        state["index"], state["step"], state["phase"] = nxt, list(AUTOTEST_STEPS[nxt]), \
+            "pending"
         save_state(state)
         tryboot_step(state)
+    elif not state.get("undervolt", False):
+        finish_autotest(state)
+    else:
+        # the speed is found: now the lowest voltage that's still stable at it
+        freq, ovd = state["best"] or (BOARD["top"], 0)
+        state["mode"], state["uv_base"] = "undervolt", [freq, ovd]
+        at_log(f"Fastest stable speed: {step_label(freq, ovd)}"
+               + ("" if state["best"] else " (no overclock was stable: the normal speed)")
+               + ". Now looking for the lowest stable voltage at it")
+        next_step(state, freq, ovd - UV_STEP)
+
+
+def next_step(state, freq, ovd):
+    """Test (freq, ovd) next, unless it's below the lowest voltage or already failed."""
+    failed = any(r["freq"] == freq and r["ovd"] <= ovd and not r["passed"]
+                 for r in state["results"])
+    if ovd < UV_LOWEST or failed:
+        finish_autotest(state)
+        return
+    state["step"], state["phase"] = [freq, ovd], "pending"
+    save_state(state)
+    tryboot_step(state)
 
 
 def save_custom_plan(freq, ovd):
-    plan = {"desc": f"Found by auto test: {freq / 1000:.1f} GHz, +{ovd // 1000} mV.",
+    plan = {"desc": f"Found by auto test: {_speed(freq)}, {ovd / 1000:+g} mV.",
             "governor": "ondemand", "max_freq_mhz": freq, "over_voltage_delta": ovd,
-            "fan": SWEET_FAN, "color": "#66bb6a", "warn": True}
+            "fan": SWEET_FAN, "color": "#66bb6a",
+            "warn": freq > BOARD["top"] or ovd > 0}
+    if ovd < 0:
+        plan["undervolt"] = True
     os.makedirs(os.path.dirname(CUSTOM_PLANS), exist_ok=True)
     try:
         with open(CUSTOM_PLANS) as f:
@@ -2878,6 +2957,15 @@ def finish_autotest(state):
     state["phase"] = "done"
     state["finished"] = time.strftime("%Y-%m-%d %H:%M")
     remove_tryboot()
+    if state.get("uv_low") is not None:
+        # the lowest stable voltage plus a margin, never above what the speed needed
+        freq, base = state["uv_base"]
+        ovd = min(base, state["uv_low"] + UV_MARGIN)
+        at_log(f"Lowest stable voltage: {step_label(freq, state['uv_low'])}; with a "
+               f"{UV_MARGIN // 1000} mV safety margin: {step_label(freq, ovd)}")
+        state["best"] = [freq, ovd]
+    elif state.get("mode") == "undervolt":
+        at_log("No lower voltage was stable: the voltage stays as it was")
     if state.get("best"):
         freq, ovd = state["best"]
         save_custom_plan(freq, ovd)
@@ -2885,7 +2973,8 @@ def finish_autotest(state):
         at_log(f"SWEET SPOT: {step_label(freq, ovd)}. Saved as plan '{SWEET_SPOT}' "
                "and set as your plan.")
     else:
-        at_log("No overclock was stable. Your current plan was kept.")
+        at_log("Nothing better than the normal settings was stable. Your current plan "
+               "was kept.")
     save_state(state)
     at_log("Rebooting into your normal settings")
     os.sync()
@@ -3899,9 +3988,8 @@ class App:
         vgpu = tk.StringVar(value=text_of(V3D_DEFAULT if empty else
                                           p.get("v3d_freq", V3D_DEFAULT)))
         vgpu_min = tk.StringVar(value=text_of(p.get("v3d_freq_min")))   # "" = default
-        volt_lbl = dict(CUSTOM_VOLTAGES)
-        vvolt = tk.StringVar(value=volt_lbl.get(p.get(VOLT_KEY, 0) if VOLT_KEY else 0,
-                                                "None"))
+        mv = volt_mv(p.get(VOLT_KEY, 0)) if VOLT_KEY else 0
+        vvolt = tk.StringVar(value=f"{mv:g}")                           # mV, 0 = normal
         vfan = tk.StringVar(value=fan_profile_of(p["fan"]) if not empty else "Default")
         vgov = tk.StringVar(value=p["governor"])
 
@@ -3912,19 +4000,20 @@ class App:
                     wraplength=380, justify="left").pack(anchor="w", pady=(2, 6))
 
         def mhz(var):
-            """The number typed in a box, None if it's empty, False if it isn't one."""
-            t = var.get().strip()
+            """The number typed in a box, None if it's empty, False if it isn't one
+            (whole numbers; the voltage box may have a sign)."""
+            t = var.get().strip().replace("−", "-")
             if not t:
                 return None
-            return int(t) if t.isdigit() else False
+            return int(t) if re.fullmatch(r"[+-]?\d+", t) else False
 
-        def speedbox(title, var, rng, inc, fmt, hint):
+        def speedbox(title, var, rng, inc, fmt, hint, unit="MHz"):
             box = tk.Frame(win, bg=CARD, padx=10, pady=6)
             box.pack(fill="x", pady=(6, 0))
             row = tk.Frame(box, bg=CARD)
             row.pack(fill="x")
             self._label(row, title, 10).pack(side="left")
-            self._label(row, "MHz", 9, MUTED).pack(side="right", padx=(4, 0))
+            self._label(row, unit, 9, MUTED).pack(side="right", padx=(4, 0))
             typed = var.get()
             tk.Spinbox(row, textvariable=var, from_=rng[0], to=rng[1], increment=inc,
                        width=6, justify="right", bg="#3a3d45", fg=FG, insertbackground=FG,
@@ -3938,7 +4027,7 @@ class App:
 
             def show():
                 v = mhz(var)
-                val.config(text="" if not v else fmt(v))
+                val.config(text="" if v is None or v is False else fmt(v))
             return show
 
         def picker(title, var, options):
@@ -3961,8 +4050,17 @@ class App:
                                 f"Slowest the CPU goes when idle. {_speed(low)} = normal. "
                                 "Higher feels snappier but uses more power and heat. "
                                 + steps)
-        if len(CUSTOM_VOLTAGES) > 1:
-            picker("Extra CPU voltage", vvolt, [(lbl, lbl) for _, lbl in CUSTOM_VOLTAGES])
+        show_volt = lambda: None   # noqa: E731
+        if VOLT_KEY:
+            vlo, vhi, vstep = VOLT_MV
+            show_volt = speedbox(
+                "Core voltage (CPU + GPU)", vvolt, (vlo, vhi), max(vstep, 5),
+                lambda v: "normal" if v == 0 else "undervolt" if v < 0 else "overvolt",
+                f"Change from the normal voltage, {vlo:+d} to {vhi:+d} mV"
+                + (f" in steps of {vstep}" if vstep > 1 else "") + ". Negative = "
+                "undervolt: less power and heat, but too low and the Pi freezes or won't "
+                "boot, so go down in small steps and test. The CPU and the GPU share this "
+                "voltage, so it's one setting for both. Applies after a reboot.", unit="mV")
         show_gpu = show_gpu_min = lambda: None   # noqa: E731
         if BOARD["gpu"]:
             show_gpu = speedbox("GPU (3D) speed", vgpu, GPU_RANGE, 10,
@@ -3997,7 +4095,14 @@ class App:
                 if v is not None:
                     c[key] = v
             if VOLT_KEY:
-                c[VOLT_KEY] = [v for v, lbl in CUSTOM_VOLTAGES if lbl == vvolt.get()][0]
+                v = mhz(vvolt)
+                if v is False:
+                    raise ValueError("Core voltage: type a number (mV), e.g. -25")
+                v = v or 0
+                if v % VOLT_MV[2]:
+                    raise ValueError(f"Core voltage: in steps of {VOLT_MV[2]} mV on this "
+                                     "Raspberry Pi")
+                c[VOLT_KEY] = mv_volt(v)
             validate_custom(c)
             return c
 
@@ -4005,7 +4110,7 @@ class App:
             return c.get(VOLT_KEY, 0) if VOLT_KEY else 0
 
         def refresh(*_):
-            for show in (show_cpu, show_cpu_min, show_gpu, show_gpu_min):
+            for show in (show_cpu, show_cpu_min, show_volt, show_gpu, show_gpu_min):
                 show()
             try:
                 c = settings()
@@ -4014,15 +4119,22 @@ class App:
                 return
             warn = []
             top = BOARD["top"]
-            if c["max_freq_mhz"] > top or c.get("v3d_freq", 0) > V3D_DEFAULT or volt_of(c):
+            if c["max_freq_mhz"] > top or c.get("v3d_freq", 0) > V3D_DEFAULT or \
+                    volt_of(c) > 0:
                 warn.append("Overclock: use the official power supply and a fan. If it "
                             "doesn't boot, remove the 'pi5-energyplan' block from config.txt "
                             "on another computer.")
-            if c["max_freq_mhz"] >= top + 400 and not volt_of(c):
+            if c["max_freq_mhz"] >= top + 400 and volt_of(c) <= 0:
                 warn.append(f"{_speed(top + 400)} and more usually need extra voltage.")
-            if volt_of(c) and c["max_freq_mhz"] <= top:
+            if volt_of(c) > 0 and c["max_freq_mhz"] <= top:
                 warn.append(f"Extra voltage only makes the Pi warmer at {_speed(top)} or "
                             "less.")
+            if volt_of(c) < 0:
+                warn.append("Undervolt: if the Pi freezes, crashes under load or won't "
+                            "boot, the voltage is too low. Fix it by removing the "
+                            "'pi5-energyplan' block from config.txt on another computer."
+                            + (" With an overclock it's even more likely."
+                               if c["max_freq_mhz"] > top else ""))
             if min(c["max_freq_mhz"], c["min_freq_mhz"]) < low or \
                     0 < min(c.get("v3d_freq", 999), c.get("v3d_freq_min") or 999) < \
                     V3D_MIN_DEFAULT:
@@ -4044,7 +4156,7 @@ class App:
                 self.root.bell()
                 return
             overclock = c["max_freq_mhz"] > BOARD["top"] or \
-                c.get("v3d_freq", 0) > V3D_DEFAULT or volt_of(c)
+                c.get("v3d_freq", 0) > V3D_DEFAULT or volt_of(c) > 0
             if self.blocked("the plan" if use else "the Custom plan",
                             lock_during_test=use):
                 return
@@ -4158,12 +4270,15 @@ class App:
         if not messagebox.askyesno(
                 "Find sweet spot",
                 "The Pi will reboot several times and stress-test each overclock\n"
-                "(2.6 → 2.8 → 3.0 GHz). It takes about 20–40 minutes.\n\n"
+                "(2.6 → 2.8 → 3.0 GHz), then lower voltages (undervolt, 25 mV\n"
+                "at a time) at the fastest stable speed, for less power and heat.\n"
+                "It takes about 40–90 minutes.\n\n"
                 "• Save your work and don't use the Pi during the test\n"
                 "• Use the official 27 W power supply\n"
                 "• If it freezes for more than a minute, unplug and replug power.\n"
                 "  It always comes back with your normal settings.\n\n"
-                "At the end the best stable setting is saved as the\n"
+                "At the end the fastest speed with the lowest stable voltage\n"
+                "(plus a small safety margin) is saved as the\n"
                 f"'{SWEET_SPOT}' plan and turned on.\n\nStart now?"):
             return
         self.set_busy("starting the sweet spot test")
@@ -4861,7 +4976,10 @@ def main():
     ap.add_argument("--uninstall-guard", action="store_true",
                     help="remove the UPS battery guard service (needs sudo)")
     ap.add_argument("--autotest", action="store_true",
-                    help="find the highest stable overclock (reboots several times)")
+                    help="find the highest stable overclock, then the lowest stable "
+                         "voltage at it (reboots several times)")
+    ap.add_argument("--no-undervolt", action="store_true",
+                    help="with --autotest: only the speed, don't look for a lower voltage")
     ap.add_argument("--minutes", type=int, default=5,
                     help="with --autotest: stress test minutes per step (default 5)")
     ap.add_argument("--max-temp", type=int, default=80,
@@ -5108,14 +5226,16 @@ def main():
             cancel_autotest()
         else:
             if not args.yes:
-                print("The Pi will reboot several times to test 2.6 → 3.0 GHz "
-                      f"({args.minutes} min each, ~20-40 min total).\n"
+                print("The Pi will reboot several times to test 2.6 → 3.0 GHz, then lower "
+                      "voltages at the best speed"
+                      f" ({args.minutes} min each, ~40-90 min total).\n"
                       "If it freezes for over a minute, unplug and replug power; it "
                       "returns to your normal settings.")
                 if input("Type 'yes' to start: ").strip().lower() != "yes":
                     sys.exit("Not started")
             try:
-                start_autotest(max(1, args.minutes), args.max_temp)
+                start_autotest(max(1, args.minutes), args.max_temp,
+                               undervolt=not args.no_undervolt)
             except Exception as e:  # noqa: BLE001
                 sys.exit(f"Error: {e}")
         return
@@ -5144,6 +5264,9 @@ def main():
         if PLANS[name].get("warn"):
             print(f"Overclock: {name}. Use the official 27 W supply. If it won't boot, "
                   "remove the pi5-energyplan block from config.txt on another PC.")
+        elif PLANS[name].get("undervolt"):
+            print(f"Undervolt: {name} (applies after a reboot). If the Pi freezes or won't "
+                  "boot, remove the pi5-energyplan block from config.txt on another PC.")
         try:
             for line in apply_plan(name, save_config=not args.no_config):
                 print(line)
