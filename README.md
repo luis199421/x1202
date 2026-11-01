@@ -796,6 +796,18 @@ over, then compare every managed file byte for byte.
 
 ---
 
+## Extras
+
+* **`extras/config.txt`**: a clean Raspberry Pi OS `config.txt` for a Pi 5 with the
+  X1202 (I2C on) and an NVMe HAT at PCIe Gen 3, with the Bluetooth / Wi-Fi switches for
+  radios you don't use. Use it to replace a damaged one; Pi 5 Energy Plan adds its block
+  when you choose a plan.
+* **`extras/energy-save.sh`**: energy saving that doesn't change how the Pi feels: PCIe
+  link idle states (`pcie_aspm.policy=powersupersave`), Wi-Fi power saving, and fewer
+  disk writes (every 15 s). `sudo sh extras/energy-save.sh`, undo with `… undo`.
+
+---
+
 ## 9. Troubleshooting
 
 | Problem | Fix |
