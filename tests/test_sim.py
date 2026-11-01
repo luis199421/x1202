@@ -1895,6 +1895,18 @@ class TestFailSafe(Base):
         r = cli("--trial-skip", check=False)                       # nothing waits now
         self.assertIn("No settings are waiting", r.stderr)
 
+    def test_no_test_boot_on_battery(self):
+        cli("--apply", "OC 2.6 GHz")
+        hw(pld=0)                                                  # on battery
+        r = cli("--trial-reboot", check=False)
+        self.assertIn("plug in the adapter first", r.stderr)
+        self.assertNotIn("reboot 0 tryboot", calls())
+        self.assertEqual(json.loads(get("/var/lib/pi5-energyplan/trial.json"))["phase"],
+                         "pending")
+        hw(pld=1)
+        cli("--trial-reboot")
+        self.assertEqual(calls()[-1], "reboot 0 tryboot")
+
     def test_no_trial_and_the_sweet_spot_test(self):
         out = cli("--apply", "OC 2.6 GHz", "--no-trial").stdout
         self.assertIn("No trial boot (--no-trial)", out)
@@ -2212,6 +2224,20 @@ class TestConfigLinesKeepTheirSection(Base):
         fixed = self.config()
         self.assertNotIn("repaired", cli("--update-root").stdout)   # only once
         self.assertEqual(self.config(), fixed)
+
+    def test_bytes_that_arent_utf8_are_kept_and_dont_stop_anything(self):
+        """A config.txt saved by another editor (Latin-1 "÷") or damaged by a power cut."""
+        with open(self.CFG, "ab") as f:
+            f.write(b"# note \xf7 from another editor\n")
+        out = cli("--apply", "Cool")
+        self.assertEqual(out.stderr, "")
+        cli("--apply", "Eco")
+        cli("--status")
+        with open(self.CFG, "rb") as f:
+            raw = f.read()
+        self.assertEqual(raw.count(b"# note \xf7 from another editor"), 1)   # kept as is
+        self.assertIn(b"# plan: Eco", raw)
+        self.assertEqual(self.ep.saved_plan(), "Eco")
 
     def test_lines_that_were_in_cm5_from_the_start_are_left_alone(self):
         put(self.CFG, PI_OS_CONFIG.replace("dtoverlay=dwc2,dr_mode=host",

@@ -92,7 +92,7 @@ def fan_profile_of(curve):
 def _first_line(*paths):
     for path in paths:
         try:
-            with open(path) as f:
+            with open(path, encoding="utf-8", errors="replace") as f:
                 v = f.read().replace("\x00", "").strip()
         except OSError:
             continue
@@ -402,16 +402,22 @@ reload_plan_settings()
 # --------------------------------------------------------------------------- #
 #  Small helpers
 # --------------------------------------------------------------------------- #
+# Files are read and written as UTF-8, but bytes that aren't valid UTF-8 (a config.txt
+# saved by another editor, or damaged by a power cut) are kept exactly as they are
+# instead of stopping the program.
+TEXT = {"encoding": "utf-8", "errors": "surrogateescape"}
+
+
 def read(path, default=None):
     try:
-        with open(path) as f:
+        with open(path, **TEXT) as f:
             return f.read().strip()
     except OSError:
         return default
 
 
 def write(path, value):
-    with open(path, "w") as f:
+    with open(path, "w", **TEXT) as f:
         f.write(str(value))
 
 
@@ -2224,6 +2230,8 @@ def power_limit_run():
             st, trial = load_state(), load_trial()
             if (st and st.get("phase") in ("pending", "running")) or \
                     (trial and trial.get("phase") == "running"):
+                lim.note = "paused while a test checks the settings"
+                lim.status(load_power_cfg(), None, time.time())
                 time.sleep(10)                 # a test sets the speeds itself
                 continue
             out = lim.step(time.time())
@@ -2335,7 +2343,7 @@ def write_config(name, p=None, target=None, watchdog=False):
     target = target or path
     if not os.path.exists(path):
         raise RuntimeError(f"{path} not found")
-    with open(path) as f:
+    with open(path, **TEXT) as f:
         text = f.read()
 
     backup = path + ".energyplan.bak"
@@ -2379,7 +2387,7 @@ def write_config(name, p=None, target=None, watchdog=False):
     text = "\n".join(tidy).rstrip("\n") + "\n\n" + build_block(name, p, watchdog)
 
     tmp = target + ".tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", **TEXT) as f:
         f.write(text)
         f.flush()
         os.fsync(f.fileno())
@@ -2893,6 +2901,8 @@ def start_autotest(minutes, max_temp, undervolt=True):
     st = load_state()
     if st and st.get("phase") in ("pending", "running"):
         raise RuntimeError("A test is already running (stop it with --autotest-cancel)")
+    if running_on_battery():
+        raise RuntimeError("the Pi runs on battery: plug in the adapter first")
     if not shutil.which("stress-ng"):
         print("Installing stress-ng for a stronger test…", flush=True)
         subprocess.run(["apt-get", "install", "-y", "stress-ng"],
@@ -3332,10 +3342,21 @@ def start_trial(name, risks):
             "settings (or hold the power button until it turns off, then press it again)."]
 
 
+def running_on_battery():
+    """True while an X120x UPS runs the Pi from its batteries."""
+    if not BOARD["ups"] or not ups_status()[0]:
+        return False
+    b = Battery().read()
+    return bool(b["ok"] and b["ac"] == 0)
+
+
 def trial_reboot():
     st = load_trial()
     if not st or st.get("phase") != "pending":
         raise RuntimeError("No settings are waiting for a trial boot")
+    if running_on_battery():
+        raise RuntimeError("the Pi runs on battery: plug in the adapter first (a test boot "
+                           "with a stress test could run the battery empty)")
     if not os.path.exists(tryboot_path()):
         raise RuntimeError("The trial settings are gone: choose the plan again")
     st["phase"], st["rebooted"] = "rebooting", time.time()
@@ -4763,6 +4784,8 @@ class App:
             text += f" · limit {cfg['watts']:g} W"
             if not st:
                 text += " (not running)"
+            elif (st.get("note") or "").startswith("paused"):
+                text += " (paused for a test)"
             elif st.get("cpu_cap_mhz"):
                 text += f" · limited: CPU ≤ {_speed(st['cpu_cap_mhz'])}"
         return text
@@ -4909,7 +4932,8 @@ class App:
         """This program's output for read-only options (no root needed)."""
         try:
             r = subprocess.run([sys.executable, os.path.abspath(__file__)] + args,
-                               capture_output=True, text=True, timeout=60)
+                               capture_output=True, text=True, errors="replace",
+                               timeout=60)
             return (r.stdout + r.stderr).strip() or "(nothing)"
         except (OSError, subprocess.SubprocessError) as e:
             return f"✘ {e}"

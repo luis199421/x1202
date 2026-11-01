@@ -162,7 +162,8 @@ written to `config.txt` right away:
    choices: **Test it first (safe)**, **Apply now without testing**, or **Later**. From
    the terminal: `sudo pi5_energyplan.py --trial-reboot` (test) or `--trial-skip`
    (apply without testing). When tested, the Pi reboots with `reboot '0 tryboot'`: the
-   firmware uses `tryboot.txt` for **that one boot only**.
+   firmware uses `tryboot.txt` for **that one boot only**. With the X1202 the adapter
+   must be plugged in: a test boot (and the sweet spot test) won't start on battery.
 2. That boot also starts the **hardware watchdog** (`kernel_watchdog_timeout=180`). The
    boot service keeps it fed, waits 20 seconds and runs a 90-second stress test on every
    core (don't use the Pi meanwhile; the window shows "on trial").
@@ -847,7 +848,7 @@ The installer test for the menu entry and panel icon needs a throwaway user:
 `sudo INSTALL_TEST_USER=someuser sh tests/run_sim_tests.sh`. To run some tests only:
 `sudo TESTS="TestUps TestNothingTwice" sh tests/run_sim_tests.sh`.
 
-The 146 tests cover:
+The 148 tests cover:
 
 * **Plans:** applying each kind of plan, the live sysfs changes and governor fallback,
   `config.txt` editing (backup, commenting out conflicting lines, only `[all]`/`[pi5]`
@@ -871,13 +872,15 @@ The 146 tests cover:
 * **Password:** the root helper and its polkit description (remembered password), never
   added twice, removed on uninstall; `--no-password on/off` per user; the window uses
   the helper only for the installed copy; the window's checkbox.
+* **Odd bytes in files:** a `config.txt` with bytes that aren't UTF-8 (another editor, a
+  power cut) is read and rewritten with those bytes kept exactly, and nothing stops.
 * **Fail-safe trial boot:** an overclock waits in `tryboot.txt` (with the watchdog line)
   and `config.txt` stays untouched; `--trial-reboot`; kept after a good trial boot
   (without the watchdog line), not tried again; a Pi that didn't start, one that froze
   during the check, and a failed check all come back with the old settings; a safe plan
   or `--trial-cancel` drops a waiting trial; `--no-trial` and `--trial-skip` (also the
   window's "Apply now without testing"); the sweet spot test takes over
-  `tryboot.txt`; what counts as risky; the window's "Try it now?" and its status.
+  `tryboot.txt`; no test boot on battery; what counts as risky; the window's "Try it now?" and its status.
 * **Undervolt in the Custom plan:** negative core voltage on a Pi 5 (any mV), Pi 4 and
   Zero 2 W (25 mV steps, undervolt only on the Zero), the limits, and the window's
   voltage box and its warnings.
