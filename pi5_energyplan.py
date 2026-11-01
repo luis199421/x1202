@@ -1080,9 +1080,9 @@ def set_custom(c, reapply=True):
             + f", {c['governor']} governor"]
     if reapply and find_plan(saved_plan() or "") == CUSTOM:
         if saver_active():
-            write_config(CUSTOM)
-            msgs.append("Saved to config.txt; the battery saver is on, so the rest applies "
-                        "when the power is back")
+            msgs += save_plan_config(CUSTOM)
+            msgs.append("The battery saver is on, so the rest applies when the power is "
+                        "back")
         else:
             msgs += apply_plan(CUSTOM)
     subprocess.run(["systemctl", "try-restart", GUARD_SERVICE], capture_output=True)
@@ -2221,9 +2221,10 @@ def power_limit_run():
         while True:
             if not load_power_cfg()["enabled"]:
                 break
-            st = load_state()
-            if st and st.get("phase") in ("pending", "running"):
-                time.sleep(10)                 # the sweet spot test sets the speeds
+            st, trial = load_state(), load_trial()
+            if (st and st.get("phase") in ("pending", "running")) or \
+                    (trial and trial.get("phase") == "running"):
+                time.sleep(10)                 # a test sets the speeds itself
                 continue
             out = lim.step(time.time())
             key = (out.get("cpu_cap_mhz"), out.get("note"))
@@ -2291,9 +2292,12 @@ def set_power_limit(value):
 # --------------------------------------------------------------------------- #
 #  Applying a plan (root needed)
 # --------------------------------------------------------------------------- #
-def build_block(name, p=None):
+def build_block(name, p=None, watchdog=False):
     """The plan's lines for config.txt, under this board's own filter (e.g. [pi4]), so
-    if the SD card goes into another Raspberry Pi model they're not used there."""
+    if the SD card goes into another Raspberry Pi model they're not used there.
+    watchdog=True (one-time trial boots only): the firmware starts the hardware
+    watchdog, so if the Pi hangs while starting it resets by itself, and the next
+    boot uses the normal config.txt again."""
     p = p or PLANS[name]
     flt = BOARD["filter"]
     lines = [BLOCK_START, f"# plan: {name}", f"[{flt or 'all'}]"]
@@ -2316,13 +2320,15 @@ def build_block(name, p=None):
         for key, mhz in zip(("v3d_freq", "v3d_freq_min"), plan_gpu(p)):
             if mhz:
                 lines.append(f"{key}={int(mhz)}")
+    if watchdog:
+        lines.append(f"kernel_watchdog_timeout={TRIAL_WATCHDOG_S}")
     if flt:
         lines.append("[all]")               # what comes after applies to every model
     lines.append(BLOCK_END)
     return "\n".join(lines) + "\n"
 
 
-def write_config(name, p=None, target=None):
+def write_config(name, p=None, target=None, watchdog=False):
     """Put the plan block into config.txt (or into `target`, e.g. tryboot.txt)."""
     CONFIG_NOTES.clear()
     path = config_path()
@@ -2370,7 +2376,7 @@ def write_config(name, p=None, target=None):
             if nxt is None or (nxt.startswith("[") and nxt.endswith("]")):
                 continue
         tidy.append(line)
-    text = "\n".join(tidy).rstrip("\n") + "\n\n" + build_block(name, p)
+    text = "\n".join(tidy).rstrip("\n") + "\n\n" + build_block(name, p, watchdog)
 
     tmp = target + ".tmp"
     with open(tmp, "w") as f:
@@ -2526,21 +2532,34 @@ def apply_live(name, by="plan"):
     return msgs
 
 
-def apply_plan(name, save_config=True):
+def apply_plan(name, save_config=True, trial=True):
     if PLANS[name].get("empty"):
         raise ValueError(f"The {name} plan is empty: fill it in first (in the window: "
                          f"{name} → Edit…, or with --set-custom)")
+    st = load_state()
+    if save_config and st and st.get("phase") in ("pending", "running"):
+        raise RuntimeError("the sweet spot test is running: wait for it, or cancel it")
     msgs = apply_live(name)
     if save_config:
-        path = write_config(name)
-        msgs.append(f"Saved to {path} (reboot for full fan curve)")
-        msgs += CONFIG_NOTES
+        msgs += save_plan_config(name, trial)
         try:
             install_service()
             msgs.append("Boot service on: this plan is restored at every boot")
         except Exception as e:  # noqa: BLE001
             msgs.append(f"Warning: boot service not installed ({e})")
     return msgs
+
+
+def save_plan_config(name, trial=True):
+    """Write the plan into config.txt, or, when it could stop the Pi from starting
+    (overclock, voltage, speeds below normal) and isn't proven yet, prepare a
+    one-time trial boot instead (see the fail-safe section)."""
+    risks = plan_risks(PLANS[name])
+    if trial and risks and not config_has_block(name):
+        return start_trial(name, risks)
+    cancel_trial(quiet=True)             # a safe plan replaces one waiting for its trial
+    path = write_config(name)
+    return [f"Saved to {path} (reboot for full fan curve)"] + CONFIG_NOTES
 
 
 # --------------------------------------------------------------------------- #
@@ -2611,6 +2630,13 @@ def boot_apply():
     if st and st.get("phase") in ("pending", "running"):
         autotest_boot(st)
         return
+    trial = load_trial()
+    if trial and trial.get("phase") in ("rebooting", "running"):
+        if booted_with_tryboot():
+            trial_boot(trial)
+            return
+        trial_failed(trial, "the Pi froze while it was checked" if trial["phase"] == "running"
+                     else "the Pi didn't start with it")
     name = find_plan(saved_plan() or "")
     if not name or PLANS[name].get("empty"):
         print(f"No saved plan: using {DEFAULT_PLAN} ({PLANS[DEFAULT_PLAN]['governor']} "
@@ -2767,6 +2793,7 @@ def start_autotest(minutes, max_temp, undervolt=True):
         subprocess.run(["apt-get", "install", "-y", "stress-ng"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=600)
     install_service()
+    cancel_trial(quiet=True)             # the test uses tryboot.txt itself
     os.makedirs(STATE_DIR, exist_ok=True)
     open(AUTOTEST_LOG, "w").close()
     state = {"phase": "pending", "index": 0, "step": list(AUTOTEST_STEPS[0]),
@@ -2783,7 +2810,8 @@ def tryboot_step(state):
     freq, ovd = current_step(state)
     plan = {"governor": "ondemand", "max_freq_mhz": freq,
             "over_voltage_delta": ovd, "fan": TEST_FAN}
-    write_config(f"Autotest {step_label(freq, ovd)}", plan, target=tryboot_path())
+    write_config(f"Autotest {step_label(freq, ovd)}", plan, target=tryboot_path(),
+                 watchdog=True)
     state["stage"], state["stage_ends"] = "rebooting", None
     save_state(state)
     at_log(f"Rebooting into test {step_label(freq, ovd)} (one-time tryboot)")
@@ -3009,13 +3037,36 @@ def _burn_worker(seconds, q):
             return
 
 
-def run_stress(seconds, max_temp):
-    """Load every core. Returns (passed, reason, peak_temp), or None if cancelled."""
-    wd = None
+def open_watchdog():
+    """The hardware watchdog: once open, the Pi resets if we stop writing to it."""
     try:
-        wd = open("/dev/watchdog", "wb", buffering=0)  # resets the Pi if we freeze
+        return open("/dev/watchdog", "wb", buffering=0)
     except OSError:
-        at_log("Hardware watchdog not available: if it freezes, unplug and replug power")
+        return None
+
+
+def close_watchdog(wd):
+    if wd:
+        try:
+            wd.write(b"V")  # "magic close": stop the watchdog cleanly
+            wd.close()
+        except OSError:
+            pass
+
+
+def run_stress(seconds, max_temp, still=None, wd=None):
+    """Load every core. Returns (passed, reason, peak_temp), or None if cancelled.
+    `still()` says whether to go on (default: the sweet spot test is running).
+    `wd`: a watchdog the caller holds open (it stays open)."""
+    own_wd = wd is None
+    if own_wd:
+        wd = open_watchdog()           # resets the Pi if we freeze
+        if wd is None:
+            at_log("Hardware watchdog not available: if it freezes, hold the power "
+                   "button to turn it off, then press it again")
+    if still is None:
+        def still():
+            return (load_state() or {}).get("phase") == "running"
 
     peak, ng, procs, q, refs = 0.0, None, [], None, set()
     use_ng = shutil.which("stress-ng") is not None
@@ -3054,7 +3105,7 @@ def run_stress(seconds, max_temp):
                     refs.add(val)
                 if len(refs) > 1:
                     return False, "unstable", peak
-            if (load_state() or {}).get("phase") != "running":
+            if not still():
                 return None
             if use_ng:
                 if ng.poll() is not None:
@@ -3073,12 +3124,8 @@ def run_stress(seconds, max_temp):
         for p in procs:
             if p.is_alive():
                 p.terminate()
-        if wd:
-            try:
-                wd.write(b"V")  # "magic close": stop the watchdog cleanly
-                wd.close()
-            except OSError:
-                pass
+        if own_wd:
+            close_watchdog(wd)
 
 
 def cancel_autotest():
@@ -3090,6 +3137,204 @@ def cancel_autotest():
         at_log("Test cancelled by user")
     print("Sweet spot test cancelled. config.txt was never changed by the test.\n"
           "If the Pi is in a test boot right now, reboot to return to normal.")
+
+
+# --------------------------------------------------------------------------- #
+#  Fail-safe: settings that could stop the Pi from starting are tried once first
+#
+#  Overclocks, voltage changes (also undervolts) and speeds below the normal
+#  lowest only take effect at boot, and if they're wrong the Pi doesn't start.
+#  So they go into tryboot.txt, not config.txt, and the Pi reboots with
+#  "reboot '0 tryboot'": the firmware uses tryboot.txt for that ONE boot. That
+#  boot also starts the hardware watchdog (kernel_watchdog_timeout). The boot
+#  service then keeps the watchdog fed, waits a little and runs a short stress
+#  test. If everything is fine, the settings are written to config.txt and kept.
+#  If the Pi hangs while starting, or during the check, the watchdog resets it,
+#  and the next boot is a normal one: your previous settings, and the trial is
+#  marked as failed. If it hangs before Linux starts (no watchdog yet), hold the
+#  power button until it turns off and press it again: same result.
+# --------------------------------------------------------------------------- #
+TRIAL_STATE = STATE_DIR + "/trial.json"
+TRIAL_WATCHDOG_S = 180      # s: the firmware's watchdog until our service takes it over
+TRIAL_SETTLE_S = 20         # s after the boot service starts, before the check
+TRIAL_STRESS_S = 90         # s of stress test on every core
+TRIAL_MAX_TEMP = 85
+
+
+def plan_risks(p):
+    """What in this plan could stop the Pi from starting (empty: nothing)."""
+    risks = []
+    if p.get("max_freq_mhz", 0) > BOARD["top"]:
+        risks.append("CPU overclock")
+    volt = p.get("over_voltage_delta") or p.get("over_voltage")
+    if volt:
+        risks.append("undervolt" if volt < 0 else "extra voltage")
+    if p.get("arm_freq_min"):
+        risks.append("CPU below its normal lowest speed")
+    if BOARD["gpu"]:
+        top, low = plan_gpu(p)
+        if (top or V3D_DEFAULT) > V3D_DEFAULT or p.get("gpu_freq"):
+            risks.append("GPU overclock")
+        if min(x for x in (top, low, V3D_MIN_DEFAULT) if x) < V3D_MIN_DEFAULT:
+            risks.append("GPU below its normal lowest speed")
+    return risks
+
+
+def current_block():
+    text = read(config_path(), "") or ""
+    m = re.search(re.escape(BLOCK_START) + r".*?" + re.escape(BLOCK_END) + r"\n?", text,
+                  flags=re.S)
+    return m.group(0) if m else None
+
+
+def config_has_block(name):
+    """True if config.txt already has exactly this plan: it started with it before."""
+    return (current_block() or "").strip() == build_block(name).strip()
+
+
+def load_trial():
+    try:
+        with open(TRIAL_STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def save_trial(st):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = TRIAL_STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, TRIAL_STATE)
+    os.sync()
+
+
+def trial_log(msg):
+    """The trial's story goes into the same log as the sweet spot test."""
+    at_log(f"[trial] {msg}")
+
+
+def start_trial(name, risks):
+    write_config(name, target=tryboot_path(), watchdog=True)
+    save_trial({"plan": name, "phase": "pending", "risks": risks, "time": time.time()})
+    trial_log(f"{name} ({', '.join(risks)}) is waiting for its trial boot")
+    return [f"{name} has {', '.join(risks)}: to be safe it's tried once first, config.txt "
+            "isn't changed yet. Reboot to try it (the window asks; or "
+            "sudo pi5_energyplan.py --trial-reboot). If the Pi starts and passes a 2-minute "
+            "check, it's kept. If it hangs, it restarts by itself with your previous "
+            "settings (or hold the power button until it turns off, then press it again)."]
+
+
+def trial_reboot():
+    st = load_trial()
+    if not st or st.get("phase") != "pending":
+        raise RuntimeError("No settings are waiting for a trial boot")
+    if not os.path.exists(tryboot_path()):
+        raise RuntimeError("The trial settings are gone: choose the plan again")
+    st["phase"], st["rebooted"] = "rebooting", time.time()
+    save_trial(st)
+    trial_log(f"Rebooting to try {st['plan']} (one-time boot)")
+    os.sync()
+    subprocess.run(["reboot", "0 tryboot"])
+
+
+def cancel_trial(quiet=False):
+    st = load_trial()
+    if not st or st.get("phase") not in ("pending", "rebooting", "running"):
+        if not quiet:
+            print("No trial boot is waiting")
+        return
+    at = load_state()
+    if not (at and at.get("phase") in ("pending", "running")):
+        remove_tryboot()
+    st["phase"] = "cancelled"
+    save_trial(st)
+    trial_log(f"Trial of {st['plan']} cancelled")
+    if not quiet:
+        print(f"Trial of {st['plan']} cancelled: config.txt keeps your current settings.")
+
+
+def trial_failed(st, reason):
+    remove_tryboot()
+    st["phase"], st["reason"], st["ended"] = "failed", reason, time.time()
+    save_trial(st)
+    trial_log(f"{st['plan']} NOT kept: {reason}. Your previous settings are in use.")
+
+
+def trial_boot(st):
+    """Called at boot when the Pi started with the trial settings (tryboot). If
+    anything goes wrong here, the watchdog isn't closed: it resets the Pi, and the
+    next boot uses the normal settings."""
+    name = st["plan"]
+    wd = open_watchdog()            # keep the firmware's watchdog fed from now on
+
+    def still():
+        return (load_trial() or {}).get("phase") == "running"
+
+    if name not in PLANS or PLANS[name].get("empty"):
+        trial_failed(st, "the plan is gone")
+        close_watchdog(wd)
+        subprocess.run(["reboot"])
+        return
+    st["phase"], st["booted"] = "running", time.time()
+    st["check_ends"] = time.time() + TRIAL_SETTLE_S + TRIAL_STRESS_S
+    save_trial(st)
+    trial_log(f"Started with {name}. Checking it for {TRIAL_SETTLE_S + TRIAL_STRESS_S} s"
+              + ("" if wd else " (no hardware watchdog: if it hangs, hold the power "
+                 "button until it turns off, then press it again)"))
+    for line in apply_live(name, by="trial boot"):
+        print(f"[{name}] {line}")
+    end = time.time() + TRIAL_SETTLE_S
+    while time.time() < end:
+        if wd:
+            wd.write(b"1")
+        time.sleep(2)
+    if not still():
+        close_watchdog(wd)
+        return                         # cancelled: the next boot is a normal one
+    result = run_stress(TRIAL_STRESS_S, TRIAL_MAX_TEMP, still=still, wd=wd)
+    if result is None:
+        close_watchdog(wd)
+        return
+    passed, reason, peak = result
+    peak_txt = f", peak {peak:.1f} °C" if peak else ""
+    if passed:
+        write_config(name)
+        remove_tryboot()
+        st["phase"], st["ended"] = "kept", time.time()
+        save_trial(st)
+        close_watchdog(wd)
+        trial_log(f"{name} passed ({reason}{peak_txt}): saved to config.txt and kept")
+        return
+    trial_failed(st, f"the check failed: {reason}{peak_txt}")
+    close_watchdog(wd)
+    trial_log("Rebooting into your previous settings")
+    os.sync()
+    subprocess.run(["reboot"])
+
+
+def trial_summary():
+    """One line for --status and the window, or None if there's nothing to say."""
+    st = load_trial()
+    if not st:
+        return None
+    phase, name = st.get("phase"), st.get("plan")
+    if phase == "pending":
+        return f"{name} waits for its trial boot (reboot to try it)"
+    if phase == "rebooting":
+        return f"{name}: rebooting to try it"
+    if phase == "running":
+        left = int((st.get("check_ends") or 0) - time.time())
+        return f"{name} on trial: checking it" + \
+            (f", {left // 60}:{left % 60:02d} left" if left > 0 else "")
+    recent = time.time() - (st.get("ended") or 0) < 24 * 3600
+    if phase == "failed" and recent:
+        return f"{name} NOT kept: {st.get('reason')}. Your previous settings are in use."
+    if phase == "kept" and recent:
+        return f"{name} passed its trial boot and is kept"
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -3247,6 +3492,10 @@ class App:
         self._build()
         self.refresh()
         self.root.after(800, self.check_update)
+        news = trial_summary()                 # e.g. "Custom NOT kept: …"
+        if news:
+            self.msg.config(text=f"Trial boot: {news}",
+                            fg="#ef5350" if "NOT kept" in news else "#ffa726")
         self.root.after(300, self.serve_requests)
 
     def serve_requests(self):
@@ -3537,7 +3786,18 @@ class App:
         self.stat["Power"].config(text=f"{pw} · {thr}" if pw else thr,
                                   fg="#ef5350" if thr.startswith("NOW") else
                                   "#ffa726" if "limited" in pw else FG)
-        self.stat["Saved plan"].config(text=s["plan"] or f"none ({DEFAULT_PLAN} at boot)")
+        plan = s["plan"] or f"none ({DEFAULT_PLAN} at boot)"
+        trial = load_trial() or {}
+        phase, tname = trial.get("phase"), trial.get("plan")
+        recent = time.time() - (trial.get("ended") or 0) < 24 * 3600
+        extra, color = {
+            "pending": (f"{tname} waits for its trial reboot", "#ffa726"),
+            "rebooting": (f"{tname}: trial reboot", "#ffa726"),
+            "running": (f"{tname} on trial (being checked)", "#ffa726"),
+            "failed": (f"{tname} not kept: trial failed" if recent else "", "#ef5350"),
+        }.get(phase, ("", FG))
+        self.stat["Saved plan"].config(text=f"{plan} · {extra}" if extra else plan,
+                                       fg=color if extra else FG)
         sweet = autotest_summary() if "Sweet spot" in self.stat else ""
         if sweet:
             self.stat["Sweet spot"].config(text=sweet, fg="#ffa726" if sweet.startswith(
@@ -3963,8 +4223,10 @@ class App:
                 "Overclock",
                 f"{name} raises the CPU / GPU speed or voltage.\n\n"
                 "• Use the official 27 W power supply\n"
-                "• If the Pi freezes or won't boot, put the SD card in a PC and\n"
-                "  delete the 'pi5-energyplan' block at the end of config.txt\n\n"
+                "• Fail-safe: it's tried once first. If the Pi doesn't start or\n"
+                "  isn't stable, it comes back with your current settings by itself\n"
+                "  (if it stays dark, hold the power button until it turns off,\n"
+                "  then press it again)\n\n"
                 "Continue?")
 
     # ----- Custom plan editor -----
@@ -4121,20 +4383,16 @@ class App:
             top = BOARD["top"]
             if c["max_freq_mhz"] > top or c.get("v3d_freq", 0) > V3D_DEFAULT or \
                     volt_of(c) > 0:
-                warn.append("Overclock: use the official power supply and a fan. If it "
-                            "doesn't boot, remove the 'pi5-energyplan' block from config.txt "
-                            "on another computer.")
+                warn.append("Overclock: use the official power supply and a fan.")
             if c["max_freq_mhz"] >= top + 400 and volt_of(c) <= 0:
                 warn.append(f"{_speed(top + 400)} and more usually need extra voltage.")
             if volt_of(c) > 0 and c["max_freq_mhz"] <= top:
                 warn.append(f"Extra voltage only makes the Pi warmer at {_speed(top)} or "
                             "less.")
             if volt_of(c) < 0:
-                warn.append("Undervolt: if the Pi freezes, crashes under load or won't "
-                            "boot, the voltage is too low. Fix it by removing the "
-                            "'pi5-energyplan' block from config.txt on another computer."
-                            + (" With an overclock it's even more likely."
-                               if c["max_freq_mhz"] > top else ""))
+                warn.append("Undervolt: too low and the Pi freezes, crashes under load or "
+                            "won't start." + (" With an overclock it's even more likely."
+                                              if c["max_freq_mhz"] > top else ""))
             if min(c["max_freq_mhz"], c["min_freq_mhz"]) < low or \
                     0 < min(c.get("v3d_freq", 999), c.get("v3d_freq_min") or 999) < \
                     V3D_MIN_DEFAULT:
@@ -4143,6 +4401,12 @@ class App:
                             + ") isn't officially supported by Raspberry Pi: it applies "
                             "after a reboot, and if the firmware ignores it the Pi just "
                             "runs at its normal lowest speed. It saves little power.")
+            risky = c["max_freq_mhz"] > top or c.get("v3d_freq", 0) > V3D_DEFAULT or \
+                volt_of(c) or min(c["max_freq_mhz"], c["min_freq_mhz"]) < low or \
+                0 < min(c.get("v3d_freq", 999), c.get("v3d_freq_min") or 999) < \
+                V3D_MIN_DEFAULT
+            if risky:
+                warn.append("Fail-safe: with 'Save and use' it's tried once first; if the Pi doesn't start or isn't stable, it comes back with your current settings by itself.")
             note.config(text="\n".join(warn), fg="#ffa726")
         for v in (vvolt, vfan, vgov):
             v.trace_add("write", refresh)
@@ -4249,9 +4513,29 @@ class App:
             b.config(state="normal")
         self.msg.config(text=(f"✔ {name}\n" if ok else "✘ ") + text,
                         fg="#66bb6a" if ok else "#ef5350")
+        trial = load_trial()
+        if ok and trial and trial.get("phase") == "pending":
+            if messagebox.askyesno(
+                    "Try it now?",
+                    f"{trial['plan']} has {', '.join(trial.get('risks', []))}.\n\n"
+                    "To be safe the Pi reboots once with it and checks it for about 2\n"
+                    "minutes (don't use it meanwhile). If all is fine, it's kept.\n"
+                    "If the Pi doesn't start or isn't stable, it restarts by itself with\n"
+                    "your current settings (if it stays dark, hold the power button\n"
+                    "until it turns off, then press it again).\n\nReboot now?"):
+                self.on_trial_reboot()
+            return
         if ok and saved and messagebox.askyesno(
                 "Reboot?", f"{name} saved.\nReboot now to apply the full fan curve?"):
             self.on_reboot(confirm=False)
+
+    def on_trial_reboot(self):
+        self.set_busy("rebooting for the trial")
+        self.msg.config(text="Rebooting to try the new settings…", fg=MUTED)
+        threading.Thread(target=lambda: setattr(
+            self, "result", ("Trial boot", False) + run_root(["--trial-reboot"])),
+            daemon=True).start()
+        self.root.after(200, self.poll_result)
 
     def on_autotest(self):
         if self.blocked("the sweet spot test", lock_during_test=False):
@@ -4515,7 +4799,10 @@ def update_root():
             subprocess.run(["systemctl", "try-restart", GUARD_SERVICE], capture_output=True)
     plan = find_plan(saved_plan() or "")
     st = load_state()
-    if plan and not (st and st.get("phase") in ("pending", "running")):
+    if plan and plan_risks(PLANS[plan]) and not config_has_block(plan):
+        msgs.append(f"config.txt left as it is: '{plan}' changed and needs a trial boot "
+                    f"first (choose it again)")
+    elif plan and not (st and st.get("phase") in ("pending", "running")):
         path = config_path()
         before = read(path, "")
         write_config(plan)
@@ -4863,6 +5150,9 @@ def print_status():
         print(f"GPU (3D)    : {f'{gpu} MHz' if gpu else '?'}")
     print(f"Power       : {s['throttled']}")
     print(f"Saved plan  : {s['plan'] or f'none ({DEFAULT_PLAN} is used at boot)'}")
+    trial = trial_summary()
+    if trial:
+        print(f"Trial boot  : {trial}")
     if BOARD["autotest"]:
         print(f"Sweet spot  : {autotest_summary()}")
     found, why = ups_status()
@@ -4978,6 +5268,15 @@ def main():
     ap.add_argument("--autotest", action="store_true",
                     help="find the highest stable overclock, then the lowest stable "
                          "voltage at it (reboots several times)")
+    ap.add_argument("--trial-reboot", action="store_true",
+                    help="reboot once with the settings waiting for their trial boot "
+                         "(overclock, voltage, speeds below normal); kept only if the Pi "
+                         "starts and passes a short check (sudo)")
+    ap.add_argument("--trial-cancel", action="store_true",
+                    help="drop the settings waiting for their trial boot (sudo)")
+    ap.add_argument("--no-trial", action="store_true",
+                    help="with --apply: write overclock / voltage settings to config.txt "
+                         "right away, without the fail-safe trial boot (sudo)")
     ap.add_argument("--no-undervolt", action="store_true",
                     help="with --autotest: only the speed, don't look for a lower voltage")
     ap.add_argument("--minutes", type=int, default=5,
@@ -5208,6 +5507,14 @@ def main():
         install_service()
         print(f"Boot service on: the saved plan (or {DEFAULT_PLAN}) is set at every boot")
         return
+    if args.trial_reboot or args.trial_cancel:
+        if os.geteuid() != 0:
+            sys.exit("Needs root: run with sudo")
+        try:
+            trial_reboot() if args.trial_reboot else cancel_trial()
+        except RuntimeError as e:
+            sys.exit(f"Error: {e}")
+        return
     if args.boot or args.uninstall_service or args.uninstall_guard or args.autotest or \
             args.autotest_cancel:
         if os.geteuid() != 0:
@@ -5262,13 +5569,15 @@ def main():
         if os.geteuid() != 0:
             sys.exit("Needs root: run with sudo")
         if PLANS[name].get("warn"):
-            print(f"Overclock: {name}. Use the official 27 W supply. If it won't boot, "
-                  "remove the pi5-energyplan block from config.txt on another PC.")
+            print(f"Overclock: {name}. Use the official 27 W supply.")
         elif PLANS[name].get("undervolt"):
-            print(f"Undervolt: {name} (applies after a reboot). If the Pi freezes or won't "
-                  "boot, remove the pi5-energyplan block from config.txt on another PC.")
+            print(f"Undervolt: {name} (applies after a reboot).")
+        if args.no_trial and plan_risks(PLANS[name]) and not args.no_config:
+            print("No trial boot (--no-trial): if the Pi won't start, remove the "
+                  "pi5-energyplan block from config.txt on another computer.")
         try:
-            for line in apply_plan(name, save_config=not args.no_config):
+            for line in apply_plan(name, save_config=not args.no_config,
+                                   trial=not args.no_trial):
                 print(line)
         except Exception as e:  # noqa: BLE001
             sys.exit(f"Error: {e}")

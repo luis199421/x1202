@@ -209,6 +209,19 @@ def load_module():
     return mod
 
 
+def pass_trial(ok=True):
+    """Do what a trial reboot does: boot with tryboot.txt and pass (or fail) the check."""
+    ep = load_module()
+    ep.TRIAL_SETTLE_S = 0
+    ep.booted_with_tryboot = lambda: True
+    ep.run_stress = lambda *a, **k: (ok, "stable" if ok else "unstable", 55.0)
+    st = ep.load_trial()
+    st["phase"] = "rebooting"
+    ep.save_trial(st)
+    ep.boot_apply()
+    return ep
+
+
 class Stop(BaseException):
     pass
 
@@ -344,13 +357,13 @@ class TestPlans(Base):
         self.assertFalse(os.path.exists("/etc/systemd/system/pi5-energyplan.service"))
 
     def test_overclock_needs_reboot(self):
-        out = cli("--apply", "oc28").stdout
+        out = cli("--apply", "oc28", "--no-trial").stdout
         self.assertIn("Overclock: OC 2.8 GHz", out)
         self.assertIn("2800 MHz unlocks after reboot", out)
         self.assertEqual(get(CPUFREQ + "/scaling_max_freq"), "2400000")
         cfg = self.config()
         self.assertIn("arm_freq=2800\nover_voltage_delta=50000\nv3d_freq=1050\n", cfg)
-        cli("--apply", "OC 3.0 GHz")
+        cli("--apply", "OC 3.0 GHz", "--no-trial")
         self.assertIn("arm_freq=3000\nover_voltage_delta=50000\nv3d_freq=1100\n",
                       self.config())
         self.assertNotIn("\ngpu_freq=", self.config())
@@ -358,7 +371,7 @@ class TestPlans(Base):
     def test_gpu_overclock_steps_up_with_the_cpu(self):
         gpu = {}
         for plan in ("OC 2.6 GHz", "OC 2.8 GHz", "OC 3.0 GHz"):
-            cli("--apply", plan)
+            cli("--apply", plan, "--no-trial")
             block = self.config().split("# >>> pi5-energyplan")[1]
             gpu[plan] = int(block.split("v3d_freq=")[1].split()[0])
             self.assertEqual(block.count("v3d_freq="), 1)
@@ -368,7 +381,7 @@ class TestPlans(Base):
         self.assertNotIn("v3d_freq=", self.config().split("# >>> pi5-energyplan")[1])
         # a hand-made GPU overclock elsewhere in config.txt can't override the plan
         put("/boot/firmware/config.txt", self.config().replace("[pi5]", "[pi5]\nv3d_freq=1200"))
-        cli("--apply", "oc26")
+        cli("--apply", "oc26", "--no-trial")
         self.assertIn("#energyplan-disabled# v3d_freq=1200", self.config())
         self.assertIn("GPU (3D)    : 960 MHz", cli("--status").stdout)
 
@@ -643,7 +656,8 @@ class TestAutotest(Base):
         ep.start_autotest(1, 80, undervolt=False)
         self.assertEqual(calls()[-1], "reboot 0 tryboot")
         self.assertEqual(self.config(), self.normal)     # config.txt never touched
-        self.assertIn("arm_freq=2600\n[all]\n# <<<", self.tryboot())
+        self.assertIn("arm_freq=2600\nkernel_watchdog_timeout=180\n[all]\n# <<<",
+                      self.tryboot())                     # resets the Pi if it hangs
 
         self.results = [(True, "stable, ran at 2600 MHz", 61.0)]
         self.boot(True)                                   # 2600 +0 passes
@@ -661,6 +675,7 @@ class TestAutotest(Base):
         self.assertEqual(calls()[-1], "reboot ")
         self.assertIn("# plan: Sweet Spot", self.config())
         self.assertIn("arm_freq=2600", self.config())
+        self.assertNotIn("kernel_watchdog_timeout", self.config())
         custom = json.loads(get("/etc/pi5-energyplan/custom.json"))
         self.assertEqual(custom["Sweet Spot"]["max_freq_mhz"], 2600)
         self.assertIn("Sweet Spot", cli("--list").stdout)
@@ -1387,7 +1402,7 @@ class TestOtherBoards(Base):
         self.assertIn("no fan control", out)
         self.assertIn("# plan: Cool\n[pi4]\narm_freq=1800\n[all]\n# <<<", self.block())
         self.assertNotIn("fan_temp0=", self.block())
-        cli("--apply", "OC 2.0")
+        cli("--apply", "OC 2.0", "--no-trial")
         self.assertIn("[pi4]\narm_freq=2000\nover_voltage=6\n[all]", self.block())
         r = cli("--set-fan", "Cool", "Max", check=False)
         self.assertIn("no fan control", r.stderr)
@@ -1406,7 +1421,7 @@ class TestOtherBoards(Base):
         self.assertEqual(ep.PLANS["Balanced"]["max_freq_mhz"], 1500)
         # Custom: undervolt and overvolt in 25 mV steps (over_voltage -16 to 6)
         out = cli("--set-custom", '{"max_freq_mhz": 1500, "over_voltage": -2}',
-                  "--apply", "Custom").stdout
+                  "--apply", "Custom", "--no-trial").stdout
         self.assertIn("CPU 1500 MHz -0.05 V", out)
         self.assertIn("[pi4]\narm_freq=1500\nover_voltage=-2\n[all]", self.block())
         r = cli("--set-custom", '{"over_voltage": 7}', check=False)
@@ -1430,11 +1445,11 @@ class TestOtherBoards(Base):
             r = cli("--set-custom", json.dumps(bad), check=False)
             self.assertIn(why, r.stderr, bad)
         out = cli("--set-custom", '{"max_freq_mhz": 900, "governor": "schedutil"}',
-                  "--apply", "Custom").stdout
+                  "--apply", "Custom", "--no-trial").stdout
         self.assertIn("Custom plan saved: CPU 900 MHz, schedutil governor", out)
         self.assertIn("[pi02]\narm_freq=900\n[all]", self.block())
         out = cli("--set-custom", '{"max_freq_mhz": 900, "over_voltage": -4}',
-                  "--apply", "Custom").stdout                        # undervolt -0.1 V
+                  "--apply", "Custom", "--no-trial").stdout                        # undervolt -0.1 V
         self.assertIn("Custom plan saved: CPU 900 MHz -0.1 V", out)
         self.assertIn("Undervolt: Custom", out)
         self.assertIn("[pi02]\narm_freq=900\nover_voltage=-4\n[all]", self.block())
@@ -1446,7 +1461,7 @@ class TestOtherBoards(Base):
         self.assertIn("[pi0]\narm_freq=1000\n[all]", self.block())
 
     def test_sd_card_moved_from_a_pi5_to_a_pi4(self):
-        cli("--apply", "OC 2.8")                      # on the Pi 5
+        cli("--apply", "OC 2.8", "--no-trial")                      # on the Pi 5
         self.assertIn("[pi5]", self.block())
         self.board("Raspberry Pi 4 Model B Rev 1.4", 1800000, 600000)
         put(CPUFREQ + "/scaling_governor", "powersave")
@@ -1618,7 +1633,7 @@ class TestCustomPlan(Base):
         self.assertRegex(cli("--list").stdout,
                          r"Custom\s+conservative\s+fan Strong\s+Yours: CPU 2.7 GHz \+0.025 V, "
                          r"GPU 1020 MHz.")
-        out = cli("--apply", "Custom").stdout
+        out = cli("--apply", "Custom", "--no-trial").stdout
         self.assertIn("Overclock: Custom", out)
         self.assertIn("2700 MHz unlocks after reboot", out)
         block = self.block()
@@ -1629,7 +1644,7 @@ class TestCustomPlan(Base):
         self.assertIn("Saved plan  : Custom", cli("--status").stdout)
 
     def test_set_and_use_in_one_step(self):
-        out = cli("--set-custom", json.dumps(self.MINE), "--apply", "Custom").stdout
+        out = cli("--set-custom", json.dumps(self.MINE), "--apply", "Custom", "--no-trial").stdout
         self.assertEqual(out.count("Saved to /boot/firmware/config.txt"), 1)   # applied once
         self.assertIn("# plan: Custom", self.config())
 
@@ -1647,15 +1662,17 @@ class TestCustomPlan(Base):
         self.assertNotIn("Overclock", cli("--apply", "Custom").stdout)
 
     def test_changing_it_while_in_use_applies_again(self):
-        cli("--set-custom", json.dumps(self.MINE), "--apply", "Custom")
+        cli("--set-custom", json.dumps(self.MINE), "--apply", "Custom", "--no-trial")
         out = cli("--set-custom", json.dumps(dict(self.MINE, max_freq_mhz=2500,
                                                   over_voltage_delta=0))).stdout
-        self.assertIn("Saved to /boot/firmware/config.txt", out)
+        self.assertIn("tried once first", out)            # still a GPU overclock
+        pass_trial()
         self.assertIn("arm_freq=2500\nv3d_freq=1020\n", self.block())
 
     def test_lowest_speeds(self):
         out = cli("--set-custom", json.dumps(dict(self.MINE, min_freq_mhz=2000,
-                                                  v3d_freq_min=800)), "--apply", "Custom").stdout
+                                                  v3d_freq_min=800)),
+                  "--apply", "Custom", "--no-trial").stdout
         self.assertIn("CPU 2700 MHz +0.025 V (min 2000 MHz), GPU 1020 MHz (min 800 MHz)", out)
         self.assertIn("min 2000 MHz", out)
         self.assertEqual(get(CPUFREQ + "/scaling_min_freq"), "2000000")    # right away
@@ -1675,14 +1692,14 @@ class TestCustomPlan(Base):
         self.assertNotIn("v3d_freq_min", self.block())
         # an overclock unlocks after the reboot: until then the min is capped at 2.4 GHz
         cli("--set-custom", json.dumps({"max_freq_mhz": 2700, "min_freq_mhz": 2700}),
-            "--apply", "Custom")
+            "--apply", "Custom", "--no-trial")
         self.assertEqual(get(CPUFREQ + "/scaling_max_freq"), "2400000")
         self.assertEqual(get(CPUFREQ + "/scaling_min_freq"), "2400000")
 
     def test_exact_speeds_and_below_the_normal_lowest(self):
         out = cli("--set-custom", json.dumps({"max_freq_mhz": 2650, "min_freq_mhz": 1750,
                                               "v3d_freq": 955, "v3d_freq_min": 505}),
-                  "--apply", "Custom").stdout
+                  "--apply", "Custom", "--no-trial").stdout
         self.assertIn("CPU 2650 MHz (min 1750 MHz), GPU 955 MHz (min 505 MHz)", out)
         block = self.block()
         self.assertIn("arm_freq=2650\n", block)
@@ -1692,14 +1709,14 @@ class TestCustomPlan(Base):
         self.assertRegex(cli("--list").stdout, r"Yours: CPU 2.65 GHz \(min 1.75 GHz\)")
         # below the normal lowest: the firmware's minimum is lowered too (after reboot)
         out = cli("--set-custom", json.dumps({"max_freq_mhz": 1200, "min_freq_mhz": 600,
-                                              "v3d_freq": 400}), "--apply", "Custom").stdout
+                                              "v3d_freq": 400}), "--apply", "Custom", "--no-trial").stdout
         self.assertIn("min 600 MHz after reboot", out)
         block = self.block()
         self.assertIn("arm_freq=1200\narm_freq_min=600\n", block)
         self.assertIn("v3d_freq=400\nv3d_freq_min=400\n", block)  # below 500: min follows
         self.assertEqual(get(CPUFREQ + "/scaling_min_freq"), "1500000")   # until the reboot
         # only the max given, below the normal lowest: the min follows it
-        cli("--set-custom", '{"max_freq_mhz": 1000}', "--apply", "Custom")
+        cli("--set-custom", '{"max_freq_mhz": 1000}', "--apply", "Custom", "--no-trial")
         self.assertIn("arm_freq=1000\narm_freq_min=1000\n", self.block())
         # a hand-made arm_freq_min elsewhere doesn't override the plan
         cfg = self.config().replace("arm_boost=1", "arm_boost=1\narm_freq_min=300")
@@ -1710,7 +1727,7 @@ class TestCustomPlan(Base):
 
     def test_undervolt(self):
         out = cli("--set-custom", '{"max_freq_mhz": 2400, "over_voltage_delta": -50000}',
-                  "--apply", "Custom").stdout
+                  "--apply", "Custom", "--no-trial").stdout
         self.assertIn("Custom plan saved: CPU 2400 MHz -0.05 V", out)
         self.assertIn("Undervolt: Custom (applies after a reboot)", out)
         self.assertNotIn("Overclock", out)
@@ -1718,13 +1735,13 @@ class TestCustomPlan(Base):
         self.assertFalse(self.ep.PLANS["Custom"].get("warn"))
         self.assertRegex(cli("--list").stdout, r"Yours: CPU 2.4 GHz -0.05 V")
         cli("--set-custom", '{"max_freq_mhz": 2400, "over_voltage_delta": -12500}',
-            "--apply", "Custom")                                     # any mV, even 12.5
+            "--apply", "Custom", "--no-trial")                                     # any mV, even 12.5
         self.assertIn("over_voltage_delta=-12500\n", self.block())
         cli("--apply", "Balanced")                                  # gone with another plan
         self.assertNotIn("over_voltage", self.block())
 
     def test_lowest_speed_left_out_changes_nothing(self):
-        cli("--set-custom", json.dumps(self.MINE), "--apply", "Custom")
+        cli("--set-custom", json.dumps(self.MINE), "--apply", "Custom", "--no-trial")
         self.assertEqual(get(CPUFREQ + "/scaling_min_freq"), "1500000")
         self.assertNotIn("min", self.ep.PLANS["Custom"]["desc"] +
                          json.dumps(json.loads(get("/etc/pi5-energyplan/custom.json"))))
@@ -1764,6 +1781,115 @@ class TestCustomPlan(Base):
         self.assertIn("Sweet Spot", lst)
         self.assertEqual(lst.strip().splitlines()[-1].split()[0], "Custom")   # still last
         self.assertNotIn("Custom", json.loads(get("/etc/pi5-energyplan/fans.json")))
+
+
+class TestFailSafe(Base):
+    """Settings that could stop the Pi from starting are tried once first."""
+    CFG = "/boot/firmware/config.txt"
+    TRY = "/boot/firmware/tryboot.txt"
+
+    def setUp(self):
+        super().setUp()
+        cli("--apply", "Cool")
+        self.safe = get(self.CFG)
+
+    def test_overclock_is_tried_first_and_kept(self):
+        out = cli("--apply", "OC 2.6 GHz").stdout
+        self.assertIn("CPU overclock, extra voltage, GPU overclock: to be safe it's tried "
+                      "once first", out)
+        self.assertEqual(get(self.CFG), self.safe)               # untouched for now
+        self.assertIn("arm_freq=2600\nover_voltage_delta=25000\nv3d_freq=1000\n"
+                      "kernel_watchdog_timeout=180\n", get(self.TRY))
+        self.assertIn("Trial boot  : OC 2.6 GHz waits for its trial boot",
+                      cli("--status").stdout)
+        cli("--trial-reboot")
+        self.assertEqual(calls()[-1], "reboot 0 tryboot")
+        self.assertEqual(json.loads(get("/var/lib/pi5-energyplan/trial.json"))["phase"],
+                         "rebooting")
+        pass_trial()                                              # started fine
+        cfg = get(self.CFG)
+        self.assertIn("# plan: OC 2.6 GHz", cfg)
+        self.assertNotIn("kernel_watchdog_timeout", cfg)          # only for the trial
+        self.assertFalse(os.path.exists(self.TRY))
+        self.assertIn("OC 2.6 GHz passed its trial boot and is kept", cli("--status").stdout)
+        self.assertIn("passed (stable", get("/var/lib/pi5-energyplan/autotest.log"))
+        # the same plan again: proven, no new trial
+        out = cli("--apply", "OC 2.6 GHz").stdout
+        self.assertNotIn("tried once first", out)
+        self.assertIn("Saved to /boot/firmware/config.txt", out)
+
+    def test_pi_that_doesnt_start_comes_back_with_the_old_settings(self):
+        cli("--set-custom", '{"max_freq_mhz": 2400, "over_voltage_delta": -150000}',
+            "--apply", "Custom")
+        self.assertIn("over_voltage_delta=-150000", get(self.TRY))
+        cli("--trial-reboot")
+        ep = load_module()
+        ep.booted_with_tryboot = lambda: False      # hung, reset: a normal boot
+        ep.TRIAL_SETTLE_S = 0
+        self.no_sleep()
+        ep.time = time
+        ep.boot_apply()
+        self.assertEqual(get(self.CFG), self.safe)
+        self.assertFalse(os.path.exists(self.TRY))
+        st = cli("--status").stdout
+        self.assertIn("Custom NOT kept: the Pi didn't start with it", st)
+        self.assertIn("Saved plan  : Cool", st)
+
+    def test_freeze_during_the_check_and_failed_check(self):
+        cli("--apply", "OC 3.0 GHz")
+        cli("--trial-reboot")
+        st = json.loads(get("/var/lib/pi5-energyplan/trial.json"))
+        st["phase"] = "running"                     # froze while being checked
+        put("/var/lib/pi5-energyplan/trial.json", json.dumps(st))
+        ep = load_module()
+        ep.booted_with_tryboot = lambda: False
+        self.no_sleep()
+        ep.boot_apply()
+        self.assertIn("the Pi froze while it was checked", cli("--status").stdout)
+        self.assertEqual(get(self.CFG), self.safe)
+        # it starts but the stress test finds it unstable: back to the old settings
+        cli("--apply", "OC 3.0 GHz")
+        cli("--trial-reboot")
+        pass_trial(ok=False)
+        self.assertEqual(get(self.CFG), self.safe)
+        self.assertEqual(calls()[-1], "reboot ")
+        self.assertIn("NOT kept: the check failed: unstable", cli("--status").stdout)
+
+    def test_safe_plans_and_cancel(self):
+        cli("--apply", "OC 2.8 GHz")
+        self.assertTrue(os.path.exists(self.TRY))
+        out = cli("--apply", "Eco").stdout                         # a safe plan instead
+        self.assertIn("Saved to", out)
+        self.assertFalse(os.path.exists(self.TRY))
+        self.assertIn("# plan: Eco", get(self.CFG))
+        self.assertNotIn("Trial boot", cli("--status").stdout)
+        cli("--apply", "OC 2.8 GHz")
+        self.assertIn("cancelled", cli("--trial-cancel").stdout)
+        self.assertFalse(os.path.exists(self.TRY))
+        r = cli("--trial-reboot", check=False)
+        self.assertIn("No settings are waiting", r.stderr)
+        # what counts as risky
+        ep = self.ep
+        self.assertEqual(ep.plan_risks(ep.PLANS["Performance"]), [])
+        self.assertEqual(ep.plan_risks({"max_freq_mhz": 1200, "arm_freq_min": 600}),
+                         ["CPU below its normal lowest speed"])
+        self.assertEqual(ep.plan_risks({"max_freq_mhz": 2400, "v3d_freq": 400,
+                                        "v3d_freq_min": 400}),
+                         ["GPU below its normal lowest speed"])
+        self.assertEqual(ep.plan_risks({"max_freq_mhz": 2400, "v3d_freq": 800}), [])
+
+    def test_no_trial_and_the_sweet_spot_test(self):
+        out = cli("--apply", "OC 2.6 GHz", "--no-trial").stdout
+        self.assertIn("No trial boot (--no-trial)", out)
+        self.assertIn("# plan: OC 2.6 GHz", get(self.CFG))
+        cli("--apply", "OC 3.0 GHz")                               # waiting for a trial…
+        ep = self.ep
+        ep.is_pi5 = lambda: True
+        ep.start_autotest(1, 80)                                   # …the test replaces it
+        self.assertIn("Autotest", get(self.TRY))
+        self.assertEqual(ep.load_trial()["phase"], "cancelled")
+        r = cli("--apply", "OC 2.8 GHz", check=False)
+        self.assertIn("the sweet spot test is running", r.stderr)
 
 
 class TestPowerLimit(Base):
@@ -1852,7 +1978,7 @@ class TestPowerLimit(Base):
         self.assertIn("v3d_freq=860\n", self.config())
         self.assertIn("raised to 860 MHz", logs[-1])
         # a plan change keeps the cap in config.txt
-        cli("--apply", "OC 2.6 GHz")
+        cli("--apply", "OC 2.6 GHz", "--no-trial")
         self.assertIn("v3d_freq=860\n", self.config())
         self.assertNotIn("v3d_freq=1000", self.config())
 
@@ -2770,11 +2896,23 @@ class TestGui(Base):
             ctl["volt"].set("+25")                            # triggers the warning text
             app.root.update()
             self.assertIn("Overclock", ctl["note"].cget("text"))
+            self.assertIn("Fail-safe", ctl["note"].cget("text"))
+            asked = []
+            ep.messagebox.askyesno = lambda title, text: asked.append(title) or True
             ctl["Save and use"].invoke()
             end = time.time() + 60
-            while app.busy and time.time() < end:
+            while (app.busy or "Try it now?" not in asked) and time.time() < end:
                 app.root.update()
                 time.sleep(0.05)
+            while app.busy and time.time() < end:            # the trial reboot
+                app.root.update()
+                time.sleep(0.05)
+            self.assertIn("Overclock", asked)                 # confirmed first
+            self.assertIn("reboot 0 tryboot", calls())        # tried once first
+            self.assertNotIn("# plan: Custom", self.config())
+            app._refresh()
+            self.assertIn("Custom: trial reboot", app.stat["Saved plan"].cget("text"))
+            pass_trial()                                      # it started fine
             self.assertIn("# plan: Custom", self.config())
             self.assertIn("arm_freq=2600", self.config())
             self.assertIn("v3d_freq_min=900", self.config())

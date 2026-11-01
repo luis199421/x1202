@@ -115,8 +115,8 @@ go back to the normal lowest speed.
   Pi, so one setting changes both; there's no separate GPU voltage. Go down in small
   steps (−25 mV at a time) and use the Pi normally for a while after each one, or let
   the [sweet spot test](#3-sweet-spot-overclock-test) find the lowest stable voltage
-  safely. If an undervolt freezes the Pi or it won't boot, remove the `pi5-energyplan`
-  block from `config.txt` on another computer.
+  safely. Every undervolt is [tried once first](#fail-safe-risky-settings-are-tried-once-first),
+  so one that's too low doesn't stop the Pi from starting.
 * **Exact speeds:** Linux changes the CPU's speed in 100 MHz steps, so a speed in between
   runs at the step below it for the max (2650 → 2600 MHz while running) and the step above
   it for the min (1750 → 1800 MHz). The GPU uses the exact number.
@@ -151,13 +151,43 @@ speed)*:
 | Strong | 35 °C | 60 °C |
 | Max | 30 °C | 55 °C |
 
+### Fail-safe: risky settings are tried once first
+
+Settings that could stop the Pi from starting only take effect at boot: an **overclock**
+(CPU or GPU), **any voltage change** (also an undervolt), and **CPU or GPU speeds below the
+normal lowest**. So a plan with any of them (the OC plans, a Custom plan with them) isn't
+written to `config.txt` right away:
+
+1. It goes into **`tryboot.txt`**, and the window asks **"Try it now?"**. From the
+   terminal: `sudo pi5_energyplan.py --trial-reboot`. The Pi reboots with
+   `reboot '0 tryboot'`: the firmware uses `tryboot.txt` for **that one boot only**.
+2. That boot also starts the **hardware watchdog** (`kernel_watchdog_timeout=180`). The
+   boot service keeps it fed, waits 20 seconds and runs a 90-second stress test on every
+   core (don't use the Pi meanwhile; the window shows "on trial").
+3. **Passed:** the settings are written to `config.txt` and kept. **Failed** (too hot,
+   unstable, under-voltage): the Pi reboots by itself into your previous settings.
+4. **If it hangs** while starting or during the check, the watchdog resets it within 3
+   minutes, and the next boot is a normal one: your previous settings. If the screen
+   stays dark before Linux even starts (the watchdog isn't running yet), **hold the
+   power button until the Pi turns off, then press it again**: same result. With the
+   X1202, unplugging the adapter isn't enough, because the batteries keep the Pi powered.
+
+The window and `--status` then say what happened, for example *"Custom NOT kept: the Pi
+didn't start with it. Your previous settings are in use."* A plan that's already in
+`config.txt` (it started with it before) isn't tried again. Choosing a safe plan while one
+waits for its trial drops the trial; `sudo pi5_energyplan.py --trial-cancel` does too.
+Experts can skip it with `--apply PLAN --no-trial`.
+
+The sweet spot test works the same way (one boot per step, with the watchdog), so it's
+never a risk either.
+
 ### What changes when you pick a plan
 
 | When | What | How |
 |---|---|---|
 | **Right away** | CPU governor and max frequency | writes `/sys/devices/system/cpu/cpufreq/policy*/scaling_governor` and `scaling_max_freq` |
 | **Right away** (if the kernel allows it) | Fan start temperatures | writes the active trip points in `/sys/class/thermal/thermal_zone0` |
-| **After a reboot** | Full fan curve (temperatures **and** speeds), `arm_freq`, `over_voltage_delta`, `gpu_freq` | a managed block at the end of `/boot/firmware/config.txt` |
+| **After a reboot** | Full fan curve (temperatures **and** speeds), `arm_freq`, `over_voltage_delta`, `v3d_freq` | a managed block at the end of `/boot/firmware/config.txt` (risky settings after their [trial boot](#fail-safe-risky-settings-are-tried-once-first)) |
 | **At every boot** | Governor and max frequency again. The Raspberry Pi kernel always starts in `powersave` (1.5 GHz); with no saved plan, **Performance** is used instead. If the battery saver is on (on battery), it's left on. | `pi5-energyplan.service`, installed with the program |
 
 The block in `config.txt` looks like this on a Pi 5. The script only ever changes the
@@ -366,7 +396,8 @@ For each step:
    only**.
 2. After booting, it waits 45 seconds (time to cancel), then runs a stress test on all
    cores for 5 minutes. It uses `stress-ng --verify`, which the test installs if
-   needed, or a built-in checksum test. The hardware watchdog is armed during the test.
+   needed, or a built-in checksum test. The hardware watchdog is armed from the moment
+   the Pi starts (`kernel_watchdog_timeout`), so a hang resets it by itself.
 3. A step **fails** if the CPU overheats (default 80 °C), throttles, reports
    under-voltage, or gives a wrong result. It also fails if the Pi freezes or resets:
    the next boot comes back with your normal `config.txt` and the test continues.
@@ -556,6 +587,9 @@ After `install.sh`, you can write `pi5_energyplan.py` instead of
 | `sudo python3 pi5_energyplan.py --set-governor Eco performance` | Change the governor a plan uses |
 | `sudo python3 pi5_energyplan.py --set-fan Eco Strong` | Change a plan's fan profile (Silent, Quiet, Default, Cool, Strong, Max) |
 | `sudo python3 pi5_energyplan.py --set-custom '{…}' [--apply Custom]` | Fill in the Custom plan (see [Your own plan](#your-own-plan-custom)) |
+| `sudo python3 pi5_energyplan.py --trial-reboot` | Reboot once with the settings waiting for their [trial boot](#fail-safe-risky-settings-are-tried-once-first); kept only if the Pi starts and passes the check |
+| `sudo python3 pi5_energyplan.py --trial-cancel` | Drop the settings waiting for their trial boot |
+| `sudo python3 pi5_energyplan.py --apply PLAN --no-trial` | Write overclock / voltage settings to `config.txt` right away, without the fail-safe (experts) |
 | `sudo python3 pi5_energyplan.py --power-limit 6` | Pi 5: keep the power use under 6 W (`off` = no limit; `'{"watts": 6, "gpu": false}'` leaves the GPU alone). See [Power limit](#power-limit-pi-5) |
 | `python3 pi5_energyplan.py --battery` | Live battery readout every 3 s (Ctrl+C to stop) |
 | `python3 pi5_energyplan.py --monitor [SECONDS]` | Full UPS and Pi report, refreshed in place (Ctrl+C to stop) |
@@ -600,7 +634,8 @@ After `install.sh`, you can write `pi5_energyplan.py` instead of
 |---|---|
 | `/boot/firmware/config.txt` | The managed `pi5-energyplan` block at the end |
 | `/boot/firmware/config.txt.energyplan.bak` | Your original `config.txt` (made once) |
-| `/boot/firmware/tryboot.txt` | Only during the sweet spot test |
+| `/boot/firmware/tryboot.txt` | Only during the sweet spot test, or while risky settings wait for their trial boot |
+| `/var/lib/pi5-energyplan/trial.json` | The last trial boot: which plan, and whether it was kept (its log goes into `autotest.log`) |
 | `/usr/local/bin/pi5_energyplan.py` | The copy the services run |
 | `/usr/share/pi5-energyplan/` | The package's files (the installed version, `install.sh`) |
 | `/etc/apt/sources.list.d/pi5-energyplan.sources`, `/usr/share/keyrings/pi5-energyplan-archive-keyring.asc` | The update source and its key (once the project has a signing key) |
@@ -723,7 +758,7 @@ over, then compare every managed file byte for byte.
 
 | Problem | Fix |
 |---|---|
-| **The Pi won't boot after choosing an overclock plan** | Put the SD card or SSD in another computer. In the boot partition, open `config.txt`, delete the `pi5-energyplan` block (or copy `config.txt.energyplan.bak` over it), and boot again. |
+| **The Pi won't boot after choosing an overclock or undervolt** | Since the [fail-safe](#fail-safe-risky-settings-are-tried-once-first), a risky setting is only kept after it started fine once: hold the power button until the Pi turns off, press it again, and it comes back with your previous settings. Settings written with `--no-trial` or by older versions: put the SD card or SSD in another computer, open `config.txt` in the boot partition (**bootfs**), replace the block from `# >>> pi5-energyplan` to `# <<< pi5-energyplan <<<` with a line `[all]`, and boot again. From another Linux system (e.g. a USB drive): `sudo mount /dev/nvme0n1p1 /mnt && sudo sed -i '/^# >>> pi5-energyplan/,/^# <<< pi5-energyplan <<</c [all]' /mnt/config.txt && sudo umount /mnt` |
 | Window says *"I2C is off"* | `sudo raspi-config nonint do_i2c 0`, then reboot |
 | *"Missing I2C library"* | `sudo apt install python3-smbus2` (or run the installer again) |
 | *"UPS not answering on I2C 0x36"* | The X1202 isn't seated or its pogo pins don't touch the Pi (I2C is on physical pins 3 and 5). Check that `i2cdetect -y 1` shows `36`. Turn the power off before adjusting the boards. |
@@ -771,7 +806,7 @@ The installer test for the menu entry and panel icon needs a throwaway user:
 `sudo INSTALL_TEST_USER=someuser sh tests/run_sim_tests.sh`. To run some tests only:
 `sudo TESTS="TestUps TestNothingTwice" sh tests/run_sim_tests.sh`.
 
-The 133 tests cover:
+The 138 tests cover:
 
 * **Plans:** applying each kind of plan, the live sysfs changes and governor fallback,
   `config.txt` editing (backup, commenting out conflicting lines, only `[all]`/`[pi5]`
@@ -789,6 +824,12 @@ The 133 tests cover:
   fastest speed until one fails, the 15 mV margin, the normal speed undervolted when no
   overclock is stable, never below −200 mV, a voltage that already failed isn't tried
   again, and `--no-undervolt`.
+* **Fail-safe trial boot:** an overclock waits in `tryboot.txt` (with the watchdog line)
+  and `config.txt` stays untouched; `--trial-reboot`; kept after a good trial boot
+  (without the watchdog line), not tried again; a Pi that didn't start, one that froze
+  during the check, and a failed check all come back with the old settings; a safe plan
+  or `--trial-cancel` drops a waiting trial; `--no-trial`; the sweet spot test takes over
+  `tryboot.txt`; what counts as risky; the window's "Try it now?" and its status.
 * **Undervolt in the Custom plan:** negative core voltage on a Pi 5 (any mV), Pi 4 and
   Zero 2 W (25 mV steps, undervolt only on the Zero), the limits, and the window's
   voltage box and its warnings.
