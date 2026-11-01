@@ -3345,6 +3345,24 @@ def trial_reboot():
     subprocess.run(["reboot", "0 tryboot"])
 
 
+def trial_skip():
+    """--trial-skip: write the settings waiting for their trial to config.txt now."""
+    st = load_trial()
+    if not st or st.get("phase") != "pending":
+        raise RuntimeError("No settings are waiting for a trial boot")
+    name = st["plan"]
+    if name not in PLANS or PLANS[name].get("empty"):
+        raise RuntimeError(f"The plan '{name}' is gone")
+    path = write_config(name)
+    remove_tryboot()
+    st["phase"], st["ended"] = "skipped", time.time()
+    save_trial(st)
+    trial_log(f"{name} written to config.txt without a trial boot (skipped by the user)")
+    return [f"{name} saved to {path} without testing. Reboot to use it. If the Pi won't "
+            "start, replace the pi5-energyplan block in config.txt with [all] on another "
+            "computer."] + CONFIG_NOTES
+
+
 def cancel_trial(quiet=False):
     st = load_trial()
     if not st or st.get("phase") not in ("pending", "rebooting", "running"):
@@ -4524,7 +4542,10 @@ class App:
                 0 < min(c.get("v3d_freq", 999), c.get("v3d_freq_min") or 999) < \
                 V3D_MIN_DEFAULT
             if risky:
-                warn.append("Fail-safe: with 'Save and use' it's tried once first; if the Pi doesn't start or isn't stable, it comes back with your current settings by itself.")
+                warn.append("Fail-safe: with 'Save and use' you can test it once first; "
+                            "if the Pi doesn't start or isn't stable, it comes back with "
+                            "your current settings by itself. You can also apply it "
+                            "without testing.")
             note.config(text="\n".join(warn), fg="#ffa726")
         for v in (vvolt, vfan, vgov):
             v.trace_add("write", refresh)
@@ -4636,18 +4657,22 @@ class App:
                         fg="#66bb6a" if ok else "#ef5350")
         trial = load_trial()
         if ok and trial and trial.get("phase") == "pending":
-            if messagebox.askyesno(
-                    "Try it now?",
-                    f"{trial['plan']} has {', '.join(trial.get('risks', []))}.\n\n"
-                    "To be safe the Pi reboots once with it and checks it for about 2\n"
-                    "minutes (don't use it meanwhile). If all is fine, it's kept.\n"
-                    "If the Pi doesn't start or isn't stable, it restarts by itself with\n"
-                    "your current settings (if it stays dark, hold the power button\n"
-                    "until it turns off, then press it again).\n\nReboot now?"):
-                self.on_trial_reboot()
+            self.choose(
+                "Try it now?",
+                [("try", "Test it first (safe): reboot once and check it"),
+                 ("skip", "Apply now without testing, and reboot"),
+                 ("later", "Later")], self.on_trial_choice,
+                text=f"{trial['plan']} has {', '.join(trial.get('risks', []))}. "
+                     "Tested: the Pi reboots once with it and checks it for about 2 "
+                     "minutes (don't use it meanwhile); if all is fine it's kept, if not it "
+                     "comes back with your current settings by itself. Without testing: "
+                     "it's written to config.txt right away; if the Pi then won't start, "
+                     "you have to fix config.txt on another computer.")
             return
-        if ok and saved and messagebox.askyesno(
-                "Reboot?", f"{name} saved.\nReboot now to apply the full fan curve?"):
+        question = "Saved without testing.\nReboot now to use it?" \
+            if name == "Applied without testing" else \
+            f"{name} saved.\nReboot now to apply the full fan curve?"
+        if ok and saved and messagebox.askyesno("Reboot?", question):
             self.on_reboot(confirm=False)
 
     def on_no_password(self):
@@ -4663,6 +4688,20 @@ class App:
             self, "result", ("Password setting", False) +
             run_root(["--no-password", "on" if on else "off"])), daemon=True).start()
         self.root.after(200, self.poll_result)
+
+    def on_trial_choice(self, answer):
+        if answer == "try":
+            self.on_trial_reboot()
+        elif answer == "skip":
+            self.set_busy("applying without testing")
+            self.msg.config(text="Applying without testing…", fg=MUTED)
+            threading.Thread(target=lambda: setattr(
+                self, "result", ("Applied without testing", True) +
+                run_root(["--trial-skip"])), daemon=True).start()
+            self.root.after(200, self.poll_result)
+        else:
+            self.msg.config(text="The new settings wait for their trial: choose the plan "
+                                 "again when you want to try them.", fg="#ffa726")
 
     def on_trial_reboot(self):
         self.set_busy("rebooting for the trial")
@@ -5413,6 +5452,9 @@ def main():
                     help="reboot once with the settings waiting for their trial boot "
                          "(overclock, voltage, speeds below normal); kept only if the Pi "
                          "starts and passes a short check (sudo)")
+    ap.add_argument("--trial-skip", action="store_true",
+                    help="write the settings waiting for their trial boot to config.txt "
+                         "now, without testing (sudo)")
     ap.add_argument("--trial-cancel", action="store_true",
                     help="drop the settings waiting for their trial boot (sudo)")
     ap.add_argument("--no-trial", action="store_true",
@@ -5656,11 +5698,14 @@ def main():
         except (RuntimeError, OSError) as e:
             sys.exit(f"Error: {e}")
         return
-    if args.trial_reboot or args.trial_cancel:
+    if args.trial_reboot or args.trial_cancel or args.trial_skip:
         if os.geteuid() != 0:
             sys.exit("Needs root: run with sudo")
         try:
-            trial_reboot() if args.trial_reboot else cancel_trial()
+            if args.trial_skip:
+                print("\n".join(trial_skip()))
+            else:
+                trial_reboot() if args.trial_reboot else cancel_trial()
         except RuntimeError as e:
             sys.exit(f"Error: {e}")
         return

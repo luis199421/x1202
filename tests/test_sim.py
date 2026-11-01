@@ -1881,6 +1881,20 @@ class TestFailSafe(Base):
                          ["GPU below its normal lowest speed"])
         self.assertEqual(ep.plan_risks({"max_freq_mhz": 2400, "v3d_freq": 800}), [])
 
+    def test_skip_the_test(self):
+        cli("--apply", "OC 2.8 GHz")
+        self.assertEqual(get(self.CFG), self.safe)
+        out = cli("--trial-skip").stdout
+        self.assertIn("OC 2.8 GHz saved to /boot/firmware/config.txt without testing", out)
+        cfg = get(self.CFG)
+        self.assertIn("# plan: OC 2.8 GHz", cfg)
+        self.assertNotIn("kernel_watchdog_timeout", cfg)
+        self.assertFalse(os.path.exists(self.TRY))
+        self.assertIn("skipped by the user", get("/var/lib/pi5-energyplan/autotest.log"))
+        self.assertNotIn("Trial boot", cli("--status").stdout)
+        r = cli("--trial-skip", check=False)                       # nothing waits now
+        self.assertIn("No settings are waiting", r.stderr)
+
     def test_no_trial_and_the_sweet_spot_test(self):
         out = cli("--apply", "OC 2.6 GHz", "--no-trial").stdout
         self.assertIn("No trial boot (--no-trial)", out)
@@ -2990,9 +3004,14 @@ class TestGui(Base):
             ep.messagebox.askyesno = lambda title, text: asked.append(title) or True
             ctl["Save and use"].invoke()
             end = time.time() + 60
-            while (app.busy or "Try it now?" not in asked) and time.time() < end:
+            while (app.busy or not getattr(app, "chooser", None)) and time.time() < end:
                 app.root.update()
                 time.sleep(0.05)
+            self.assertEqual(app.chooser.title(), "Try it now?")
+            texts = widget_texts(app.chooser)
+            self.assertIn("○  Apply now without testing, and reboot", texts)
+            app.chooser.destroy()
+            app.on_trial_choice("try")
             while app.busy and time.time() < end:            # the trial reboot
                 app.root.update()
                 time.sleep(0.05)
@@ -3061,6 +3080,31 @@ class TestPowerLimitWindow(Base):
             app.root.update()
             self.assertNotIn(" W", app.stat["Power"].cget("text"))
             self.assertNotIn("Power limit…", widget_texts(app.root))
+        finally:
+            app.root.destroy()
+            KEEP_TK.append(app)
+
+
+@unittest.skipUnless(HAVE_TK, "needs tkinter and a display (use xvfb-run)")
+class TestTrialWindow(Base):
+    def test_apply_without_testing_from_the_window(self):
+        cli("--apply", "OC 2.8 GHz")                    # waits for its trial
+        ep = self.ep
+        asked = []
+        ep.messagebox.askyesno = lambda title, text: asked.append(text) or False
+        app = ep.App()
+        try:
+            app.root.update()
+            self.assertIn("waits for its trial", app.msg.cget("text"))
+            app.on_trial_choice("skip")
+            end = time.time() + 60
+            while app.busy and time.time() < end:
+                app.root.update()
+                time.sleep(0.05)
+            self.assertIn("without testing", app.msg.cget("text"))
+            self.assertIn("Saved without testing.\nReboot now to use it?", asked)
+            self.assertIn("# plan: OC 2.8 GHz", self.config())
+            self.assertNotIn("reboot 0 tryboot", calls())
         finally:
             app.root.destroy()
             KEEP_TK.append(app)

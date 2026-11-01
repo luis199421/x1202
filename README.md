@@ -158,9 +158,11 @@ Settings that could stop the Pi from starting only take effect at boot: an **ove
 normal lowest**. So a plan with any of them (the OC plans, a Custom plan with them) isn't
 written to `config.txt` right away:
 
-1. It goes into **`tryboot.txt`**, and the window asks **"Try it now?"**. From the
-   terminal: `sudo pi5_energyplan.py --trial-reboot`. The Pi reboots with
-   `reboot '0 tryboot'`: the firmware uses `tryboot.txt` for **that one boot only**.
+1. It goes into **`tryboot.txt`**, and the window asks **"Try it now?"** with three
+   choices: **Test it first (safe)**, **Apply now without testing**, or **Later**. From
+   the terminal: `sudo pi5_energyplan.py --trial-reboot` (test) or `--trial-skip`
+   (apply without testing). When tested, the Pi reboots with `reboot '0 tryboot'`: the
+   firmware uses `tryboot.txt` for **that one boot only**.
 2. That boot also starts the **hardware watchdog** (`kernel_watchdog_timeout=180`). The
    boot service keeps it fed, waits 20 seconds and runs a 90-second stress test on every
    core (don't use the Pi meanwhile; the window shows "on trial").
@@ -176,7 +178,13 @@ The window and `--status` then say what happened, for example *"Custom NOT kept:
 didn't start with it. Your previous settings are in use."* A plan that's already in
 `config.txt` (it started with it before) isn't tried again. Choosing a safe plan while one
 waits for its trial drops the trial; `sudo pi5_energyplan.py --trial-cancel` does too.
-Experts can skip it with `--apply PLAN --no-trial`.
+
+**Skipping the test:** choose **Apply now without testing** in the window, or
+`sudo pi5_energyplan.py --trial-skip` for settings already waiting, or
+`sudo pi5_energyplan.py --apply PLAN --no-trial` to never prepare a trial. The settings go
+straight into `config.txt` and take effect at the next reboot, but without the safety
+net: if the Pi then won't start, you have to fix `config.txt` on another computer (see
+[Troubleshooting](#9-troubleshooting)).
 
 The sweet spot test works the same way (one boot per step, with the watchdog), so it's
 never a risk either.
@@ -605,6 +613,7 @@ After `install.sh`, you can write `pi5_energyplan.py` instead of
 | `sudo python3 pi5_energyplan.py --set-custom '{…}' [--apply Custom]` | Fill in the Custom plan (see [Your own plan](#your-own-plan-custom)) |
 | `sudo python3 pi5_energyplan.py --no-password on` | The window stops asking you for your password (`off` = ask again). See [The password](#the-password) |
 | `sudo python3 pi5_energyplan.py --trial-reboot` | Reboot once with the settings waiting for their [trial boot](#fail-safe-risky-settings-are-tried-once-first); kept only if the Pi starts and passes the check |
+| `sudo python3 pi5_energyplan.py --trial-skip` | Write the settings waiting for their trial boot to `config.txt` now, without testing |
 | `sudo python3 pi5_energyplan.py --trial-cancel` | Drop the settings waiting for their trial boot |
 | `sudo python3 pi5_energyplan.py --apply PLAN --no-trial` | Write overclock / voltage settings to `config.txt` right away, without the fail-safe (experts) |
 | `sudo python3 pi5_energyplan.py --power-limit 6` | Pi 5: keep the power use under 6 W (`off` = no limit; `'{"watts": 6, "gpu": false}'` leaves the GPU alone). See [Power limit](#power-limit-pi-5) |
@@ -825,7 +834,7 @@ The installer test for the menu entry and panel icon needs a throwaway user:
 `sudo INSTALL_TEST_USER=someuser sh tests/run_sim_tests.sh`. To run some tests only:
 `sudo TESTS="TestUps TestNothingTwice" sh tests/run_sim_tests.sh`.
 
-The 142 tests cover:
+The 144 tests cover:
 
 * **Plans:** applying each kind of plan, the live sysfs changes and governor fallback,
   `config.txt` editing (backup, commenting out conflicting lines, only `[all]`/`[pi5]`
@@ -850,7 +859,8 @@ The 142 tests cover:
   and `config.txt` stays untouched; `--trial-reboot`; kept after a good trial boot
   (without the watchdog line), not tried again; a Pi that didn't start, one that froze
   during the check, and a failed check all come back with the old settings; a safe plan
-  or `--trial-cancel` drops a waiting trial; `--no-trial`; the sweet spot test takes over
+  or `--trial-cancel` drops a waiting trial; `--no-trial` and `--trial-skip` (also the
+  window's "Apply now without testing"); the sweet spot test takes over
   `tryboot.txt`; what counts as risky; the window's "Try it now?" and its status.
 * **Undervolt in the Custom plan:** negative core voltage on a Pi 5 (any mV), Pi 4 and
   Zero 2 W (25 mV steps, undervolt only on the Zero), the limits, and the window's
