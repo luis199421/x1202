@@ -2578,11 +2578,116 @@ WantedBy=multi-user.target
 """
 
 
+# --------------------------------------------------------------------------- #
+#  The password prompt (polkit)
+#  The window runs its root steps through pkexec. ROOT_HELPER is a tiny
+#  root-owned program that only starts the installed copy of this script, and
+#  POLKIT_ACTION describes it to polkit: the password is remembered for a few
+#  minutes (auth_admin_keep). With "Don't ask for my password", POLKIT_RULE
+#  lets the chosen users run it without a password, only from their own desktop
+#  session (local and active), and only this program: nothing else gets root.
+# --------------------------------------------------------------------------- #
+ROOT_HELPER = "/usr/local/bin/pi5-energyplan-root"
+POLKIT_ID = "io.github.luis199421.pi5-energyplan"
+POLKIT_ACTION = f"/usr/share/polkit-1/actions/{POLKIT_ID}.policy"
+POLKIT_RULE = "/etc/polkit-1/rules.d/49-pi5-energyplan.rules"
+NO_PASSWORD_FILE = "/etc/pi5-energyplan/no-password.json"   # the same list, readable
+
+ROOT_HELPER_TEXT = f"""#!/bin/sh
+# Pi 5 Energy Plan: runs the installed copy as root for the window (through pkexec).
+exec /usr/bin/python3 {INSTALLED_SCRIPT} "$@"
+"""
+
+POLKIT_ACTION_TEXT = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <action id="{POLKIT_ID}.run">
+    <description>Change Pi 5 Energy Plan settings</description>
+    <message>Pi 5 Energy Plan needs your password to change system settings</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">{ROOT_HELPER}</annotate>
+  </action>
+</policyconfig>
+"""
+
+
+def install_root_helper():
+    """The pkexec helper and its polkit description (root). Rewritten only when
+    different, so nothing is ever added twice."""
+    for path, text, mode in ((ROOT_HELPER, ROOT_HELPER_TEXT, 0o755),
+                             (POLKIT_ACTION, POLKIT_ACTION_TEXT, 0o644)):
+        if read(path) != text.strip():
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            write(path, text)
+        os.chmod(path, mode)
+
+
+def no_password_users():
+    try:
+        with open(NO_PASSWORD_FILE) as f:
+            users = json.load(f).get("users", [])
+    except (OSError, ValueError, AttributeError):
+        return []
+    return [u for u in users if isinstance(u, str) and re.fullmatch(r"[a-z_][a-z0-9_.-]*", u)]
+
+
+def calling_user():
+    """The desktop user behind sudo / pkexec."""
+    import pwd
+    uid = os.environ.get("PKEXEC_UID")
+    if uid and uid.isdigit():
+        try:
+            return pwd.getpwuid(int(uid)).pw_name
+        except KeyError:
+            pass
+    return os.environ.get("SUDO_USER") or None
+
+
+def set_no_password(on, user=None):
+    """--no-password on|off (root): stop or start asking this user for the password."""
+    user = user or calling_user()
+    if not user or user == "root":
+        raise RuntimeError("run it from your own account with sudo (or from the window)")
+    users = [u for u in no_password_users() if u != user] + ([user] if on else [])
+    install_root_helper()
+    if users:
+        os.makedirs(os.path.dirname(POLKIT_RULE), exist_ok=True)
+        write(POLKIT_RULE, f"""// Pi 5 Energy Plan: these users change its settings without a password,
+// from their own desktop session, and only through {ROOT_HELPER}.
+polkit.addRule(function(action, subject) {{
+    if (action.id == "{POLKIT_ID}.run" && subject.local && subject.active &&
+        {json.dumps(sorted(users))}.indexOf(subject.user) >= 0) {{
+        return polkit.Result.YES;
+    }}
+}});
+""")
+        os.chmod(POLKIT_RULE, 0o644)
+    elif os.path.exists(POLKIT_RULE):
+        os.remove(POLKIT_RULE)
+    write_json_atomic(NO_PASSWORD_FILE, {"users": sorted(users)})
+    return (f"Pi 5 Energy Plan won't ask {user} for the password any more (only for its "
+            "own settings)." if on else
+            f"Pi 5 Energy Plan asks {user} for the password again (remembered for a few "
+            "minutes).")
+
+
+def remove_root_helper():
+    for path in (ROOT_HELPER, POLKIT_ACTION, POLKIT_RULE, NO_PASSWORD_FILE):
+        if os.path.exists(path):
+            os.remove(path)
+
+
 def install_service():
     """Copy this script to /usr/local/bin and enable the boot service."""
     if os.path.exists(NO_BOOT_SERVICE):
         os.remove(NO_BOOT_SERVICE)
     install_copy()
+    install_root_helper()
     if read(SERVICE_PATH) != SERVICE_UNIT.strip():
         write(SERVICE_PATH, SERVICE_UNIT)
         subprocess.run(["systemctl", "daemon-reload"], check=True)
@@ -3354,11 +3459,16 @@ def run_privileged(name, save_config):
 
 def run_root(extra, timeout=180):
     """Run this script with root rights (pkexec password prompt). Returns (ok, text)."""
-    args = [sys.executable, os.path.abspath(__file__)] + extra
+    me = os.path.abspath(__file__)
+    args = [sys.executable, me] + extra
     if os.geteuid() == 0:
         cmd = args
     elif shutil.which("pkexec"):
-        cmd = ["pkexec"] + args
+        # the helper runs the installed copy: use it when that's this same program
+        # (then polkit remembers the password, or doesn't ask, see install_root_helper)
+        same = os.path.exists(ROOT_HELPER) and (me == INSTALLED_SCRIPT or
+                                                file_sha(me) == file_sha(INSTALLED_SCRIPT))
+        cmd = ["pkexec"] + ([ROOT_HELPER] + extra if same else args)
     else:
         cmd = ["sudo", "-n"] + args
 
@@ -3737,10 +3847,18 @@ class App:
                           activebackground="#4a4d55", activeforeground=FG,
                           font=("DejaVu Sans", 9)).pack(anchor="w", pady=(2, 0))
 
-        tk.Checkbutton(body, text="Keep this plan after reboot (config.txt + boot service)",
+        row = tk.Frame(body, bg=BG)
+        row.pack(fill="x", padx=12)
+        tk.Checkbutton(row, text="Keep this plan after reboot",
                        variable=self.save_var, bg=BG, fg=FG, selectcolor=CARD,
                        activebackground=BG, activeforeground=FG,
-                       font=("DejaVu Sans", 9)).pack(anchor="w", padx=12)
+                       font=("DejaVu Sans", 9)).pack(side="left")
+        import getpass
+        self.nopass_var = tk.BooleanVar(value=getpass.getuser() in no_password_users())
+        tk.Checkbutton(row, text="Don't ask for my password", variable=self.nopass_var,
+                       command=self.on_no_password, bg=BG, fg=FG, selectcolor=CARD,
+                       activebackground=BG, activeforeground=FG,
+                       font=("DejaVu Sans", 9)).pack(side="left", padx=(12, 0))
 
         self.msg = self._label(foot, "Pick a plan.", 9, MUTED, wraplength=440,
                                justify="left")
@@ -4509,6 +4627,9 @@ class App:
         name, saved, ok, text = self.result
         self.result, self.busy = None, False
         self.sync_governors()
+        if name == "Password setting" and not ok:     # cancelled: show what's really set
+            import getpass
+            self.nopass_var.set(getpass.getuser() in no_password_users())
         for b in self.buttons.values():
             b.config(state="normal")
         self.msg.config(text=(f"✔ {name}\n" if ok else "✘ ") + text,
@@ -4528,6 +4649,20 @@ class App:
         if ok and saved and messagebox.askyesno(
                 "Reboot?", f"{name} saved.\nReboot now to apply the full fan curve?"):
             self.on_reboot(confirm=False)
+
+    def on_no_password(self):
+        on = self.nopass_var.get()
+        if self.blocked("the password setting", lock_during_test=False):
+            self.nopass_var.set(not on)
+            return
+        self.set_busy("saving the password setting")
+        self.msg.config(text="Enter your password one last time…" if on else
+                        "Turning the password prompt back on…", fg=MUTED)
+
+        threading.Thread(target=lambda: setattr(
+            self, "result", ("Password setting", False) +
+            run_root(["--no-password", "on" if on else "off"])), daemon=True).start()
+        self.root.after(200, self.poll_result)
 
     def on_trial_reboot(self):
         self.set_busy("rebooting for the trial")
@@ -4766,6 +4901,8 @@ def update_root():
     any number of times never adds anything twice."""
     msgs = []
     changed = False
+    if os.path.exists(INSTALLED_SCRIPT) or os.path.exists(ROOT_HELPER):
+        install_root_helper()
     installed = [p for p in (SERVICE_PATH, GUARD_UNIT_PATH, POWER_UNIT_PATH)
                  if os.path.exists(p)]
     if installed and installed_is_newer():
@@ -5268,6 +5405,10 @@ def main():
     ap.add_argument("--autotest", action="store_true",
                     help="find the highest stable overclock, then the lowest stable "
                          "voltage at it (reboots several times)")
+    ap.add_argument("--no-password", choices=["on", "off"],
+                    help="on: the window stops asking you for your password for its own "
+                         "settings (only from your desktop session); off: it asks again "
+                         "(sudo)")
     ap.add_argument("--trial-reboot", action="store_true",
                     help="reboot once with the settings waiting for their trial boot "
                          "(overclock, voltage, speeds below normal); kept only if the Pi "
@@ -5506,6 +5647,14 @@ def main():
             return
         install_service()
         print(f"Boot service on: the saved plan (or {DEFAULT_PLAN}) is set at every boot")
+        return
+    if args.no_password:
+        if os.geteuid() != 0:
+            sys.exit("Needs root: run with sudo")
+        try:
+            print(set_no_password(args.no_password == "on"))
+        except (RuntimeError, OSError) as e:
+            sys.exit(f"Error: {e}")
         return
     if args.trial_reboot or args.trial_cancel:
         if os.geteuid() != 0:

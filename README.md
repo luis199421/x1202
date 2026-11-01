@@ -526,7 +526,8 @@ Then:
 
 1. Open **Pi 5 Energy Plan** from the menu.
 2. Click a plan, for example **Cool**. Keep *"Keep this plan after reboot"* ticked.
-   Enter your password when asked. Reboot when it asks, so the full fan curve applies.
+   Enter your password when asked (tick **Don't ask for my password** to stop that). Reboot
+   when it asks, so the full fan curve applies.
 3. Click **UPS settings…** → **Recommended (20–80 %)** → **Save**. This turns on the
    battery guard service.
 
@@ -559,6 +560,21 @@ Applying a plan or saving UPS settings for the first time copies the script to
 
 ![UPS settings](docs/ups-settings.png)
 
+### The password
+
+Changing a plan, the UPS settings and so on needs root, so the window asks for your
+password (with `pkexec`). It's **remembered for a few minutes**, so several changes in a
+row ask only once. To stop it asking at all, tick **Don't ask for my password** under the
+plans: you enter it one last time, and from then on the window doesn't ask you any more.
+Untick it to be asked again. From the terminal:
+`sudo pi5_energyplan.py --no-password on` (or `off`).
+
+How it stays safe: it only covers `/usr/local/bin/pi5-energyplan-root`, a small root-owned
+program that starts the installed Pi 5 Energy Plan and nothing else (a polkit rule in
+`/etc/polkit-1/rules.d/49-pi5-energyplan.rules`). It only works for the users who chose
+it, and only from their own desktop session: not over SSH, and not for other programs.
+Running a copy from another folder (a download that isn't installed yet) still asks.
+
 ### Small screens
 
 On a small screen, like the 7" Touch Display (800×480) or 1024×600, the windows fit
@@ -587,6 +603,7 @@ After `install.sh`, you can write `pi5_energyplan.py` instead of
 | `sudo python3 pi5_energyplan.py --set-governor Eco performance` | Change the governor a plan uses |
 | `sudo python3 pi5_energyplan.py --set-fan Eco Strong` | Change a plan's fan profile (Silent, Quiet, Default, Cool, Strong, Max) |
 | `sudo python3 pi5_energyplan.py --set-custom '{…}' [--apply Custom]` | Fill in the Custom plan (see [Your own plan](#your-own-plan-custom)) |
+| `sudo python3 pi5_energyplan.py --no-password on` | The window stops asking you for your password (`off` = ask again). See [The password](#the-password) |
 | `sudo python3 pi5_energyplan.py --trial-reboot` | Reboot once with the settings waiting for their [trial boot](#fail-safe-risky-settings-are-tried-once-first); kept only if the Pi starts and passes the check |
 | `sudo python3 pi5_energyplan.py --trial-cancel` | Drop the settings waiting for their trial boot |
 | `sudo python3 pi5_energyplan.py --apply PLAN --no-trial` | Write overclock / voltage settings to `config.txt` right away, without the fail-safe (experts) |
@@ -648,6 +665,8 @@ After `install.sh`, you can write `pi5_energyplan.py` instead of
 | `/run/pi5-energyplan/power-limit.json`, `plan-limits.json` | Live power-limit status; the plan's CPU speeds it gives back |
 | `/etc/pi5-energyplan/battery.json` | UPS settings |
 | `/etc/pi5-energyplan/governors.json`, `fans.json` | Your per-plan governor and fan choices |
+| `/usr/local/bin/pi5-energyplan-root`, `/usr/share/polkit-1/actions/io.github.luis199421.pi5-energyplan.policy` | What the window runs as root, and its polkit description (the password is remembered for a few minutes) |
+| `/etc/polkit-1/rules.d/49-pi5-energyplan.rules`, `/etc/pi5-energyplan/no-password.json` | Only with **Don't ask for my password**: who isn't asked |
 | `/etc/pi5-energyplan/custom.json` | The "Sweet Spot" and "Custom" plans |
 | `/etc/sysctl.d/90-pi5-energyplan.conf`, `/etc/systemd/system/tmp.mount` | Only with slow storage and 2 GB+ RAM (see Slow storage) |
 | `/etc/pi5-energyplan/charge_pin_v3.json` | What the charge-pin self-check learned |
@@ -806,7 +825,7 @@ The installer test for the menu entry and panel icon needs a throwaway user:
 `sudo INSTALL_TEST_USER=someuser sh tests/run_sim_tests.sh`. To run some tests only:
 `sudo TESTS="TestUps TestNothingTwice" sh tests/run_sim_tests.sh`.
 
-The 138 tests cover:
+The 142 tests cover:
 
 * **Plans:** applying each kind of plan, the live sysfs changes and governor fallback,
   `config.txt` editing (backup, commenting out conflicting lines, only `[all]`/`[pi5]`
@@ -824,6 +843,9 @@ The 138 tests cover:
   fastest speed until one fails, the 15 mV margin, the normal speed undervolted when no
   overclock is stable, never below −200 mV, a voltage that already failed isn't tried
   again, and `--no-undervolt`.
+* **Password:** the root helper and its polkit description (remembered password), never
+  added twice, removed on uninstall; `--no-password on/off` per user; the window uses
+  the helper only for the installed copy; the window's checkbox.
 * **Fail-safe trial boot:** an overclock waits in `tryboot.txt` (with the watchdog line)
   and `config.txt` stays untouched; `--trial-reboot`; kept after a good trial boot
   (without the watchdog line), not tried again; a Pi that didn't start, one that froze

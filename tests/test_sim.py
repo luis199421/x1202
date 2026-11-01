@@ -143,7 +143,8 @@ def make_pi(governors="conservative ondemand userspace powersave performance sch
               "/run/pi5-energyplan", "/sys/firmware", "/usr/share/pi5-energyplan",
               "/sys/block", "/etc/sysctl.d",
               "/usr/share/doc/pi5-energyplan", "/usr/share/keyrings",
-              "/etc/apt/sources.list.d", "/var/cache/pi5-energyplan", STATE):
+              "/etc/apt/sources.list.d", "/var/cache/pi5-energyplan",
+              "/usr/share/polkit-1/actions", "/etc/polkit-1/rules.d", STATE):
         clear(d)
     put(CPUFREQ + "/scaling_available_governors", governors)
     put(CPUFREQ + "/scaling_governor", "ondemand")
@@ -934,7 +935,9 @@ class TestInstaller(Base):
         for p in ("/usr/local/bin/pi5_energyplan.py",
                   "/etc/systemd/system/pi5-energyplan.service",
                   "/etc/systemd/system/pi5-battery-guard.service",
-                  "/usr/share/pi5-energyplan/pi5_energyplan.py"):
+                  "/usr/share/pi5-energyplan/pi5_energyplan.py",
+                  "/usr/local/bin/pi5-energyplan-root",
+                  "/usr/share/polkit-1/actions/io.github.luis199421.pi5-energyplan.policy"):
             self.assertFalse(os.path.exists(p), p)
         self.assertEqual(hw()["pin16"], "ip pd")             # charging left on
 
@@ -1892,6 +1895,91 @@ class TestFailSafe(Base):
         self.assertIn("the sweet spot test is running", r.stderr)
 
 
+class TestPassword(Base):
+    """The window's root steps: password remembered, or not asked at all if chosen."""
+    HELPER = "/usr/local/bin/pi5-energyplan-root"
+    ACTION = "/usr/share/polkit-1/actions/io.github.luis199421.pi5-energyplan.policy"
+    RULE = "/etc/polkit-1/rules.d/49-pi5-energyplan.rules"
+
+    def as_user(self, user, *args, check=True):
+        r = subprocess.run([sys.executable, SCRIPT, *args], capture_output=True, text=True,
+                           env=dict(os.environ, SUDO_USER=user), timeout=60)
+        if check:
+            self.assertEqual(r.returncode, 0, r.stderr)
+        return r
+
+    def test_helper_and_polkit_action(self):
+        cli("--install-service")
+        self.assertIn('exec /usr/bin/python3 /usr/local/bin/pi5_energyplan.py "$@"',
+                      get(self.HELPER))
+        self.assertTrue(os.access(self.HELPER, os.X_OK))
+        action = get(self.ACTION)
+        self.assertIn("<allow_active>auth_admin_keep</allow_active>", action)  # remembered
+        self.assertIn('"org.freedesktop.policykit.exec.path">/usr/local/bin/'
+                      'pi5-energyplan-root<', action)
+        before = (get(self.HELPER), get(self.ACTION))
+        cli("--update-root")
+        cli("--install-service")
+        self.assertEqual((get(self.HELPER), get(self.ACTION)), before)   # nothing twice
+        self.assertFalse(os.path.exists(self.RULE))      # no rule unless asked for
+        # the helper really runs the installed copy
+        r = subprocess.run(["pkexec", self.HELPER, "--version"], capture_output=True,
+                           text=True, timeout=30)
+        self.assertIn(self.ep.VERSION, r.stdout)
+
+    def test_no_password_on_and_off(self):
+        out = self.as_user("luis", "--no-password", "on").stdout
+        self.assertIn("won't ask luis for the password", out)
+        rule = get(self.RULE)
+        self.assertIn('["luis"].indexOf(subject.user) >= 0', rule)
+        self.assertIn("subject.local && subject.active", rule)
+        self.assertIn('action.id == "io.github.luis199421.pi5-energyplan.run"', rule)
+        self.assertTrue(os.path.exists(self.ACTION))
+        self.as_user("ana", "--no-password", "on")
+        self.as_user("luis", "--no-password", "on")       # again: still once
+        self.assertIn('["ana", "luis"]', get(self.RULE))
+        self.assertEqual(self.ep.no_password_users(), ["ana", "luis"])
+        self.as_user("ana", "--no-password", "off")
+        self.assertIn('["luis"]', get(self.RULE))
+        self.as_user("luis", "--no-password", "off")
+        self.assertFalse(os.path.exists(self.RULE))
+        self.assertEqual(self.ep.no_password_users(), [])
+        r = cli("--no-password", "on", check=False)        # who? (no sudo user)
+        self.assertIn("from your own account", r.stderr)
+
+    def test_window_uses_the_helper_only_for_the_installed_copy(self):
+        cli("--install-service")
+        spec = importlib.util.spec_from_file_location("inst", "/usr/local/bin/pi5_energyplan.py")
+        ep = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ep)
+        seen = []
+
+        class R:
+            returncode, stdout, stderr = 0, "done", ""
+
+        def fake_run(cmd, **kw):
+            seen.append(cmd)
+            return R()
+        real_geteuid = os.geteuid
+        os.geteuid = lambda: 1000                 # the window runs as the desktop user
+        ep.subprocess = type("S", (), {"run": staticmethod(fake_run),
+                                       "TimeoutExpired": subprocess.TimeoutExpired,
+                                       "SubprocessError": subprocess.SubprocessError,
+                                       "DEVNULL": subprocess.DEVNULL})
+        try:
+            self.assertEqual(ep.run_root(["--apply", "Eco"]), (True, "done"))
+            self.assertEqual(seen[-1], ["pkexec", self.HELPER, "--apply", "Eco"])
+            # another copy (e.g. a newer one in a download folder): the normal prompt
+            with open("/usr/local/bin/pi5_energyplan.py", "a") as f:
+                f.write("# changed\n")
+            mine = load_module()
+            mine.subprocess = ep.subprocess
+            mine.run_root(["--apply", "Eco"])
+            self.assertEqual(seen[-1][:3], ["pkexec", sys.executable, SCRIPT])
+        finally:
+            os.geteuid = real_geteuid
+
+
 class TestPowerLimit(Base):
     """Keep the Pi's power use under a limit: CPU right away, GPU at the next boot.
     The fake PMIC's power follows the CPU's top speed: 0.63 W + 3.2 W per GHz
@@ -2598,6 +2686,7 @@ class TestInstallGui(Base):
             "ig", os.path.join(os.path.dirname(HERE), "install_gui.py"))
         ig = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(ig)
+        self.addCleanup(setattr, os, "geteuid", os.geteuid)   # ig.os is the os module
         ig.os.geteuid = lambda: 1000        # behave like the desktop user: use pkexec
         hw(i2c=1)
         app = ig.Installer()
@@ -2972,6 +3061,36 @@ class TestPowerLimitWindow(Base):
             app.root.update()
             self.assertNotIn(" W", app.stat["Power"].cget("text"))
             self.assertNotIn("Power limit…", widget_texts(app.root))
+        finally:
+            app.root.destroy()
+            KEEP_TK.append(app)
+
+
+@unittest.skipUnless(HAVE_TK, "needs tkinter and a display (use xvfb-run)")
+class TestPasswordWindow(Base):
+    def test_dont_ask_for_my_password(self):
+        import pwd
+        user = next(p for p in pwd.getpwall() if 1000 <= p.pw_uid < 60000)
+        hw(pkexec_uid=user.pw_uid)                     # who pkexec says asked
+        # the tests run as root, so the window may skip pkexec: say who asked like sudo
+        os.environ["SUDO_USER"] = user.pw_name
+        self.addCleanup(os.environ.pop, "SUDO_USER", None)
+        cli("--install-service")
+        app = self.ep.App()
+        try:
+            app.root.update()
+            self.assertIn("Don't ask for my password", widget_texts(app.root))
+            self.assertFalse(app.nopass_var.get())
+            app.nopass_var.set(True)
+            app.on_no_password()
+            end = time.time() + 60
+            while app.busy and time.time() < end:
+                app.root.update()
+                time.sleep(0.05)
+            self.assertIn(f"won't ask {user.pw_name} for the password",
+                          app.msg.cget("text"))
+            self.assertIn(json.dumps([user.pw_name]),
+                          get("/etc/polkit-1/rules.d/49-pi5-energyplan.rules"))
         finally:
             app.root.destroy()
             KEEP_TK.append(app)

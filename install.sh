@@ -119,7 +119,9 @@ uninstall() {
             python3 "$DEST" --uninstall-service || true   # keeps the copy while the guard needs it
             [ -f "$DEST" ] && { python3 "$DEST" --uninstall-guard || true; }
         fi
-        rm -f "$DEST"
+        rm -f "$DEST" /usr/local/bin/pi5-energyplan-root \
+              /usr/share/polkit-1/actions/io.github.luis199421.pi5-energyplan.policy \
+              /etc/polkit-1/rules.d/49-pi5-energyplan.rules
         users=$(desktop_users)
         [ -n "$DESK_USER" ] && users="$users $DESK_USER"
         for u in $users; do
