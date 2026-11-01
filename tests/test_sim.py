@@ -3086,6 +3086,101 @@ class TestPowerLimitWindow(Base):
 
 
 @unittest.skipUnless(HAVE_TK, "needs tkinter and a display (use xvfb-run)")
+class TestMoreWindow(Base):
+    """Every command-line option is in the window too ("More…")."""
+    def wait(self, app):
+        end = time.time() + 60
+        while (app.busy or app.result) and time.time() < end:
+            app.root.update()
+            time.sleep(0.05)
+
+    def test_more_options(self):
+        cli("--apply", "Cool")
+        cli("--ups-config", '{"enabled": true}')
+        ep = self.ep
+        ep.messagebox.askyesno = lambda *a: True
+        ep.is_pi5 = lambda: True
+        app = ep.App()
+        try:
+            app.root.update()
+            self.assertIn("More…", widget_texts(app.root))
+            app.open_more()
+            app.root.update()
+            texts = widget_texts(app.more_win)
+            for want in ("Status", "Sweet spot test", "Trial boot (fail-safe)",
+                         "Battery (X120x)", "Storage", "System", "Full status", "Start test",
+                         "Show log", "Cancel trial", "Charge test", "Charging details",
+                         "Full UPS report", "Battery icon in the panel",
+                         "Bootloader settings", "Remove battery guard", "Storage: off",
+                         "Boot service off", "Menu entry", "Update everything"):
+                self.assertIn(want, texts)
+            ctl = app.more_controls
+            # read-only views open in a text window
+            ctl["Full status"].invoke()
+            self.assertIn("Saved plan  : Cool", app.text_box.get("1.0", "end"))
+            ctl["Full UPS report"].invoke()
+            self.assertIn("X120x UPS", app.text_box.get("1.0", "end"))
+            ctl["Charging details"].invoke()
+            self.assertIn("Charge pin (GPIO16)", app.text_box.get("1.0", "end"))
+            # root steps
+            ctl["Storage: off"].invoke()
+            self.wait(app)
+            self.assertIn("Storage tuning removed", app.text_box.get("1.0", "end"))
+            self.assertTrue(os.path.exists("/etc/pi5-energyplan/no-storage-tuning"))
+            ctl["Boot service off"].invoke()
+            self.wait(app)
+            self.assertFalse(os.path.exists("/etc/systemd/system/pi5-energyplan.service"))
+            ctl["Boot service on"].invoke()
+            self.wait(app)
+            self.assertTrue(os.path.exists("/etc/systemd/system/pi5-energyplan.service"))
+            # a trial waiting: cancel it here
+            cli("--apply", "OC 2.8 GHz")
+            ctl["Cancel trial"].invoke()
+            self.wait(app)
+            self.assertEqual(ep.load_trial()["phase"], "cancelled")
+            # the sweet spot test with its options
+            ctl["test_minutes"].set("3")
+            ctl["test_temp"].set("75")
+            ctl["test_undervolt"].set(False)
+            ctl["Start test"].invoke()
+            self.wait(app)
+            st = ep.load_state()
+            self.assertEqual((st["minutes"], st["max_temp"], st["undervolt"]), (3, 75, False))
+            ctl["Cancel test"].invoke()
+            self.wait(app)
+            self.assertEqual(ep.load_state()["phase"], "cancelled")
+            ctl["test_minutes"].set("99")                 # checked before it starts
+            ctl["Start test"].invoke()
+            self.assertIn("Minutes per step: 1-30", app.msg.cget("text"))
+            # the charge test runs as long as chosen, then shows its whole output
+            ran = []
+            app.run_task = lambda *a, **k: ran.append((a, k))
+            ctl["charge_minutes"].set("4")
+            ctl["Charge test"].invoke()
+            self.assertEqual(ran[0][0][1], ["--charge-test", "4"])
+            self.assertEqual(ran[0][1]["show"], "Charge test")
+        finally:
+            app.root.destroy()
+            KEEP_TK.append(app)
+
+    def test_other_boards_get_their_own_options(self):
+        as_board("Raspberry Pi Zero 2 W Rev 1.0", 1000000, 600000)
+        ep = load_module()
+        app = ep.App()
+        try:
+            app.open_more()
+            app.root.update()
+            texts = widget_texts(app.more_win)
+            for gone in ("Sweet spot test", "Battery (X120x)", "Charge test"):
+                self.assertNotIn(gone, texts)
+            for want in ("Status", "Storage", "System", "Trial boot (fail-safe)"):
+                self.assertIn(want, texts)
+        finally:
+            app.root.destroy()
+            KEEP_TK.append(app)
+
+
+@unittest.skipUnless(HAVE_TK, "needs tkinter and a display (use xvfb-run)")
 class TestTrialWindow(Base):
     def test_apply_without_testing_from_the_window(self):
         cli("--apply", "OC 2.8 GHz")                    # waits for its trial

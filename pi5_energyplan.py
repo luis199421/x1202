@@ -3889,8 +3889,7 @@ class App:
             actions.append(("Find sweet spot…", self.on_autotest))
         if BOARD["gpu"]:
             actions.append(("Power limit…", self.open_power_limit))
-        if self.ups_found:
-            actions.append(("Battery in panel", self.on_tray))
+        actions.append(("More…", self.open_more))
         for text, cmd in actions:
             tk.Button(bottom, text=text, command=cmd, relief="flat", bg=CARD, fg=FG,
                       activebackground="#444", activeforeground=FG,
@@ -4647,6 +4646,10 @@ class App:
             return
         name, saved, ok, text = self.result
         self.result, self.busy = None, False
+        show = getattr(self, "show_after", None)
+        self.show_after = None
+        if show:                             # e.g. the charge test: its whole output
+            self.show_text(show, text if ok else f"✘ {text}")
         self.sync_governors()
         if name == "Password setting" and not ok:     # cancelled: show what's really set
             import getpass
@@ -4711,7 +4714,7 @@ class App:
             daemon=True).start()
         self.root.after(200, self.poll_result)
 
-    def on_autotest(self):
+    def on_autotest(self, minutes=5, max_temp=80, undervolt=True):
         if self.blocked("the sweet spot test", lock_during_test=False):
             return
         st = load_state()
@@ -4728,9 +4731,11 @@ class App:
         if not messagebox.askyesno(
                 "Find sweet spot",
                 "The Pi will reboot several times and stress-test each overclock\n"
-                "(2.6 → 2.8 → 3.0 GHz), then lower voltages (undervolt, 25 mV\n"
-                "at a time) at the fastest stable speed, for less power and heat.\n"
-                "It takes about 40–90 minutes.\n\n"
+                "(2.6 → 2.8 → 3.0 GHz)"
+                + (", then lower voltages (undervolt, 25 mV\n"
+                   "at a time) at the fastest stable speed, for less power and heat"
+                   if undervolt else "") +
+                f".\n{minutes} minutes per step, a step fails above {max_temp} °C.\n\n"
                 "• Save your work and don't use the Pi during the test\n"
                 "• Use the official 27 W power supply\n"
                 "• If it freezes for more than a minute, unplug and replug power.\n"
@@ -4742,9 +4747,11 @@ class App:
         self.set_busy("starting the sweet spot test")
         self.msg.config(text="Starting sweet spot test… the Pi will reboot shortly.",
                         fg=MUTED)
+        args = ["--autotest", "--yes", "--minutes", str(minutes), "--max-temp", str(max_temp)]
         threading.Thread(target=lambda: setattr(
             self, "result", ("Sweet spot test", False) +
-            run_root(["--autotest", "--yes"], timeout=900)), daemon=True).start()
+            run_root(args + ([] if undervolt else ["--no-undervolt"]), timeout=900)),
+            daemon=True).start()
         self.root.after(200, self.poll_result)
 
     def power_text(self):
@@ -4852,6 +4859,245 @@ class App:
             self.power_controls[text] = b
         top.geometry(f"+{self.root.winfo_rootx() + 30}+{max(0, self.root.winfo_rooty() - 10)}")
         keep_on_screen(top)
+
+    # ----- "More…": every option of the command line, in the window -----
+    def show_text(self, title, text):
+        """A window with a long text (status, logs, reports) that can be copied."""
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.configure(bg=BG)
+        win.transient(self.root)
+        room_w, room_h = screen_room(win)
+        lines = text.count("\n") + 1
+        box = tk.Text(win, bg=CARD, fg=FG, insertbackground=FG, relief="flat", wrap="word",
+                      font=("DejaVu Sans Mono", 9), padx=8, pady=6,
+                      width=min(96, max(50, room_w // 8 - 4)),
+                      height=min(lines + 1, max(8, room_h // 16 - 6)))
+        bar = tk.Scrollbar(win, command=box.yview, width=SCROLLBAR, bg=CARD,
+                           troughcolor=BG, highlightthickness=0, bd=0)
+        box.config(yscrollcommand=bar.set)
+        foot = tk.Frame(win, bg=BG)
+        foot.pack(side="bottom", fill="x", padx=10, pady=8)
+        bar.pack(side="right", fill="y")
+        box.pack(side="left", fill="both", expand=True)
+        box.insert("1.0", text)
+        box.config(state="disabled")
+        tk.Button(foot, text="Close", command=win.destroy, relief="flat", bg=CARD, fg=FG,
+                  activebackground="#555", activeforeground=FG,
+                  font=("DejaVu Sans", 9)).pack(side="right", ipadx=8)
+        win.bind("<Escape>", lambda _e: win.destroy())
+        keep_on_screen(win)
+        self.text_win, self.text_box = win, box
+        return win
+
+    def run_task(self, name, args, busy, timeout=180, saved=False, show=None,
+                 lock_during_test=False):
+        """Run a root step of this program in the background (one password prompt, or
+        none, see "Don't ask for my password"). show: a title to open the whole
+        output in a text window afterwards."""
+        if self.blocked(name.lower(), lock_during_test=lock_during_test):
+            return
+        self.set_busy(busy)
+        self.show_after = show
+        self.msg.config(text=f"{busy[:1].upper()}{busy[1:]}…", fg=MUTED)
+        threading.Thread(target=lambda: setattr(
+            self, "result", (name, saved) + run_root(args, timeout=timeout)),
+            daemon=True).start()
+        self.root.after(200, self.poll_result)
+
+    def own_output(self, args):
+        """This program's output for read-only options (no root needed)."""
+        try:
+            r = subprocess.run([sys.executable, os.path.abspath(__file__)] + args,
+                               capture_output=True, text=True, timeout=60)
+            return (r.stdout + r.stderr).strip() or "(nothing)"
+        except (OSError, subprocess.SubprocessError) as e:
+            return f"✘ {e}"
+
+    def open_more(self):
+        old = getattr(self, "more_win", None)
+        if old is not None and old.winfo_exists():
+            old.destroy()
+        top = self.more_win = tk.Toplevel(self.root)
+        top.title("More options")
+        top.configure(bg=BG)
+        top.transient(self.root)
+        win, foot = make_scrollable(top, footer=True, padx=16, pady=12)
+        self.more_controls = ctl = {}
+
+        def section(title, text=""):
+            box = tk.Frame(win, bg=CARD, padx=10, pady=8)
+            box.pack(fill="x", pady=(8, 0))
+            self._label(box, title, 11, bold=True).pack(anchor="w")
+            if text:
+                lbl = self._label(box, text, 8, MUTED, wraplength=400, justify="left")
+                lbl.pack(anchor="w", pady=(2, 0))
+                ctl[title] = lbl
+            return box
+
+        def buttons(box, items):
+            row = tk.Frame(box, bg=CARD)
+            row.pack(fill="x", pady=(6, 0))
+            for text, cmd in items:
+                b = tk.Button(row, text=text, command=cmd, relief="flat", bg="#3a3d45",
+                              fg=FG, activebackground="#4a4d55", activeforeground=FG,
+                              font=("DejaVu Sans", 9))
+                b.pack(side="left", padx=(0, 6), pady=2, ipadx=4)
+                ctl[text] = b
+            return row
+
+        def number(box, title, value, lo, hi, inc, unit):
+            row = tk.Frame(box, bg=CARD)
+            row.pack(fill="x", pady=(4, 0))
+            self._label(row, title, 9).pack(side="left")
+            self._label(row, unit, 9, MUTED).pack(side="right", padx=(4, 0))
+            var = tk.StringVar(value=str(value))
+            tk.Spinbox(row, textvariable=var, from_=lo, to=hi, increment=inc, width=5,
+                       justify="right", bg="#3a3d45", fg=FG, insertbackground=FG,
+                       buttonbackground="#3a3d45", relief="flat",
+                       font=("DejaVu Sans", 10, "bold")).pack(side="right")
+            var.set(str(value))
+            return var
+
+        def whole(var, lo, hi, what):
+            t = var.get().strip()
+            if not t.isdigit() or not lo <= int(t) <= hi:
+                self.msg.config(text=f"✘ {what}: {lo}-{hi}", fg="#ef5350")
+                self.root.bell()
+                return None
+            return int(t)
+
+        self._label(win, "More options", 13, bold=True).pack(anchor="w")
+        self._label(win, f"Pi 5 Energy Plan {VERSION} · {BOARD['model']}", 9, MUTED,
+                    wraplength=400, justify="left").pack(anchor="w")
+
+        # --- status -------------------------------------------------------------
+        box = section("Status", "Everything --status shows: temperature, fan, CPU, GPU, "
+                                "power, plan, trial boot, battery, power limit, storage.")
+        buttons(box, [("Full status", lambda: self.show_text(
+            "Status", self.own_output(["--status"])))])
+
+        # --- sweet spot test ----------------------------------------------------
+        if BOARD["autotest"]:
+            box = section("Sweet spot test", autotest_summary())
+            vmin = number(box, "Stress test per step", 5, 1, 30, 1, "min")
+            vtemp = number(box, "A step fails above", 80, 60, 90, 1, "°C")
+            vuv = tk.BooleanVar(value=True)
+            tk.Checkbutton(box, text="Then find the lowest stable voltage (undervolt)",
+                           variable=vuv, bg=CARD, fg=FG, selectcolor=BG,
+                           activebackground=CARD, activeforeground=FG,
+                           font=("DejaVu Sans", 9)).pack(anchor="w", pady=(4, 0))
+            ctl.update(test_minutes=vmin, test_temp=vtemp, test_undervolt=vuv)
+
+            def start():
+                m = whole(vmin, 1, 30, "Minutes per step")
+                t = whole(vtemp, 60, 90, "Temperature")
+                if m is not None and t is not None:
+                    self.on_autotest(m, t, vuv.get())
+            buttons(box, [("Start test", start),
+                          ("Show log", lambda: self.show_text(
+                              "Sweet spot test", self.own_output(["--autotest-status"]))),
+                          ("Continue", lambda: self.run_task(
+                              "Sweet spot test", ["--autotest-resume"],
+                              "continuing the sweet spot test")),
+                          ("Cancel test", lambda: self.run_task(
+                              "Sweet spot test cancelled", ["--autotest-cancel"],
+                              "cancelling the sweet spot test"))])
+
+        # --- trial boot ---------------------------------------------------------
+        box = section("Trial boot (fail-safe)", trial_summary() or
+                      "Nothing is waiting. Overclock, voltage and below-normal speeds are "
+                      "tried once before they're kept.")
+        buttons(box, [("Test it now", lambda: self.on_trial_choice("try")),
+                      ("Apply without testing", lambda: self.on_trial_choice("skip")),
+                      ("Cancel trial", lambda: self.run_task(
+                          "Trial cancelled", ["--trial-cancel"], "cancelling the trial"))])
+
+        # --- battery (X120x) ----------------------------------------------------
+        if self.ups_found:
+            box = section("Battery (X120x)",
+                          "Charge test: pauses charging and checks by the cell voltage that "
+                          "it really stops (adapter plugged in, battery below 90 %).")
+            vct = number(box, "Charge test length", 10, 2, 30, 1, "min")
+            ctl["charge_minutes"] = vct
+
+            def charge_test():
+                m = whole(vct, 2, 30, "Charge test minutes")
+                if m is not None:
+                    self.run_task("Charge test", ["--charge-test", str(m)],
+                                  f"testing charging for {m} minutes", timeout=m * 60 + 180,
+                                  show="Charge test")
+            buttons(box, [("Charge test", charge_test),
+                          ("Charging details", lambda: self.show_text(
+                              "Charging details", self.own_output(["--charge-debug"]))),
+                          ("Full UPS report", lambda: self.show_text(
+                              "UPS report", monitor_report(self.battery)))])
+            buttons(box, [("Battery icon in the panel", self.on_tray),
+                          ("Bootloader settings", lambda: messagebox.askyesno(
+                              "Bootloader settings",
+                              "Set Geekworm's bootloader settings (PSU_MAX_CURRENT=5000 and "
+                              "your 5 V choice)? They take effect after a reboot.")
+                           and self.run_task("Bootloader settings", ["--eeprom-setup"],
+                                             "saving the bootloader settings")),
+                          ("Remove battery guard", lambda: messagebox.askyesno(
+                              "Remove battery guard",
+                              "Remove the battery guard? No charge limit, no safe shutdown "
+                              "and no battery saver until you save the UPS settings again.")
+                           and self.run_task("Battery guard removed", ["--uninstall-guard"],
+                                             "removing the battery guard"))])
+
+        # --- storage ------------------------------------------------------------
+        box = section("Storage", storage_line())
+        self._label(box, "On slow storage (SD card, USB 2) with RAM to spare, keep more in "
+                         "RAM: file cache, swap and /tmp.", 8, MUTED, wraplength=400,
+                    justify="left").pack(anchor="w")
+        buttons(box, [(f"Storage: {mode}", lambda m=mode: self.run_task(
+            "Storage", ["--storage-tune", m], f"storage: {m}", show="Storage"))
+            for mode in ("auto", "on", "off")])
+
+        # --- system ---------------------------------------------------------------
+        box = section("System", "Boot service: sets your plan (or Performance) at every "
+                                "boot. " + ("It's on." if os.path.exists(SERVICE_PATH)
+                                            else "It's off."))
+        buttons(box, [("Boot service on", lambda: self.run_task(
+                          "Boot service", ["--install-service", "--yes"],
+                          "turning the boot service on")),
+                      ("Boot service off", lambda: self.run_task(
+                          "Boot service", ["--uninstall-service"],
+                          "turning the boot service off"))])
+        buttons(box, [("Menu entry", self.on_launcher),
+                      ("Update everything", self.on_update_all)])
+
+        tk.Button(foot, text="Close", command=top.destroy, relief="flat", bg=CARD, fg=FG,
+                  activebackground="#555", activeforeground=FG,
+                  font=("DejaVu Sans", 9)).pack(side="right", pady=(4, 12), ipadx=8)
+        top.geometry(f"+{self.root.winfo_rootx() + 30}+{max(0, self.root.winfo_rooty() - 10)}")
+        keep_on_screen(top)
+
+    def on_update_all(self):
+        """--update: the menu entry and panel icon (as you), then the system part (it
+        asks for the password itself when needed)."""
+        if self.blocked("the update", lock_during_test=False):
+            return
+        self.set_busy("updating")
+        self.show_after = "Update"
+        self.msg.config(text="Updating…", fg=MUTED)
+
+        def work():
+            try:
+                r = subprocess.run([sys.executable, os.path.abspath(__file__), "--update"],
+                                   capture_output=True, text=True, timeout=300,
+                                   stdin=subprocess.DEVNULL)
+                self.result = ("Update", False, r.returncode == 0,
+                               (r.stdout + r.stderr).strip())
+            except (OSError, subprocess.SubprocessError) as e:
+                self.result = ("Update", False, False, str(e))
+        threading.Thread(target=work, daemon=True).start()
+        self.root.after(200, self.poll_result)
+
+    def on_launcher(self):
+        install_launcher()
+        self.msg.config(text="✔ Pi 5 Energy Plan is in the menu.", fg="#66bb6a")
 
     def on_tray(self):
         install_tray()

@@ -565,8 +565,25 @@ Applying a plan or saving UPS settings for the first time copies the script to
 * **Governor / Fan pickers** (▾): change the governor or fan profile a plan uses.
 * **UPS settings…**: charge limit, safe shutdown level, power-cut timer, warning time,
   5 V outputs after shutdown, battery saver, and **Charge to 100 % once**.
+* **Find sweet spot…**: starts or cancels the [sweet spot test](#3-sweet-spot-overclock-test).
+* **Power limit…**: see [Power limit](#power-limit-pi-5).
+* **More…**: everything else the command line can do, so you never need the terminal:
+  * **Status**: the full `--status` report.
+  * **Sweet spot test**: minutes per step, the temperature a step fails at, with or
+    without the undervolt part; start, show the log, continue a stuck test, cancel.
+  * **Trial boot**: what's waiting, and test it now, apply it without testing, or cancel.
+  * **Battery (X120x)**: the charge test (choose how long; shows its whole result),
+    charging details, the full UPS report, the battery icon in the panel, the bootloader
+    settings, and removing the battery guard.
+  * **Storage**: what was found, and the slow-storage tuning auto / on / off.
+  * **System**: boot service on / off, menu entry, update everything.
+  Long outputs open in their own window, where they can be copied.
+* When you run a newer copy of the script, the window offers to **update the
+  background services**.
 
 ![UPS settings](docs/ups-settings.png)
+
+![More options](docs/more.png)
 
 ### The password
 
@@ -591,10 +608,6 @@ line stay pinned at the bottom, so they're always visible. On a normal monitor
 nothing changes.
 
 ![The window on an 800×480 screen](docs/small-screen.png)
-* **Battery in panel**: adds the panel icon.
-* **Find sweet spot…**: starts or cancels the overclock test.
-* When you run a newer copy of the script, the window offers to **update the
-  background services**.
 
 ### Command line
 
@@ -834,7 +847,7 @@ The installer test for the menu entry and panel icon needs a throwaway user:
 `sudo INSTALL_TEST_USER=someuser sh tests/run_sim_tests.sh`. To run some tests only:
 `sudo TESTS="TestUps TestNothingTwice" sh tests/run_sim_tests.sh`.
 
-The 144 tests cover:
+The 146 tests cover:
 
 * **Plans:** applying each kind of plan, the live sysfs changes and governor fallback,
   `config.txt` editing (backup, commenting out conflicting lines, only `[all]`/`[pi5]`
@@ -852,6 +865,9 @@ The 144 tests cover:
   fastest speed until one fails, the 15 mV margin, the normal speed undervolted when no
   overclock is stable, never below −200 mV, a voltage that already failed isn't tried
   again, and `--no-undervolt`.
+* **More…:** every section and button is there (fewer on other boards), the read-only
+  views open in a text window, storage off, boot service off and on, cancelling a trial,
+  the sweet spot test with its options (checked first), and the charge test's length.
 * **Password:** the root helper and its polkit description (remembered password), never
   added twice, removed on uninstall; `--no-password on/off` per user; the window uses
   the helper only for the installed copy; the window's checkbox.
